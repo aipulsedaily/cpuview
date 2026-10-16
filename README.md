@@ -4,7 +4,8 @@ A btop-style terminal monitor that shows **every core's clock speed and load at 
 by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds.
 Native Rust, one 0.99 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
-`smooth` (animated bars at up to 60 frames per second, ≤ 0.3 % of one thread) or fixed rates up to
+`smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
+≤ 0.5 % of one thread) or fixed rates up to
 60 updates per second.
 
 ![cpuview, Midnight theme, 128×45](docs/screenshots/rust-128x45.webp)
@@ -104,16 +105,46 @@ and is remembered in `~/.config/cpuview/config`; `cpuview --speed smooth` (or `1
 from the command line. Except in eco the title clock shows seconds; history graphs always get
 one point per second.
 
-**Smooth** samples 5 times a second and animates in between: every clock and load bar glides
-toward its new value on a critically damped spring (no overshoot, ~0.25 s to settle) at up to
-60 frames per second, with sub-cell resolution (the bar's edge cell is its colour blended into
-the track by the covered eighth). A frame is drawn only when some bar has moved a visible
-eighth of a cell, so nothing is drawn once the bars have settled. The digits show where their
-bar is, updated with each sample (5/s) so they stay readable. Small changes below the
-measurement noise (±1.2 % load, ±2 % clock) don't move a settled bar. Clocks in smooth mode are
-the clock *while running*: see [Load and clock accuracy](#load-and-clock-accuracy). Smooth holds
-itself to a CPU budget of 2.5 ms per second: if frames cost more than that (cache-cold
-wakeups on an idle machine), the frame cap slides from 60 to 30 per second.
+**Smooth** is made to look live: everything that changes moves continuously instead of
+jumping, on a fixed frame grid.
+
+- **Frames**: a steady 60 frames per second on a fixed clock grid (the 10 samples a second fall
+  on it), one write per frame wrapped in synchronized-output marks, nothing written when nothing
+  changed. Every frame advances the animation by exactly one grid step, so motion per frame is
+  even whatever the wakeup jitter. Every other frame touches only the core cards (bars and
+  their digits); panels and graphs change on the others.
+- **Bars** follow critically damped springs (no overshoot) whose targets move 10 times a
+  second; with the spring slow against the sample rate the motion is C1-continuous (no
+  start-stop pulses: velocity ripple under ~10 %). The bar end is anti-aliased in 1/16 cell
+  steps, blended in linear light so it glides at an even perceived speed across a cell.
+- **Load** blends two windows of `/proc/stat` (which counts in 10 ms ticks): 0.8 s (±1 %) while
+  it agrees with 0.2 s (±5 %) within the noise, the short one as they disagree. Quiet bars stay
+  still; a step 10 % → 80 % reaches 90 % in ~0.45 s. Changes below ±0.8 % load / ±1.5 % clock
+  don't move a bar.
+- **Digits** count along with their bar (90 → 91 → … → 99), with hysteresis while it moves so a
+  value near a rounding edge never flickers; exact once it rests. Totals, CCD figures and
+  temperatures (read every second, eased over ~1 s) do the same; colours follow the digits.
+- **Graphs** scroll continuously: history is a curve through the per-second points with the
+  live value at its head, sampled at fixed ages, so every graph, strip and heatmap column slides
+  along a little at a time (15 updates a second, staggered over the frames) and the newest
+  column grows in, instead of jumping a cell every 2 s.
+- **Pictures**: sixel/iTerm pixel patches are sent only with full repaints (start, keys,
+  resize), never mid-animation; a cell that turns blank in between shows the half-block
+  backdrop until then.
+
+Measured from frame-by-frame captures at 128×45 (one thread driven by a 10 ms duty-cycle load,
+bar length read back from the edge cell's colour), previous smooth → now: frame intervals p95 /
+median 1.95 → 1.01–1.02 and longest gap 80–100 → 19 ms while bars move; a 10 % → 80 % step reaches
+90 % in 0.80 → 0.44 s with no overshoot; on a 3 s ramp the share of frames where the bar stands
+still 29–41 % → 12–15 % (the rest of those are sub-1/16-cell steps) and velocity variation
+(50 ms bins) 0.58–0.63 → 0.35–0.40; graphs update 0.5 → 4–6 times a second with ≤ 2 cells a
+frame instead of a 20–35-cell jump every 2 s; quiet threads' digits change 0.3–0.6 times a
+second (max 1.8), bar reversals unchanged (≤ 1.2/s).
+
+Clocks in smooth mode are the clock *while running*: see
+[Load and clock accuracy](#load-and-clock-accuracy). Should frames cost more than 5 ms of CPU per
+second for 3 s in a row (huge windows), the frame rate halves, and stays constant from there;
+`CPUVIEW_FPS=30` sets it.
 
 ## Themes and pictures
 
@@ -200,15 +231,18 @@ work; smooth and eco 60 s runs, fixed speeds 20 s):
 | speed | samples/s | frames/s | CPU per second | % of one thread | output |
 |---|---|---|---|---|---|
 | eco (default) | ~0.5–1 | ~0.4 | 83 µs | 0.0083 % | 2.0 KB/s |
-| smooth | 5 | ~37 (≤ 60) | 1.37 ms | 0.14 % | 10 KB/s |
+| smooth | 10 | 60 (steady; fewer when nothing moves) | 2.7 ms | 0.27 % | 33 KB/s |
 | 1/s · 2/s · 4/s | 1 · 2 · 4 | same | 0.17 · 0.32 · 0.46 ms | 0.017 · 0.032 · 0.046 % | 3–13 KB/s |
 | 10/s | 10 | ~9 | 0.89 ms | 0.089 % | 7 KB/s |
 | 20/s · 30/s · 60/s | 20 · 30 · 60 | ~18 · 27 · 51 | 2.0 · 2.7 · 5.2 ms | 0.20 · 0.27 · 0.52 % | 31 · 25 · 68 KB/s |
 
-Smooth at 128×45: 1.36 ms/s, 11 KB/s. Its cost is mostly wakeups: on an
-idle machine a bare wakeup of a cache-cold core costs 20–30 µs (3–6 µs when the CCD is busy),
-which is why smooth caps itself with a CPU budget rather than a fixed frame rate. Fixed-speed
+Smooth, 60 s runs at 128×45 · 172×40: Midnight 2.2 · 2.7 ms/s and 30 · 33 KB/s; NASA Webb
+picture (sixel) 3.4 · 3.6 ms/s and 38 · 27 KB/s; ≤ 3.3 KB per frame, never a picture patch after
+the first paint. (The previous smooth: 1.0 – 2.3 ms/s at ~20 – 50 irregular frames/s.) Its cost
+is mostly the 60 wakeups a second: on an idle machine a bare wakeup of a cache-cold core costs
+20–30 µs (3–6 µs when the CCD is busy). Fixed-speed
 cost depends mostly on how many cells change, so a busier machine costs more.
+
 Sample rates were confirmed by counting `/proc/stat` reads with strace. Details for eco:
 
 Measured on this machine (Ryzen 9 9950X, Linux 7.0, output going to a pseudo-terminal that is
@@ -248,11 +282,12 @@ What makes that possible:
   ~10 µs), load average every 5 s, governor every 10 s.
 - Rendering is retained: cells are compared as they are written, so only changed cells are
   composited and sent; bars update only the cells between the old and new length; graphs,
-  strips and the heatmap scroll every 2 s (one braille cell; every 4–6 s on very large windows,
+  strips and the heatmap scroll every 2 s at eco and fixed speeds (one braille cell; every 4–6 s on very large windows,
   where most frames then only touch bars and numbers); integers and decimals are formatted without
   `core::fmt` (no float formatting or parsing code in the binary); big buffers live in their own
   mappings and go back to the kernel when freed. Smooth's
-  animation frames touch only the bar cells whose eighth-cell fill changed.
+  animation frames redraw only what moved (memo keys per panel and per card row) and never
+  send picture data.
 
 ## Notes
 
@@ -270,6 +305,6 @@ What makes that possible:
 ```sh
 cargo test --release         # parsing, layout fit at many sizes, probe matrix, sixel round trip, input parser …
 cargo clippy --release
-CPUVIEW_PROFILE=/tmp/prof.txt cpuview     # per-phase CPU time, written on exit
+cargo build --release --features prof && CPUVIEW_PROFILE=/tmp/prof.txt target/release/cpuview  # per-phase CPU time, written on exit
 python3 themes/reference.py render nebula out.png   # the theme spec's reference renderer
 ```

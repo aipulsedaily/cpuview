@@ -14,7 +14,11 @@ const SLOT_HEADER: usize = 4;
 const SLOT_DETAIL: usize = 5;
 const SLOT_GBODY: usize = 6;
 const SLOT_DBODY: usize = 7;
-const SLOT_CARDS: usize = 8;
+const SLOT_SDYN: usize = 8;
+const SLOT_SHIST: usize = 9;
+const SLOT_STATS: usize = 10;
+const SLOT_GBODY2: usize = 11;
+const SLOT_CARDS: usize = 12;
 
 /// Memo key: a small mixing hash of display-relevant values.
 pub fn mixk(v: &[u64]) -> u64 {
@@ -77,10 +81,10 @@ pub const SORTS: [&str; 3] = ["core", "load", "freq"];
 pub const VIEWS: [&str; 3] = ["auto", "full", "compact"];
 /// Update speeds: (label, samples per second). 0 = eco: adaptive 1–2 s, held under
 /// 0.01 % of one thread by the CPU-time budget in the main loop. Smooth samples at
-/// 5/s and animates the bars (eased, up to 60 frames/s) between samples.
+/// 10/s and animates everything on a fixed 60 frames/s grid (see `anim`).
 pub const SPEEDS: [(&str, i64); 9] = [
     ("eco", 0),
-    ("smooth", 5),
+    ("smooth", 10),
     ("1/s", 1),
     ("2/s", 2),
     ("4/s", 4),
@@ -91,33 +95,33 @@ pub const SPEEDS: [(&str, i64); 9] = [
 ];
 
 pub const SMOOTH: usize = 1;
-/// Smooth-mode bar spring: critically damped, angular frequency in rad/s
-/// (a step settles to 90 % in ~3.9 / ω ≈ 0.24 s).
-pub const SPRING_W: f32 = 16.0;
-/// Smooth-mode target deadbands (fractions of the bar)
-pub const DEADBAND_U: f32 = 0.012;
-pub const DEADBAND_F: f32 = 0.02;
 
-/// One critically damped spring step of `dt` s toward `target` (exact for a fixed
-/// target; `ex` = exp(-ω·dt)). Snaps and returns false once within `eps` and slow.
+/// Smooth-mode target deadbands (fractions of the bar)
+pub const DEADBAND_U: f32 = 0.008;
+pub const DEADBAND_F: f32 = 0.015;
+
+/// Bar fill in sixteenths of a cell (the edge cell's colour is blended by coverage).
 #[inline]
-pub fn spring(x: &mut f32, v: &mut f32, target: f32, dt: f32, ex: f32, eps: f32) -> bool {
-    let e = *x - target;
-    if e.abs() < eps && v.abs() < eps * SPRING_W {
-        *x = target;
-        *v = 0.0;
-        return false;
-    }
-    let k = (*v + SPRING_W * e) * dt;
-    *x = target + (e + k) * ex;
-    *v = (*v - SPRING_W * k) * ex;
-    true
+pub fn fill16(frac: f32, w: usize) -> usize {
+    (frac.clamp(0.0, 1.0) * (w * 16) as f32 + 0.5) as usize
 }
 
-/// Bar fill in eighths of a cell.
-#[inline]
-pub fn eighths(frac: f32, w: usize) -> usize {
-    (frac.clamp(0.0, 1.0) * (w * 8) as f32 + 0.5) as usize
+/// Smooth mode: indices into `App::hy` (shown numbers) after the per-CPU ones.
+const HY_TOT: usize = 0;
+const HY_AVG: usize = 1;
+const HY_TOP: usize = 2;
+const HY_TEMP: usize = 3;
+
+/// History series a graph, strip or heatmap shows.
+#[derive(Clone, Copy)]
+pub enum Hist<'a> {
+    Tot,
+    Avg,
+    Temp(usize),
+    /// mean load of these CPUs
+    Load(&'a [usize]),
+    /// highest clock of these CPUs
+    Clock(&'a [usize]),
 }
 
 /// "eco", "10/s", "10" (and "auto" for eco) → index into SPEEDS; unknown → eco.
@@ -342,6 +346,7 @@ pub struct App {
     pub clock: (i32, i32, i32),
     pub uptime: u64,
     pub vals: Vec<f32>,
+    pub vals2: Vec<f32>,
     pub tmp16: Vec<u16>,
     pub tmp8: Vec<u8>,
     pub idw: usize,
@@ -360,12 +365,27 @@ pub struct App {
     pub bu: Vec<f32>,
     vf: Vec<f32>,
     vu: Vec<f32>,
-    /// smooth mode: where the bars are heading (the latest sample, through a deadband)
+    /// smooth mode: where the bars are heading (the latest sample)
     tf: Vec<f32>,
     tu: Vec<f32>,
     /// smooth mode: the numbers shown (see `shown`)
     nf: Vec<f32>,
     nu: Vec<f32>,
+    /// smooth mode: temperatures (position, velocity) and the other shown numbers
+    /// (HY_* then one per sensor, then per CCD load %, then per CCD clock)
+    tt: Vec<(f32, f32)>,
+    /// smooth mode: mean clock (position, velocity)
+    ta: (f32, f32),
+    hy: Vec<f32>,
+    /// seconds since each shown number (per-CPU loads, clocks, then `hy`) changed
+    na: Vec<f32>,
+    scratch: std::cell::RefCell<Vec<f32>>,
+    /// smooth mode: seconds since the newest history point (graphs scroll by it) and
+    /// the animation frames drawn (history bodies redraw on a cycle of them, `body_key`)
+    pub phase: f32,
+    pub frame: u64,
+    /// drawing an animation frame (the order is kept; it changes with samples)
+    pub anim: bool,
     /// widest clock / load bar in cells (sets the animation's resolution)
     bar_cells: (usize, usize),
 }
@@ -408,6 +428,7 @@ impl App {
             clock: (0, 0, 0),
             uptime: 0,
             vals: Vec::with_capacity(2048),
+            vals2: Vec::with_capacity(2048),
             tmp16: Vec::with_capacity(2048),
             tmp8: Vec::with_capacity(2048),
             idw,
@@ -427,6 +448,14 @@ impl App {
             tu: Vec::new(),
             nf: Vec::new(),
             nu: Vec::new(),
+            tt: Vec::new(),
+            ta: (0.0, 0.0),
+            hy: Vec::new(),
+            na: Vec::new(),
+            scratch: std::cell::RefCell::new(Vec::with_capacity(512)),
+            phase: 0.0,
+            frame: 0,
+            anim: false,
             bar_cells: (8, 8),
         }
         .with_bars()
@@ -438,15 +467,13 @@ impl App {
         self.bu = vec![0.0; n];
         self.vf = vec![0.0; n];
         self.vu = vec![0.0; n];
-        let m = self.s.t.maxf;
-        for i in 0..n {
-            self.bf[i] = (self.s.f[i] / m).clamp(0.0, 1.0);
-            self.bu[i] = self.s.u[i].clamp(0.0, 1.0);
-        }
-        self.tf = self.bf.clone();
-        self.tu = self.bu.clone();
-        self.nf = self.s.f.clone();
-        self.nu = self.s.u.clone();
+        self.tf = vec![0.0; n];
+        self.tu = vec![0.0; n];
+        self.nf = vec![0.0; n];
+        self.nu = vec![0.0; n];
+        self.tt = self.s.temps.iter().map(|t| (t.val, 0.0)).collect();
+        self.hy = vec![0.0; HY_TEMP + self.s.temps.len() + 2 * self.s.t.ndom.max(1)];
+        self.bars_snap();
         self
     }
 
@@ -455,8 +482,7 @@ impl App {
     }
 
     /// Clock (MHz) and load a CPU's numbers show: the published sample, or in smooth
-    /// mode where its bars were at the last sample (`snap_numbers`), so digits agree
-    /// with their bar but change at most 5 times a second.
+    /// mode the digits following its moving bars (`anim_numbers`).
     #[inline]
     pub fn shown(&self, c: usize) -> (f32, f32) {
         if self.smooth() {
@@ -466,15 +492,7 @@ impl App {
         }
     }
 
-    pub fn snap_numbers(&mut self) {
-        let m = self.s.t.maxf;
-        for i in 0..self.bf.len() {
-            self.nf[i] = self.bf[i] * m;
-            self.nu[i] = self.bu[i];
-        }
-    }
-
-    /// Bars jump to the latest sample (every speed but smooth).
+    /// Bars jump to the latest sample (every speed but smooth; smooth at start).
     pub fn bars_snap(&mut self) {
         let m = self.s.t.maxf;
         for i in 0..self.bf.len() {
@@ -485,15 +503,23 @@ impl App {
         }
         self.tf.copy_from_slice(&self.bf);
         self.tu.copy_from_slice(&self.bu);
+        for (t, s) in self.tt.iter_mut().zip(&self.s.temps) {
+            *t = (s.val, 0.0);
+        }
+        self.ta = (self.s.avg_r, 0.0);
+        self.hy.iter_mut().for_each(|h| *h = -1e9);
+        self.na.clear();
+        self.anim_numbers(1.0);
     }
 
-    /// Smooth mode, after a sample: new bar targets. Changes smaller than the
-    /// measurement noise (load ±2 % over the window, clock jitter) are ignored so
-    /// steady bars come to rest instead of wobbling; 0 and 100 % are always exact.
+    /// Smooth mode, after a sample: the bars' new targets.
+    /// Changes within the measurement noise (load: tick quantisation of the long
+    /// window; clock: reading jitter) are ignored, so quiet bars stand still instead
+    /// of shimmering at their edge; 0 and 100 % are always exact.
     pub fn retarget(&mut self) {
         let m = self.s.t.maxf;
         let db = |t: &mut f32, n: f32, d: f32| {
-            if (n - *t).abs() >= d || (n <= 0.0 || n >= 1.0) {
+            if (n - *t).abs() >= d || n <= 0.0 || n >= 1.0 {
                 *t = n;
             }
         };
@@ -507,26 +533,255 @@ impl App {
         }
     }
 
-    /// Smooth mode: move every bar `dt` seconds along its spring toward the latest
-    /// sample. Returns the fastest bar's speed in eighth-cells per second, 0 once
-    /// all have settled (each snaps when within half an eighth of its target).
-    pub fn bars_step(&mut self, dt: f32) -> f32 {
-        let ex = (-SPRING_W * dt).exp();
-        let (cf, cu) = (
-            self.bar_cells.0.max(1) as f32 * 8.0,
-            self.bar_cells.1.max(1) as f32 * 8.0,
+    /// Smooth mode: advance every spring by `dt` s. Returns whether anything moves.
+    pub fn anim_step(&mut self, dt: f32) -> bool {
+        use crate::anim::*;
+        let (eu, ef) = (
+            0.25 / (self.bar_cells.1.max(1) * 16) as f32,
+            0.25 / (self.bar_cells.0.max(1) * 16) as f32,
         );
-        let (ef, eu) = (0.5 / cf, 0.5 / cu);
-        let mut fast = 0.0f32;
+        let (xu, xf, xt) = (
+            (-W_LOAD * dt).exp(),
+            (-W_CLOCK * dt).exp(),
+            (-W_TEMP * dt).exp(),
+        );
+        let mut moving = false;
         for i in 0..self.bf.len() {
-            if spring(&mut self.bf[i], &mut self.vf[i], self.tf[i], dt, ex, ef) {
-                fast = fast.max(self.vf[i].abs() * cf).max(1.0);
+            moving |= spring(
+                &mut self.bu[i],
+                &mut self.vu[i],
+                self.tu[i],
+                dt,
+                W_LOAD,
+                xu,
+                eu,
+            );
+            moving |= spring(
+                &mut self.bf[i],
+                &mut self.vf[i],
+                self.tf[i],
+                dt,
+                W_CLOCK,
+                xf,
+                ef,
+            );
+        }
+        for (t, s) in self.tt.iter_mut().zip(&self.s.temps) {
+            moving |= spring(&mut t.0, &mut t.1, s.val, dt, W_TEMP, xt, 0.01);
+        }
+        let ta = &mut self.ta;
+        moving |= spring(&mut ta.0, &mut ta.1, self.s.avg_r, dt, W_CLOCK, xf, 1.0);
+        moving
+    }
+
+    /// Smooth mode: the digits follow the moving values (with hysteresis, see
+    /// `anim::hyst`). Returns whether any changed.
+    pub fn anim_numbers(&mut self, dt: f32) -> bool {
+        use crate::anim::hyst;
+        let m = self.s.t.maxf;
+        let n = self.bf.len();
+        if self.na.len() != 2 * n + self.hy.len() {
+            self.na = vec![1.0; 2 * n + self.hy.len()];
+        }
+        // A digit field changes at most 4 times a second while its bar wanders, but
+        // counts along at frame rate through a real transition (bar moving faster than
+        // half its length a second) and lands exactly once the bar rests. While the
+        // bar moves, a wide hysteresis keeps a value at a rounding edge from flickering.
+        let (u, f, top) = self.live_totals();
+        let nd = self.s.t.ndom.clamp(1, 16);
+        let mut ccd = [(0.0f32, 0.0f32); 16];
+        for (d, c) in ccd.iter_mut().enumerate().take(nd) {
+            *c = self.ccd_live(d);
+        }
+        let mut ch = false;
+        let na = &mut self.na;
+        let mut upd = |k: usize, shown: &mut f32, x: f32, unit: f32, h: f32, v: Option<f32>| {
+            na[k] += dt;
+            let rest = v == Some(0.0);
+            if !(rest || v.is_some_and(|v| v.abs() >= 0.5) || na[k] >= 0.25) {
+                return;
             }
-            if spring(&mut self.bu[i], &mut self.vu[i], self.tu[i], dt, ex, eu) {
-                fast = fast.max(self.vu[i].abs() * cu).max(1.0);
+            if hyst(shown, x, unit, if rest { 0.0 } else { h }) {
+                na[k] = 0.0;
+                ch = true;
+            }
+        };
+        for i in 0..n {
+            let mut p = self.nu[i] * 100.0;
+            upd(i, &mut p, self.bu[i] * 100.0, 1.0, 1.0, Some(self.vu[i]));
+            self.nu[i] = p / 100.0;
+            upd(
+                i + n,
+                &mut self.nf[i],
+                self.bf[i] * m,
+                10.0,
+                2.0,
+                Some(self.vf[i]),
+            );
+        }
+        let hy = &mut self.hy;
+        upd(2 * n + HY_TOT, &mut hy[HY_TOT], u * 100.0, 1.0, 0.5, None);
+        upd(2 * n + HY_AVG, &mut hy[HY_AVG], f, 10.0, 1.0, None);
+        upd(2 * n + HY_TOP, &mut hy[HY_TOP], top, 10.0, 1.0, None);
+        let nt = self.tt.len();
+        for k in 0..nt {
+            let j = HY_TEMP + k;
+            upd(2 * n + j, &mut hy[j], self.tt[k].0, 1.0, 0.3, None);
+        }
+        for (d, &(u, f)) in ccd.iter().enumerate().take(nd) {
+            let b = HY_TEMP + nt + 2 * d;
+            upd(2 * n + b, &mut hy[b], u * 100.0, 1.0, 0.5, None);
+            upd(2 * n + b + 1, &mut hy[b + 1], f, 10.0, 1.0, None);
+        }
+        ch
+    }
+
+    /// Smooth mode: total load and top clock (MHz) from the moving bars, mean clock
+    /// (of the raw readings, like its history) eased.
+    fn live_totals(&self) -> (f32, f32, f32) {
+        let n = self.bf.len().max(1) as f32;
+        let m = self.s.t.maxf;
+        let u = self.bu.iter().sum::<f32>() / n;
+        let f = self.ta.0;
+        let top = self.bf.iter().copied().fold(0.0, f32::max) * m;
+        (u, f, top)
+    }
+
+    /// Smooth mode: a CCD's mean load and mean core clock from the moving bars.
+    fn ccd_live(&self, d: usize) -> (f32, f32) {
+        let s = &self.s;
+        let (mut u, mut f, mut nt, mut nc) = (0.0f32, 0.0f32, 0usize, 0usize);
+        for (g, thr) in s.t.groups.iter().enumerate() {
+            if s.t.ccd[g] != d {
+                continue;
+            }
+            nc += 1;
+            f += thr.iter().map(|&c| self.bf[c]).fold(0.0, f32::max);
+            for &c in thr {
+                u += self.bu[c];
+                nt += 1;
             }
         }
-        fast
+        (u / nt.max(1) as f32, f / nc.max(1) as f32 * s.t.maxf)
+    }
+
+    /// Total load (0..1), mean clock and top clock as the numbers show them.
+    pub fn totals(&self) -> (f32, f32, f32) {
+        if self.smooth() {
+            (self.hy[HY_TOT] / 100.0, self.hy[HY_AVG], self.hy[HY_TOP])
+        } else {
+            let s = &self.s;
+            (s.tot_u, s.avg_f, s.f.iter().copied().fold(0.0, f32::max))
+        }
+    }
+
+    /// Sensor `k`: (bar position, shown value) in °C.
+    pub fn temp(&self, k: usize) -> (f32, f32) {
+        if self.smooth() {
+            (self.tt[k].0, self.hy[HY_TEMP + k])
+        } else {
+            let v = self.s.temps[k].val;
+            (v, v)
+        }
+    }
+
+    /// CCD `d`: (bar load, shown load, shown clock).
+    pub fn ccd(&self, d: usize) -> (f32, f32, f32) {
+        if self.smooth() {
+            let b = HY_TEMP + self.tt.len() + 2 * d;
+            (self.ccd_live(d).0, self.hy[b] / 100.0, self.hy[b + 1])
+        } else {
+            let (u, f, _) = ccd_stats(&self.s, d);
+            (u, u, f)
+        }
+    }
+
+    /// Temperature shown for an L3 domain.
+    pub fn dom_temp(&self, d: usize) -> Option<f32> {
+        self.s.domain_temp_idx(d).map(|k| self.temp(k).1)
+    }
+
+    /// Redraw key of history bodies (graphs, strips, heatmap). Smooth: changes every
+    /// GRAPH_DIV frames, at frame `slot` of the cycle (0: the two top graphs, 2: the
+    /// detail area and the sensor history; strips: by core number at half the rate),
+    /// so frames cost about the same.
+    pub fn body_key(&self, slot: u64) -> u64 {
+        if self.smooth() {
+            (self.frame + crate::anim::GRAPH_DIV - slot) / crate::anim::GRAPH_DIV
+        } else {
+            self.s.hist_n / self.hist_step()
+        }
+    }
+
+    /// Redraw key of core `g`'s history strip (smooth: staggered over the cores).
+    pub fn strip_key(&self, g: usize) -> u64 {
+        if self.smooth() {
+            (self.frame + g as u64) / (2 * crate::anim::GRAPH_DIV)
+        } else {
+            self.body_key(0)
+        }
+    }
+
+    /// `n` values of a history series for columns `step` seconds apart, the youngest
+    /// at age `off` (oldest first). Other speeds: the last `n` points as they are
+    /// (`step` 1); smooth: the scrolling curve (`anim::Curve`) with the live value at
+    /// its head.
+    pub fn hist_vals(&self, out: &mut Vec<f32>, n: usize, off: f32, step: f32, src: Hist) {
+        let s = &self.s;
+        let (len, head, part): (usize, f32, f32) = match src {
+            Hist::Tot => (s.h_tot.len(), self.live_totals().0, s.part_tot()),
+            Hist::Avg => {
+                let p =
+                    (0..s.fr.len()).map(|i| s.part_f(i)).sum::<f32>() / s.fr.len().max(1) as f32;
+                (s.h_avg.len(), self.ta.0, p)
+            }
+            Hist::Temp(k) => (s.temps[k].hist.len(), self.tt[k].0, s.temps[k].val),
+            Hist::Load(t) => {
+                let k = t.len().max(1) as f32;
+                (
+                    t.iter().map(|&c| s.hu[c].len()).min().unwrap_or(0),
+                    t.iter().map(|&c| self.bu[c]).sum::<f32>() / k,
+                    t.iter().map(|&c| s.part_u(c)).sum::<f32>() / k,
+                )
+            }
+            // (history points are means of the raw readings, idle floor included: so
+            // is the head, not the bars' clock-while-running)
+            Hist::Clock(t) => {
+                let p = t.iter().map(|&c| s.part_f(c)).fold(0.0, f32::max);
+                (t.iter().map(|&c| s.hf[c].len()).min().unwrap_or(0), p, p)
+            }
+        };
+        let pt = |k: usize| -> f32 {
+            match src {
+                Hist::Tot => s.h_tot.back(k),
+                Hist::Avg => s.h_avg.back(k),
+                Hist::Temp(i) => s.temps[i].hist.back(k),
+                Hist::Load(t) => {
+                    t.iter().map(|&c| s.hu[c].back(k) as f32).sum::<f32>()
+                        / (255.0 * t.len().max(1) as f32)
+                }
+                Hist::Clock(t) => t
+                    .iter()
+                    .map(|&c| s.hf[c].back(k) as f32)
+                    .fold(0.0, f32::max),
+            }
+        };
+        if !self.smooth() {
+            out.clear();
+            let have = len.min(n);
+            out.resize(n - have, 0.0);
+            out.extend((0..have).rev().map(pt));
+            return;
+        }
+        crate::anim::Curve {
+            phase: self.phase,
+            head,
+            part,
+            len,
+            pt: &pt,
+            pad: 0.0,
+        }
+        .sample(out, n, off, step);
     }
 
     /// History points between redraws of graphs and strips: 2 (one braille column),
@@ -895,82 +1150,17 @@ impl App {
         true
     }
 
-    /// Smooth-mode animation frame: only the core bars move (numbers, graphs and
-    /// order change with samples, in `draw`).
+    /// Smooth-mode in-between frame: only the core cards (their bars and digits);
+    /// the panels and graphs change on the other frames, in `draw`.
     pub fn draw_bars(&mut self, scr: &mut Screen) {
-        if self.menu.is_some() {
-            return;
+        if self.menu.is_none() {
+            prof(11, || self.draw_cores(scr, false));
         }
-        if self.lay.compact {
-            self.draw_cores(scr, false);
-            return;
-        }
-        // full cards: touch only the bar cells whose fill changed (same geometry and
-        // row memo as draw_card, which drew every row at the last sample)
-        let l = &self.lay;
-        let ir = l.cores.inner();
-        let mut rm = std::mem::take(&mut self.row_memo);
-        for c in 0..l.cols {
-            let (cx, cw) = l.card_x[c];
-            let geo = self.geo(cw, M_FULL);
-            let (fw, lw) = (geo.fw, geo.lw);
-            let xb = ir.x + cx + geo.xb;
-            let xl = ir.x + cx + geo.xl;
-            for vr in 0..l.vis_rows {
-                let r = vr + self.scroll;
-                let y = self.row_y(c, vr);
-                if r >= l.nrows || y + l.rh > ir.y + ir.h {
-                    break;
-                }
-                let Some(&g) = self.order.get(c * l.nrows + r) else {
-                    continue;
-                };
-                let bg = if g == self.selected {
-                    surf(S_SELECT)
-                } else {
-                    surf(S_PANEL)
-                };
-                for (j, &t) in self.s.t.groups[g].iter().take(l.rh).enumerate() {
-                    let Some(m) = rm.get_mut(t) else { continue };
-                    if m[0] == u32::MAX || m[2] == u32::MAX {
-                        continue;
-                    }
-                    let f8 = eighths(self.bf[t], fw) as u32;
-                    if m[0] & 0xffff != f8 {
-                        let ramp = if m[0] >> 16 != 0 {
-                            &self.t.freq_idle
-                        } else {
-                            &self.t.freq
-                        };
-                        let old = (m[0] & 0xffff) as usize;
-                        self.meter_to(scr, xb, y + j, old, f8 as usize, fw, ramp, bg, CLK);
-                        m[0] = (m[0] & !0xffff) | f8;
-                    }
-                    let u8v = eighths(self.bu[t], lw) as u32;
-                    if m[2] != u8v {
-                        let old = m[2] as usize;
-                        self.meter_to(
-                            scr,
-                            xl,
-                            y + j,
-                            old,
-                            u8v as usize,
-                            lw,
-                            &self.t.load,
-                            bg,
-                            LOAD,
-                        );
-                        m[2] = u8v;
-                    }
-                }
-            }
-        }
-        self.row_memo = rm;
     }
 
     pub fn draw(&mut self, scr: &mut Screen, full: bool) {
         let full = full || self.menu.is_some();
-        if !self.paused {
+        if !self.paused && !self.anim {
             prof(13, || {
                 self.prev_order.clone_from(&self.order);
                 self.resort();
@@ -1013,20 +1203,28 @@ impl App {
             prof(8, || self.draw_title(scr, full));
         }
         if self.lay.top.is_some() {
-            let s = &self.s;
-            let ku = (s.tot_u * 100.0).round() as u64;
-            let topf = s.f.iter().copied().fold(0.0, f32::max);
-            let kf = mixk(&[(s.avg_f / 10.0) as u64, (topf / 10.0) as u64]);
-            let ks = mixk(&[sensors_key(s), hn / 2]);
-            let body = self.memo(SLOT_GBODY, hn / self.hist_step());
+            let (u, f, topf) = self.totals();
+            let ku = (u * 100.0).round() as u64;
+            let kf = mixk(&[(f / 10.0) as u64, (topf / 10.0) as u64]);
+            let ks = mixk(&[sensors_key(&self.s), hn / 2]);
+            let kd = self.sensors_dyn_key();
+            let kh = self.body_key(2);
+            let body = self.memo(SLOT_GBODY, self.body_key(0));
             if self.memo(SLOT_GLOAD, ku) || body {
                 prof(9, || self.draw_gload(scr, full, body));
             }
+            let body = self.memo(SLOT_GBODY2, self.body_key(0));
             if self.memo(SLOT_GFREQ, kf) || body {
                 prof(9, || self.draw_gfreq(scr, full, body));
             }
-            if self.memo(SLOT_SENSORS, ks) {
-                prof(10, || self.draw_sensors(scr, full));
+            // static rows, live rows (temperatures, CCDs), temperature history
+            let parts = self.memo(SLOT_SENSORS, ks) as u8
+                | (self.memo(SLOT_SDYN, kd) as u8) << 1
+                | (self.memo(SLOT_SHIST, kh) as u8) << 2;
+            if parts != 0 || full {
+                prof(10, || {
+                    self.draw_sensors(scr, full, if full { 7 } else { parts })
+                });
             }
         }
         prof(11, || self.draw_cores(scr, full));
@@ -1044,7 +1242,7 @@ impl App {
                     (s.peak[c] / 10.0) as u64,
                 ]);
             }
-            let body = self.memo(SLOT_DBODY, hn / self.hist_step());
+            let body = self.memo(SLOT_DBODY, self.body_key(2));
             if self.memo(SLOT_DETAIL, k) || body {
                 prof(12, || self.draw_detail(scr, full, body));
             }
@@ -1151,10 +1349,35 @@ impl App {
 
     /// Total load, fastest clock (MHz) and hottest sensor (°C, 0 if none).
     fn summary(&self) -> (f32, f32, f32) {
+        let (u, _, f) = self.totals();
+        let t = (0..self.s.temps.len())
+            .map(|k| self.temp(k).1)
+            .fold(0.0, f32::max);
+        (u, f, t)
+    }
+
+    /// Memo key of the sensors panel's live rows (smooth: as they move).
+    fn sensors_dyn_key(&self) -> u64 {
         let s = &self.s;
-        let f = s.f.iter().copied().fold(0.0, f32::max);
-        let t = s.temps.iter().map(|t| t.val).fold(0.0, f32::max);
-        (s.tot_u, f, t)
+        let bw = self.sensors_bw() as f32 * 16.0;
+        let mut k = 0;
+        for i in 0..s.temps.len() {
+            let (p, v) = self.temp(i);
+            k = mixk(&[k, ((p - 30.0) / 65.0 * bw) as u64, v.to_bits() as u64]);
+        }
+        for d in 0..s.t.ndom {
+            let (b, u, f) = self.ccd(d);
+            k = mixk(&[k, (b * bw) as u64, u.to_bits() as u64, f.to_bits() as u64]);
+        }
+        k
+    }
+
+    /// Width of the sensors panel's meters.
+    fn sensors_bw(&self) -> usize {
+        let w = self.lay.sensors.inner().w;
+        let tsw = if w >= 32 { 8 } else { 0 };
+        w.saturating_sub(13 + if tsw > 0 { tsw + 2 } else { 0 })
+            .max(4)
     }
 
     fn draw_title(&self, scr: &mut Screen, full: bool) {
@@ -1431,7 +1654,7 @@ impl App {
     fn draw_gload(&mut self, scr: &mut Screen, full: bool, body: bool) {
         let r = self.lay.g_load;
         let th = &self.t;
-        let u = self.s.tot_u;
+        let u = self.totals().0;
         let ir = r.inner();
         let pct = num("", u * 100.0, 0, "%");
         let title: [(&str, u32); 2] = [("cpu ", th.title | BOLD), (pct.s(), th.load.at(u) | BOLD)];
@@ -1446,7 +1669,7 @@ impl App {
             return;
         }
         let mut vals = std::mem::take(&mut self.vals);
-        self.s.h_tot.tail(2 * ir.w, 0.0, &mut vals);
+        self.hist_vals(&mut vals, 2 * ir.w, 0.0, 1.0, Hist::Tot);
         self.axis_graph(
             scr,
             ir.x,
@@ -1466,8 +1689,7 @@ impl App {
         let th = &self.t;
         let s = &self.s;
         let maxf = s.t.maxf;
-        let avg = s.avg_f;
-        let topf = s.f.iter().copied().fold(0.0, f32::max);
+        let (_, avg, topf) = self.totals();
         let ir = r.inner();
         let (ga, gt) = (ghz(avg), ghz(topf));
         let (ca, ct) = (
@@ -1504,7 +1726,7 @@ impl App {
             return;
         }
         let mut vals = std::mem::take(&mut self.vals);
-        self.s.h_avg.tail(2 * ir.w, 0.0, &mut vals);
+        self.hist_vals(&mut vals, 2 * ir.w, 0.0, 1.0, Hist::Avg);
         let (m1, m2) = (ghz(maxf), ghz(maxf / 2.0));
         self.axis_graph(
             scr,
@@ -1532,13 +1754,13 @@ impl App {
         bg: u32,
         g: char,
     ) {
-        let n8 = eighths(frac, w);
+        let n = fill16(frac, w);
         for i in 0..w {
-            Self::bar_cell(scr, x, y, i, n8, w, ramp, bg, g);
+            Self::bar_cell(scr, x, y, i, n, w, ramp, bg, g);
         }
     }
 
-    /// Cell `i` of a half-block bar filled to `n8` eighths: the edge cell is the bar
+    /// Cell `i` of a half-block bar filled to `n` sixteenths: the edge cell is the bar
     /// colour blended into the track by its covered fraction (sub-cell resolution).
     #[allow(clippy::too_many_arguments)]
     #[inline]
@@ -1547,24 +1769,24 @@ impl App {
         x: usize,
         y: usize,
         i: usize,
-        n8: usize,
+        n: usize,
         w: usize,
         ramp: &crate::color::Ramp,
         bg: u32,
         g: char,
     ) {
         let den = (w.max(2) - 1) as f32;
-        let fg = if i < n8 / 8 {
+        let fg = if i < n / 16 {
             ramp.at(i as f32 / den)
-        } else if i == n8 / 8 && n8 % 8 > 0 {
-            ramp.at(i as f32 / den) | ((n8 % 8) as u32) << BLEND_SHIFT
+        } else if i == n / 16 && n % 16 > 0 {
+            ramp.at(i as f32 / den) | ((n % 16) as u32) << BLEND_SHIFT
         } else {
             TRACK
         };
         scr.put(x + i, y, g, fg, bg);
     }
 
-    /// Update a meter drawn earlier filled to `old` eighths: only the cells in between
+    /// Update a meter drawn earlier filled to `old` sixteenths: only the cells in between
     /// change (the gradient is fixed per position).
     #[allow(clippy::too_many_arguments)]
     fn meter_to(
@@ -1579,12 +1801,13 @@ impl App {
         bg: u32,
         g: char,
     ) {
-        for i in old.min(n) / 8..(old.max(n) / 8 + 1).min(w) {
+        for i in old.min(n) / 16..(old.max(n) / 16 + 1).min(w) {
             Self::bar_cell(scr, x, y, i, n, w, ramp, bg, g);
         }
     }
 
-    fn draw_sensors(&mut self, scr: &mut Screen, full: bool) {
+    /// `parts`: 1 static rows, 2 live rows (temperatures, CCDs), 4 temperature history.
+    fn draw_sensors(&mut self, scr: &mut Screen, full: bool, parts: u8) {
         let r = self.lay.sensors;
         if full {
             self.panel(scr, r, &[("sensors", self.t.title | BOLD)], "");
@@ -1598,9 +1821,7 @@ impl App {
         let s = &self.s;
         // wide enough: bar + value + a history strip (4 s per cell) per sensor
         let tsw = if ir.w >= 32 { 8 } else { 0 };
-        let bw =
-            ir.w.saturating_sub(13 + if tsw > 0 { tsw + 2 } else { 0 })
-                .max(4);
+        let bw = self.sensors_bw();
         let nt = s.temps.len().max(1);
         let skip_blank = nt + 5 > ir.h;
         let mut y = ir.y;
@@ -1617,15 +1838,29 @@ impl App {
             );
             y += 1;
         }
-        for sn in &s.temps {
+        for (k, sn) in s.temps.iter().enumerate() {
             if y >= maxy {
                 break;
             }
-            let x = (sn.val - 30.0) / 65.0;
+            if parts & 3 == 0 {
+                y += 1;
+                continue;
+            }
+            let (pos, val) = self.temp(k);
+            let x = (val - 30.0) / 65.0;
             let lab = f!("{:<6}", sn.label);
             scr.text(ir.x, y, lab.s(), th.mid, bg, ir.x + 6);
-            self.meter(scr, ir.x + 6, y, x, bw, &th.temp, bg, LOAD);
-            let v = num(" ", sn.val, 4, "°C");
+            self.meter(
+                scr,
+                ir.x + 6,
+                y,
+                (pos - 30.0) / 65.0,
+                bw,
+                &th.temp,
+                bg,
+                LOAD,
+            );
+            let v = num(" ", val, 4, "°C");
             Self::line(
                 scr,
                 ir.x + 6 + bw,
@@ -1636,9 +1871,7 @@ impl App {
             );
             if tsw > 0 {
                 // the hottest reading in the history window, after the value
-                let mx = (0..sn.hist.len())
-                    .map(|k| sn.hist.back(k))
-                    .fold(sn.val, f32::max);
+                let mx = sn.max.max(val);
                 let m = num("", mx, 0, "°");
                 let fm = ((mx - 30.0) / 65.0).clamp(0.0, 1.0);
                 Self::line(
@@ -1736,6 +1969,10 @@ impl App {
             if y >= maxy {
                 break;
             }
+            if parts & 1 == 0 {
+                y += 1;
+                continue;
+            }
             let sp = vs
                 .iter()
                 .find(|v| Self::spans_len(v) <= ir.w)
@@ -1748,13 +1985,17 @@ impl App {
         if nd > 1 && y + 1 + nd <= maxy && ir.w >= 24 {
             y += 1;
             for d in 0..nd {
-                let (u, f, _) = ccd_stats(s, d);
+                if parts & 2 == 0 {
+                    y += 1;
+                    continue;
+                }
+                let (bu, u, f) = self.ccd(d);
                 let lab = f!("CCD{d}");
                 scr.text(ir.x, y, lab.s(), th.mid, bg, ir.x + 6);
                 for x in ir.x + lab.n..ir.x + 6 {
                     scr.put(x, y, ' ', 0, bg);
                 }
-                self.meter(scr, ir.x + 6, y, u, bw, &th.load, bg, LOAD);
+                self.meter(scr, ir.x + 6, y, bu, bw, &th.load, bg, LOAD);
                 let pc = num(" ", u * 100.0, 3, "%");
                 let gz = ghz(f);
                 Self::line(
@@ -1775,7 +2016,7 @@ impl App {
         }
         // spare height: temperature history
         let gh = maxy.saturating_sub(y + 2);
-        if let (Some(sn), true) = (s.temps.first(), gh >= 2) {
+        if let (Some(sn), true) = (s.temps.first(), gh >= 2 && parts & 4 != 0) {
             y += 1;
             let win = span(2 * ir.w.saturating_sub(5));
             let a = f!("{} history", sn.label);
@@ -1783,7 +2024,7 @@ impl App {
             Self::line(scr, ir.x, y, maxx, bg, &[(a.s(), th.mid), (b.s(), th.dim)]);
             y += 1;
             let mut vals = std::mem::take(&mut self.vals);
-            self.s.temps[0].hist.tail(2 * ir.w, 0.0, &mut vals);
+            self.hist_vals(&mut vals, 2 * ir.w, 0.0, 1.0, Hist::Temp(0));
             for v in vals.iter_mut() {
                 *v = (*v - 30.0).max(0.0);
             }
@@ -1995,14 +2236,13 @@ impl App {
                 self.s.hist_n.min(4096) / 64,
             ]);
             for d in 0..self.s.t.ndom {
-                k = mixk(&[k, self.s.domain_temp(d).map_or(0, |t| t.round() as u64)]);
+                k = mixk(&[k, self.dom_temp(d).map_or(0, |t| t.round() as u64)]);
             }
             if self.memo(SLOT_HEADER, k) {
                 self.draw_cores_header(scr, ir);
             }
         }
         let l = self.lay.clone();
-        let hn = self.s.hist_n;
         for c in 0..l.cols {
             let (cx, cw) = l.card_x[c];
             let geo = self.geo(cw, l.mode);
@@ -2024,14 +2264,14 @@ impl App {
                 let mut key = [0u64; 12];
                 key[0] = (g == self.selected) as u64 | (k as u64) << 1 | (y as u64) << 20;
                 if l.compact {
-                    key[1] = if geo.sw > 0 { hn / self.hist_step() } else { 0 };
+                    key[1] = if geo.sw > 0 { self.strip_key(g) } else { 0 };
                     let (f, b, idle) = self.core_clock(&s.t.groups[g]);
                     key[2] =
-                        (f / 10.0) as u64 | (eighths(b, geo.fw) as u64) << 32 | (idle as u64) << 60;
+                        (f / 10.0) as u64 | (fill16(b, geo.fw) as u64) << 32 | (idle as u64) << 60;
                     for (j, &t) in s.t.groups[g].iter().take(4).enumerate() {
                         let u = self.shown(t).1;
                         key[3 + 2 * j] =
-                            (u * 1000.0) as u64 | (eighths(self.bu[t], geo.lw) as u64) << 32;
+                            (u * 1000.0) as u64 | (fill16(self.bu[t], geo.lw) as u64) << 32;
                         key[4 + 2 * j] = (self.shown(t).0 / 10.0) as u64;
                     }
                 }
@@ -2078,7 +2318,7 @@ impl App {
             let label = |d: usize, scr: &mut Screen, y: usize| -> usize {
                 let lab = f!("{lead}CCD{d}");
                 let mut x = scr.text(x0, y, lab.s(), th.text | BOLD, bg, maxx);
-                if let Some(temp) = s.domain_temp(d) {
+                if let Some(temp) = self.dom_temp(d) {
                     let tt = num(" ", temp, 0, "°");
                     x = scr.text(x, y, tt.s(), th.temp.at((temp - 30.0) / 65.0), bg, maxx);
                 }
@@ -2106,7 +2346,7 @@ impl App {
             } else if s.t.ndom > 1 && !multi && dom != usize::MAX && self.sort == 0 {
                 let lab = f!("{lead}CCD{dom}");
                 x = scr.text(x0, ir.y, lab.s(), th.text | BOLD, bg, maxx);
-                if let Some(temp) = s.domain_temp(dom) {
+                if let Some(temp) = self.dom_temp(dom) {
                     let tt = num(" ", temp, 0, "°");
                     x = scr.text(x, ir.y, tt.s(), th.temp.at((temp - 30.0) / 65.0), bg, maxx);
                 }
@@ -2182,7 +2422,6 @@ impl App {
         let (fw, lw, sw) = (geo.fw, geo.lw, geo.sw);
         let idw = self.idw;
         let active = threads.iter().any(|&c| self.shown(c).1 >= 0.05);
-        let hn = s.hist_n as u32;
         for j in 0..rh {
             let y = y0 + j;
             let Some(&c) = threads.get(j) else {
@@ -2194,19 +2433,15 @@ impl App {
             let (f, u) = self.shown(c);
             let idle = u < 0.01 && f <= s.t.minf * 1.05 + 1.0;
             let (bf, bu) = (self.bf[c], self.bu[c]);
-            let fnn = eighths(bf, fw) as u32;
-            let lnn = eighths(bu, lw) as u32;
+            let fnn = fill16(bf, fw) as u32;
+            let lnn = fill16(bu, lw) as u32;
             let pct = (u * 100.0).round() as u32;
             let keys = [
                 fnn | (idle as u32) << 16,
                 (f / 10.0) as u32 | (idle as u32) << 24,
                 lnn,
                 pct | ((u * 64.0).round() as u32) << 8,
-                if sw > 0 {
-                    hn / self.hist_step() as u32
-                } else {
-                    0
-                },
+                if sw > 0 { self.strip_key(g) as u32 } else { 0 },
                 (j == 0 && (sel || active)) as u32,
             ];
             let mut memo = if force || c >= rm.len() {
@@ -2420,21 +2655,21 @@ impl App {
     /// load, faded from there to the busier one's (edge cells blend, as in `meter`).
     #[allow(clippy::too_many_arguments)]
     fn split_meter(&self, scr: &mut Screen, x: usize, y: usize, a: f32, b: f32, w: usize, bg: u32) {
-        let (lo, hi) = (eighths(a.min(b), w), eighths(a.max(b), w));
+        let (lo, hi) = (fill16(a.min(b), w), fill16(a.max(b), w));
         let den = (w.max(2) - 1) as f32;
         let (full, one) = (&self.t.load, &self.t.load_one);
         for i in 0..w {
             let t = i as f32 / den;
             // whole cells of the lower bar; its edge cell counts if at least half full
-            let in_lo = i < lo / 8 || (i == lo / 8 && lo % 8 >= 4);
-            let fg = if i < hi / 8 {
+            let in_lo = i < lo / 16 || (i == lo / 16 && lo % 16 >= 8);
+            let fg = if i < hi / 16 {
                 if in_lo {
                     full.at(t)
                 } else {
                     one.at(t)
                 }
-            } else if i == hi / 8 && hi % 8 > 0 {
-                (if in_lo { full.at(t) } else { one.at(t) }) | ((hi % 8) as u32) << BLEND_SHIFT
+            } else if i == hi / 16 && hi % 16 > 0 {
+                (if in_lo { full.at(t) } else { one.at(t) }) | ((hi % 16) as u32) << BLEND_SHIFT
             } else {
                 TRACK
             };
@@ -2442,11 +2677,46 @@ impl App {
         }
     }
 
+    /// Smooth mode: mean load of `thr` per history cell (`STRIP_SECS` each, newest
+    /// last) from the scrolling curve, into `out` (`w` values). Returns how many cells
+    /// (from the right) the history covers.
+    fn cells_smooth(&self, out: &mut Vec<f32>, w: usize, thr: &[usize]) -> usize {
+        const K: usize = 4; // samples per cell
+        let st = STRIP_SECS as f32 / K as f32;
+        self.hist_vals(out, w * K, st / 2.0, st, Hist::Load(thr));
+        for i in 0..w {
+            out[i] = out[i * K..i * K + K].iter().sum::<f32>() / K as f32;
+        }
+        out.truncate(w);
+        let len = thr.iter().map(|&c| self.s.hu[c].len()).min().unwrap_or(0);
+        (((len as f32 + self.phase) / STRIP_SECS as f32) as usize).min(w)
+    }
+
     /// Load history of `thr` (averaged) as a strip of eighth-blocks, newest on the
     /// right, `STRIP_SECS` per cell; buckets are aligned to whole cells so the strip
     /// moves once per cell, not with every point.
     #[allow(clippy::too_many_arguments)]
     fn strip(&self, scr: &mut Screen, x: usize, y: usize, thr: &[usize], w: usize, bg: u32) {
+        if self.smooth() {
+            let mut v = self.scratch.borrow_mut();
+            let have = self.cells_smooth(&mut v, w, thr);
+            for i in 0..w {
+                let xx = x + w - 1 - i;
+                if i >= have {
+                    scr.put(xx, y, ' ', NOPATCH, bg);
+                    continue;
+                }
+                let u = v[w - 1 - i];
+                let lv = (u * 4.0).round() as usize;
+                if lv == 0 {
+                    scr.put(xx, y, '▁', TRACK, bg);
+                } else {
+                    let q = (u * 16.0).round() / 16.0;
+                    scr.put(xx, y, BLOCKS[lv.min(4) - 1], self.t.load.at(q), bg);
+                }
+            }
+            return;
+        }
         let s = &self.s;
         let k = STRIP_SECS;
         let lag = (s.hist_n % k as u64) as usize;
@@ -2518,7 +2788,7 @@ impl App {
         (k < self.ngroups()).then_some(k)
     }
 
-    fn draw_grid(&mut self, scr: &mut Screen, r: Rect, full: bool, body: bool) {
+    fn draw_grid(&mut self, scr: &mut Screen, r: Rect, full: bool, body: bool, stats: bool) {
         let th = &self.t;
         let Some((g, rows, cols, cw, ch)) = self.grid_geo(r) else {
             return;
@@ -2590,26 +2860,13 @@ impl App {
             let gh = ch - 1;
             let fh = (gh * 2 / 5).max(1);
             let lh = gh - fh;
-            vals.clear();
-            vals.resize(2 * cw, 0.0);
-            for &c in thr {
-                self.s.hf[c].tail(2 * cw, 0, &mut v16);
-                for (o, &v) in vals.iter_mut().zip(v16.iter()) {
-                    *o = o.max(v as f32);
-                }
-            }
+            self.hist_vals(&mut vals, 2 * cw, 0.0, 1.0, Hist::Clock(thr));
             self.graph(scr, x, y + 1, cw, fh, &vals, maxf, &th.freq);
-            vals.iter_mut().for_each(|v| *v = 0.0);
-            for &c in thr {
-                self.s.hu[c].tail(2 * cw, 0, &mut v8);
-                for (o, &v) in vals.iter_mut().zip(v8.iter()) {
-                    *o += v as f32 / 255.0 / thr.len() as f32;
-                }
-            }
+            self.hist_vals(&mut vals, 2 * cw, 0.0, 1.0, Hist::Load(thr));
             self.graph(scr, x, y + 1 + fh, cw, lh, &vals, 1.0, &th.load);
         }
         // the selected core's numbers on the right
-        if full || body {
+        if stats {
             let ir = r.inner();
             let sx = ir.x + ir.w - GRID_STATS;
             for yy in 0..ir.h {
@@ -2660,7 +2917,11 @@ impl App {
 
     /// Detail area as a load heatmap of every core over time (two cores per row:
     /// upper and lower half of each cell), the selected core's statistics beside it.
-    fn draw_heat(&mut self, scr: &mut Screen, r: Rect, full: bool) {
+    fn draw_heat(&mut self, scr: &mut Screen, r: Rect, full: bool, stats: bool) {
+        let (mut ca, mut cb) = (
+            std::mem::take(&mut self.vals),
+            std::mem::take(&mut self.vals2),
+        );
         let th = &self.t;
         let ir = r.inner();
         let n = self.ngroups();
@@ -2731,23 +2992,40 @@ impl App {
                 x += 1;
             }
             let ta = &self.s.t.groups[ga];
+            let smooth = self.smooth();
+            let (mut ha, mut hb) = (0, 0);
+            if smooth {
+                ha = self.cells_smooth(&mut ca, hw, ta);
+                if gb < n {
+                    hb = self.cells_smooth(&mut cb, hw, &self.s.t.groups[gb]);
+                }
+            }
             for i in 0..hw {
-                let va = self.cell_load(ta, i);
+                let va = if smooth {
+                    (i < ha).then(|| ca[hw - 1 - i])
+                } else {
+                    self.cell_load(ta, i)
+                };
                 if va.is_none() {
                     // before the history starts: plain panel (the picture shows through)
                     scr.put(hx + hw - 1 - i, y, ' ', NOPATCH, bg);
                     continue;
                 }
                 let up = heat(va);
-                let lo = if gb < n {
-                    heat(self.cell_load(&self.s.t.groups[gb], i))
-                } else {
+                let lo = if gb >= n {
                     th.panel
+                } else if smooth {
+                    heat((i < hb).then(|| cb[hw - 1 - i]))
+                } else {
+                    heat(self.cell_load(&self.s.t.groups[gb], i))
                 };
                 scr.put(hx + hw - 1 - i, y, '▀', up, lo);
             }
             y += 1;
         }
+        self.vals = ca;
+        self.vals2 = cb;
+        let th = &self.t;
         if axis {
             // minute ticks under the heatmap, "now" at the right
             let mut x = hx;
@@ -2766,7 +3044,7 @@ impl App {
             }
             scr.text(hx + hw - 3, y, "now", th.dim, bg, hx + hw);
         }
-        if stats_w > 0 {
+        if stats_w > 0 && stats {
             let sx = ir.x + ir.w - stats_w;
             for yy in 0..ir.h {
                 scr.put(sx - 2, ir.y + yy, '┃', th.border, bg);
@@ -2791,13 +3069,20 @@ impl App {
 
     fn draw_detail(&mut self, scr: &mut Screen, full: bool, body: bool) {
         let Some(r) = self.lay.det else { return };
+        // the selected core's statistics change with history points, not every frame
+        let sk = mixk(&[
+            self.selected as u64,
+            self.s.hist_n,
+            self.s.peak.iter().fold(0.0f32, |a, &b| a.max(b)) as u64,
+        ]);
+        let stats = self.memo(SLOT_STATS, sk) || full || (body && !self.smooth());
         if self.lay.grid {
-            self.draw_grid(scr, r, full, body);
+            self.draw_grid(scr, r, full, body, stats);
             return;
         }
         if !self.det_core && self.heat_fits(r) {
             if full || body {
-                self.draw_heat(scr, r, full);
+                self.draw_heat(scr, r, full, stats);
             }
             return;
         }
@@ -2821,7 +3106,16 @@ impl App {
         let mut vals = std::mem::take(&mut self.vals);
         let mut v16 = std::mem::take(&mut self.tmp16);
         let mut v8 = std::mem::take(&mut self.tmp8);
-        self.detail_body(scr, r, gi, &mut vals, &mut v16, &mut v8, full || body);
+        self.detail_body(
+            scr,
+            r,
+            gi,
+            &mut vals,
+            &mut v16,
+            &mut v8,
+            full || body,
+            stats,
+        );
         self.vals = vals;
         self.tmp16 = v16;
         self.tmp8 = v8;
@@ -2837,6 +3131,7 @@ impl App {
         v16: &mut Vec<u16>,
         v8: &mut Vec<u8>,
         body: bool,
+        stats: bool,
     ) {
         let threads = &self.s.t.groups[gi];
         let th = &self.t;
@@ -2896,9 +3191,7 @@ impl App {
                 x += cw + gap;
                 continue;
             }
-            s.hf[c].tail(2 * gw, 0, v16);
-            vals.clear();
-            vals.extend(v16.iter().map(|&v| v as f32));
+            self.hist_vals(vals, 2 * gw, 0.0, 1.0, Hist::Clock(&threads[i..i + 1]));
             let (mx, md) = (ghz(maxf), ghz(maxf / 2.0));
             // no "0" at the clock's foot: the load graph's "100%" sits right below it
             let fl: &[(f32, &str)] = if fh >= 5 {
@@ -2907,9 +3200,7 @@ impl App {
                 &[(1.0, mx.s())]
             };
             self.axis_graph(scr, x, ir.y + 1, gw, fh, vals, maxf, &th.freq, fl);
-            self.s.hu[c].tail(2 * gw, 0, v8);
-            vals.clear();
-            vals.extend(v8.iter().map(|&v| v as f32 / 255.0));
+            self.hist_vals(vals, 2 * gw, 0.0, 1.0, Hist::Load(&threads[i..i + 1]));
             let ll: &[(f32, &str)] = if lh >= 2 {
                 &[(1.0, "100%"), (0.0, "0")]
             } else {
@@ -2918,7 +3209,7 @@ impl App {
             self.axis_graph(scr, x, ir.y + 1 + fh, gw, lh, vals, 1.0, &th.load, ll);
             x += cw + gap;
         }
-        if stats_w > 0 && body {
+        if stats_w > 0 && stats {
             let sx = ir.x + w - stats_w;
             for yy in 0..h {
                 scr.put(sx - 2, ir.y + yy, '┃', th.border, bg);
@@ -3336,44 +3627,7 @@ mod tests {
     }
 
     #[test]
-    fn spring_eases_without_overshoot_and_settles() {
-        let (mut x, mut v) = (0.0f32, 0.0f32);
-        let dt = 1.0 / 60.0;
-        let ex = (-SPRING_W * dt).exp();
-        let mut prev = 0.0;
-        let mut frames = 0;
-        while spring(&mut x, &mut v, 1.0, dt, ex, 0.002) {
-            assert!(
-                x >= prev - 1e-6 && x <= 1.0 + 1e-3,
-                "monotone, no overshoot: {x}"
-            );
-            prev = x;
-            frames += 1;
-            assert!(frames < 120, "settles within 2 s");
-        }
-        assert_eq!((x, v), (1.0, 0.0), "snaps exactly onto the target");
-        assert!(
-            frames > 6,
-            "eases over several frames, not a jump ({frames})"
-        );
-        // frame-rate independent: two half steps land where one full step does
-        let (mut a, mut va, mut b, mut vb) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        spring(&mut a, &mut va, 1.0, 0.1, (-SPRING_W * 0.1f32).exp(), 1e-6);
-        for _ in 0..2 {
-            spring(
-                &mut b,
-                &mut vb,
-                1.0,
-                0.05,
-                (-SPRING_W * 0.05f32).exp(),
-                1e-6,
-            );
-        }
-        assert!((a - b).abs() < 1e-4 && (va - vb).abs() < 1e-3);
-    }
-
-    #[test]
-    fn smooth_bars_follow_samples_and_come_to_rest() {
+    fn smooth_bars_and_digits_follow_samples_and_come_to_rest() {
         let mut a = app(16, 2, 2);
         a.fit(172, 40);
         a.speed = SMOOTH;
@@ -3384,47 +3638,77 @@ mod tests {
             a.s.ur[i] = 0.3;
         }
         a.retarget();
-        let mut t = 0.0;
-        let mut fast = a.bars_step(1.0 / 60.0);
-        assert!(
-            fast > 60.0,
-            "a big step moves faster than an eighth per frame"
-        );
-        while fast > 0.0 {
-            fast = a.bars_step(1.0 / 60.0);
-            t += 1.0 / 60.0;
-            assert!(t < 2.0);
+        let dt = 1.0 / crate::anim::FPS as f32;
+        let (mut t, mut prev, mut digits) = (0.0, 0.0, vec![a.shown(0).1]);
+        while a.anim_step(dt) {
+            a.anim_numbers(dt);
+            assert!(
+                a.bu[0] >= prev && a.bu[0] <= 0.3 + 1e-6,
+                "monotone, no overshoot"
+            );
+            prev = a.bu[0];
+            if digits.last() != Some(&a.shown(0).1) {
+                digits.push(a.shown(0).1);
+            }
+            t += dt;
+            assert!(t < 3.0);
         }
+        a.anim_numbers(dt);
         assert!(a.bu.iter().all(|&u| u == 0.3));
         assert!(a.bf.iter().all(|&f| f == 5000.0 / 5760.0));
-        // noise below the deadband doesn't move a settled bar; 0 % always does
-        a.s.ur[0] = 0.305;
-        a.s.ur[1] = 0.0;
-        a.retarget();
-        a.bars_step(1.0 / 60.0);
-        assert_eq!(a.bu[0], 0.3);
-        assert!(a.bu[1] < 0.3);
-        // numbers show where the bars are
-        a.snap_numbers();
-        assert_eq!(a.shown(0), (5000.0, 0.3));
+        // the digits counted up through the values in between, ending on the target
+        assert!(digits.len() > 10 && digits.windows(2).all(|w| w[1] > w[0]));
+        assert!((a.shown(0).1 - 0.3).abs() < 1e-6 && a.shown(0).0 == 5000.0);
+        // the numbers drawn and the totals follow the bars
+        assert!((a.totals().0 - 0.3).abs() < 1e-6);
+        let mut scr = Screen::new(172, 40);
+        a.draw(&mut scr, true);
         // other speeds: bars jump to the sample
         a.speed = 0;
+        a.s.ur[0] = 0.5;
         a.bars_snap();
-        assert_eq!(a.bu[0], 0.305);
+        assert_eq!(a.bu[0], 0.5);
     }
 
     #[test]
-    fn bars_have_eighth_cell_resolution() {
-        assert_eq!(eighths(0.0, 10), 0);
-        assert_eq!(eighths(1.0, 10), 80);
-        assert_eq!(eighths(0.5 + 1.0 / 160.0, 10), 41);
-        assert_eq!(eighths(2.0, 10), 80);
+    fn smooth_history_scrolls_with_the_live_value_at_its_head() {
+        let mut a = app(16, 2, 2);
+        a.first_size(172, 40);
+        let mut v = Vec::new();
+        // other speeds: the points as they are
+        a.hist_vals(&mut v, 4, 0.0, 1.0, Hist::Tot);
+        assert_eq!(v, vec![0.3; 4]);
+        a.speed = SMOOTH;
+        a.bars_snap();
+        a.bu.iter_mut().for_each(|u| *u = 0.9);
+        a.phase = 0.5;
+        a.hist_vals(&mut v, 4, 0.0, 1.0, Hist::Tot);
+        assert!((v[3] - 0.9).abs() < 1e-6, "{v:?}"); // age 0: live
+        assert!((v[2] - 0.3).abs() < 1e-6, "{v:?}"); // age 1: newest point
+                                                     // strips / heatmap cells: means over 2 s
+        let thr = a.s.t.groups[0].clone();
+        let mut c = Vec::new();
+        let have = a.cells_smooth(&mut c, 6, &thr);
+        assert_eq!((c.len(), have), (6, 6));
+        let mut scr = Screen::new(172, 40);
+        a.draw(&mut scr, true);
+        a.anim = true;
+        a.frame += 1;
+        a.draw(&mut scr, false);
+    }
+
+    #[test]
+    fn bars_have_sixteenth_cell_resolution() {
+        assert_eq!(fill16(0.0, 10), 0);
+        assert_eq!(fill16(1.0, 10), 160);
+        assert_eq!(fill16(0.5 + 1.0 / 320.0, 10), 81);
+        assert_eq!(fill16(2.0, 10), 160);
         let a = app(4, 1, 1);
         let mut scr = Screen::new(12, 1);
-        a.meter(&mut scr, 0, 0, 0.3125, 10, &a.t.load, surf(S_PANEL), LOAD); // 3 1/8 cells
+        a.meter(&mut scr, 0, 0, 0.30625, 10, &a.t.load, surf(S_PANEL), LOAD); // 3 1/16 cells
         let cell = |i: usize| scr.buf[i].fg;
         assert!((0..3).all(|i| cell(i) & (TRACK | BLEND) == 0));
-        assert_eq!((cell(3) & BLEND) >> BLEND_SHIFT, 1, "edge cell covers 1/8");
+        assert_eq!((cell(3) & BLEND) >> BLEND_SHIFT, 1, "edge cell covers 1/16");
         assert!((4..10).all(|i| cell(i) & TRACK != 0));
     }
 

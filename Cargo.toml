@@ -11,6 +11,8 @@ rust-version = "1.82"
 default = ["images"]
 # JPEG + PNG wallpapers (zune-jpeg / zune-png). Without it, procedural themes still work.
 images = ["dep:zune-jpeg", "dep:zune-png", "dep:zune-core"]
+# phase profiler (CPUVIEW_PROFILE=path), for development
+prof = []
 
 [dependencies]
 libc = "0.2"

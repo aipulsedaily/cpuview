@@ -50,6 +50,23 @@ fn lin_table() -> &'static [f32; 256] {
     })
 }
 
+/// `mix` in linear light: an anti-aliased edge covering `t` of a cell emits `t` of
+/// the colour's light, so a bar end moves at an even perceived speed across a cell.
+pub fn mix_lin(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let l = lin_table();
+    let (a, b) = (ch(a), ch(b));
+    let m = |i: usize| {
+        let v = l[a[i] as usize] + (l[b[i] as usize] - l[a[i] as usize]) * t;
+        let s = if v <= 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    };
+    rgb(m(0), m(1), m(2))
+}
+
 /// WCAG relative luminance.
 pub fn lum(c: Rgb) -> f32 {
     let t = lin_table();

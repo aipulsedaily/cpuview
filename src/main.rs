@@ -1,5 +1,6 @@
 //! cpuview — btop-style per-core CPU clock / load / temperature monitor.
 
+mod anim;
 mod bg;
 mod color;
 mod config;
@@ -35,8 +36,9 @@ usage: cpuview [options]
                         ~/.config/cpuview/images/ and remembered)
   --image-mode MODE     auto | kitty | sixel | iterm | blocks | blocks256 | terminal | off
   --speed SPEED         eco (default: adaptive 1-2 s, ≤ 0.01 % of one thread),
-                        smooth (5 samples/s, bars animated at up to 60 fps,
-                        ≤ 0.3 %), or updates per second: 1, 2, 4, 10, 20, 30, 60
+                        smooth (10 samples/s, everything animated at a steady
+                        60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
+                        20, 30, 60
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
@@ -473,13 +475,16 @@ impl State {
         self.render_with(false);
     }
 
-    /// Smooth-mode animation frame (bars only).
-    fn render_bars(&mut self) {
-        if self.full {
-            self.render();
-        } else {
+    /// Smooth-mode animation frame: everything moving is redrawn (`bars`: only the
+    /// core cards); the order is kept unless `resort`.
+    fn render_frame(&mut self, bars: bool, resort: bool) {
+        self.app.anim = !self.full && !resort;
+        if bars && !self.full {
             self.render_with(true);
+        } else {
+            self.render();
         }
+        self.app.anim = false;
     }
 
     fn render_with(&mut self, bars: bool) {
@@ -490,7 +495,13 @@ impl State {
         } else {
             prof(1, || self.app.draw(&mut self.scr, full));
         }
-        let patch = self.patch();
+        // smooth: picture patches only with full repaints, never mid-animation (cells
+        // that turn blank in between show the half-block backdrop until then)
+        let patch = if self.app.smooth() && !full {
+            Patch::None
+        } else {
+            self.patch()
+        };
         let mut pre = Vec::new();
         self.kitty_layers(&mut pre);
         if !pre.is_empty() {
@@ -784,36 +795,6 @@ fn auto_pin(t: &sys::Topo) {
         }
         libc::sched_setaffinity(0, sz, &set);
     }
-}
-
-/// Advance the smooth-mode bars to `now`; returns the fastest bar's speed in
-/// eighth-cells per second (0 = all settled).
-fn step_bars(app: &mut App, now: i64, anim_t: &mut i64, moving: bool) -> f32 {
-    // from rest, start with one frame's worth of motion
-    let dt = if moving {
-        ((now - *anim_t) as f32 / 1e9).clamp(0.0, 0.1)
-    } else {
-        1.0 / 60.0
-    };
-    *anim_t = now;
-    prof(14, || app.bars_step(dt))
-}
-
-/// Next animation frame: when the fastest bar has moved about one eighth of a cell
-/// (its next visible step), but no sooner than `min_gap` (1/60 s, or 1/30 s while
-/// over the CPU budget) and no later than 0.2 s. A frame that would land just before
-/// the next sample is folded into it. None when nothing moves.
-fn frame_at(fast: f32, now: i64, next_sample: i64, min_gap: i64) -> Option<i64> {
-    if fast <= 0.0 {
-        return None;
-    }
-    let gap = ((1e9 / fast) as i64).clamp(min_gap, 200_000_000);
-    let t = now + gap;
-    Some(if t + 6_000_000 >= next_sample {
-        next_sample
-    } else {
-        t
-    })
 }
 
 fn update_clock(app: &mut App) {
@@ -1151,8 +1132,8 @@ fn main() {
     st.app.bars_snap();
 
     // ── main loop ───────────────────────────────────────────────────────────
-    // The process sleeps in ppoll() until the next sample, the next minute (title
-    // clock) or input: nothing else ever wakes it.
+    // The process sleeps in ppoll() until the next sample, the next frame (smooth),
+    // the next minute (title clock) or input: nothing else ever wakes it.
     //
     // Speed (s / + / -): a fixed rate samples on a wall-clock grid of 1/hz s, history
     // graphs still get one point per second. Eco (the default) is adaptive:
@@ -1165,24 +1146,17 @@ fn main() {
     // stays under BUDGET whatever the machine (cold caches, many CPUs, busy system),
     // and any 60 s window stays under BUDGET + CAP / 60 (< 100 µs/s).
     //
-    // Smooth samples at 5/s (load over a 0.5 s window, see sys::WINDOW_NS); the
-    // numbers follow the bars at that rate, sorting and summaries at half of it.
-    // Between samples the bars ease toward the latest sample along critically
-    // damped springs: an animation frame is scheduled when the fastest bar has
-    // moved about an eighth of a cell, i.e. on its next visible step (at most 60
-    // frames/s, down to 30 while over the CPU budget), none once all have settled.
+    // Smooth samples 10 times a second (sys::dual) and draws on a fixed frame grid
+    // (anim::FPS, aligned with the samples): every frame advances the springs by
+    // exactly one grid step, digits follow the bars (with hysteresis), graphs scroll
+    // continuously (anim::Curve). Frames run while anything moves or scrolls; one
+    // write each, nothing when nothing changed. Should frames cost more than SM_BUDGET
+    // on average over ~5 s (huge screens), the frame rate is halved, and stays constant.
     const SEC: i64 = 1_000_000_000;
     const BUDGET: i64 = 70_000;
     const CAP: i64 = 1_200_000;
     const IDLE_GAP: i64 = 2;
-    // smooth: animation frames are capped at 60/s while within SM_BUDGET ns of CPU
-    // per second, sliding down to 30/s as the bucket (± SM_CAP) runs dry. A wakeup
-    // alone costs 3-30 µs depending on how deeply the core and its CCD were asleep.
-    const SM_BUDGET: i64 = 2_500_000;
-    const SM_CAP: i64 = 500_000;
-    let mut sm_tokens = SM_CAP;
-    let (mut sm_mark, mut sm_t) = (0i64, 0i64);
-    let mut min_gap = SEC / 60;
+    const SM_BUDGET: i64 = 5_000_000;
     let fixed: Option<i64> = std::env::var("CPUVIEW_PERIOD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1206,8 +1180,20 @@ fn main() {
     let mut last_min = last_sample_sec / 60;
     let mut winch_at: Option<i64> = None;
     let mut esc_at: Option<i64> = None;
+    // smooth: next frame on the grid, the time the animation state is at, frames per
+    // second, CPU accounting for the governor
     let mut next_frame: Option<i64> = None;
-    let mut anim_t = 0i64;
+    let mut anim_t = term::mono();
+    // CPUVIEW_FPS: smooth-mode frame rate (default anim::FPS)
+    let fps0: i64 = std::env::var("CPUVIEW_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(anim::FPS, |f: i64| f.clamp(10, 120));
+    let mut fps = fps0;
+    let mut fcount = 0u64;
+    let mut resort = false;
+    let mut settled = false; // smooth, paused and at rest: no frames
+    let (mut sm_cpu, mut sm_avg) = (term::cpu_ns(), 0i64);
     let mut buf = [0u8; 4096];
     let mut dirty = true;
     let mut running = true;
@@ -1230,7 +1216,21 @@ fn main() {
             last_tick = (term::mono() + offset) / period;
             tokens = CAP;
             cpu_mark = term::cpu_ns();
-            (sm_mark, sm_t) = (cpu_mark, term::mono());
+            let smooth = st.app.smooth();
+            st.app.s.dual = smooth;
+            // smooth: clocks shown as the clock while running
+            st.app.s.clock_hold = if smooth { 1_500_000_000 } else { 0 };
+            anim_t = term::mono();
+            fps = fps0;
+            sm_avg = 0;
+            if !smooth {
+                st.app.bars_snap();
+                next_frame = None;
+            }
+        }
+        let smooth = st.app.smooth();
+        if smooth && next_frame.is_none() && !(st.app.paused && settled) {
+            next_frame = Some(anim::next_frame(term::mono() + offset, fps) - offset);
         }
         let eco = fixed.is_none() && ui::SPEEDS[speed].1 == 0;
         // account the CPU time of the wakeup that just finished (eco only: reading
@@ -1305,6 +1305,7 @@ fn main() {
                 st.render();
                 dirty = false;
             }
+            settled = false;
             input_cpu += term::cpu_ns() - c0;
         }
         let now = term::mono();
@@ -1321,10 +1322,11 @@ fn main() {
             winch_at = None;
             st.resize();
             dirty = true;
+            fps = fps0;
+            sm_avg = 0;
         }
         // wakeups land a little after the deadline: round to the intended tick
-        let smooth = st.app.smooth();
-        let slack = (period / 5).min(if smooth { 3_000_000 } else { 20_000_000 });
+        let slack = (period / 5).min(if smooth { 2_000_000 } else { 20_000_000 });
         let sec = wall_sec(now + slack, offset);
         let tick = (now + slack + offset) / period;
         if sec / 60 != last_min {
@@ -1338,9 +1340,12 @@ fn main() {
             prof_count(6);
             let push = (sec - last_push_sec).clamp(0, 30) as u32;
             last_push_sec = sec;
-            // slow sensors: one temperature every 3 s (round robin), load average
-            // every 5 s, governor / EPP every 10 s
-            if sec - last_temp_sec >= 3 {
+            // slow sensors: one temperature every 3 s (round robin; smooth: all of
+            // them every second), load average every 5 s, governor / EPP every 10 s
+            if smooth && push > 0 {
+                last_temp_sec = sec;
+                prof(4, || st.app.s.read_temps(true));
+            } else if sec - last_temp_sec >= 3 {
                 last_temp_sec = sec;
                 prof(4, || st.app.s.read_temps(false));
             }
@@ -1352,27 +1357,29 @@ fn main() {
                 last_pol_sec = sec;
                 st.app.s.read_policy();
             }
-            // smooth: clocks shown as the clock while running
-            st.app.s.clock_hold = if smooth { 1_500_000_000 } else { 0 };
-            prof(0, || st.app.s.sample(push, true));
+            // smooth: clocks 5 times a second, numbers / order 2.5 times
+            let clocks = !smooth || tick % 2 == 0;
+            prof(0, || st.app.s.sample(push, clocks));
             if smooth {
-                // frame-rate governor, settled once per sample
-                let c = term::cpu_ns();
-                sm_tokens = (sm_tokens + SM_BUDGET * (now - sm_t) / SEC - (c - sm_mark))
-                    .clamp(-SM_CAP, SM_CAP);
-                (sm_mark, sm_t) = (c, now);
-                min_gap = SEC / (30 + 30 * sm_tokens.max(0) / SM_CAP);
-                if tick % 2 == 0 {
+                if tick % 4 == 0 {
                     st.app.s.publish();
+                    resort = true; // a new order may show with this frame
                 }
                 st.app.retarget();
-                let fast = step_bars(&mut st.app, now, &mut anim_t, next_frame.is_some());
-                st.app.snap_numbers();
-                next_frame = frame_at(fast, now, (tick + 1) * period - offset, min_gap);
+                if push > 0 {
+                    // frame-rate governor: CPU per second (averaged over ~5 s) against
+                    // SM_BUDGET
+                    let c = term::cpu_ns();
+                    sm_avg = (sm_avg * 4 + (c - sm_cpu) / push as i64) / 5;
+                    sm_cpu = c;
+                    if sm_avg > SM_BUDGET && fps > 15 {
+                        fps /= 2;
+                        sm_avg = 0;
+                    }
+                }
             } else {
                 st.app.s.publish();
                 st.app.bars_snap();
-                next_frame = None;
             }
             active_left = if st.app.s.activity > 0.15 {
                 5
@@ -1380,29 +1387,47 @@ fn main() {
                 active_left.saturating_sub(1)
             };
             update_clock(&mut st.app);
-            st.render();
-            dirty = false;
+            if !smooth {
+                st.render();
+                dirty = false;
+            }
             if eco {
                 let spent = term::cpu_ns() - cpu_mark - input_cpu - st.excluded;
                 est = ((est * 3 + spent) / 4).clamp(20_000, 2_000_000);
             }
-        } else {
-            if st.app.paused && sec > last_push_sec {
-                last_push_sec = sec;
+        } else if st.app.paused && sec > last_push_sec {
+            last_push_sec = sec;
+        }
+        // smooth: a frame on the grid (in the same wakeup as a sample that's due)
+        if smooth && next_frame.is_some_and(|t| now + 1_000_000 >= t) {
+            let t = next_frame.unwrap();
+            let dt = ((t - anim_t) as f32 / 1e9).clamp(0.0, 0.1);
+            anim_t = t;
+            let a = &mut st.app;
+            let moving = prof(14, || a.anim_step(dt) | a.anim_numbers(dt));
+            if !a.paused {
+                a.phase = ((t - a.s.push_t) as f32 / 1e9).clamp(0.0, 1.0);
             }
-            if next_frame.is_some_and(|t| now + 1_000_000 >= t) {
-                next_frame = None;
-                if smooth {
-                    let fast = step_bars(&mut st.app, now, &mut anim_t, true);
-                    st.render_bars();
-                    let t_next = if st.app.paused {
-                        i64::MAX
-                    } else {
-                        (last_tick + 1) * period - offset
-                    };
-                    next_frame = frame_at(fast, now, t_next, min_gap);
-                }
+            if !a.paused {
+                a.frame += 1;
             }
+            // at 60 frames/s every other frame moves only the bars (cheap); numbers,
+            // panels and graphs change on the others
+            fcount += 1;
+            let bars = fps > 30 && fcount % 2 == 1 && !resort;
+            if st.app.menu.is_none() || fcount % 6 == 0 {
+                // (the theme menu repaints whole screens: 10 a second is plenty)
+                st.render_frame(bars, resort);
+                resort = false;
+            }
+            dirty = false;
+            // paused and settled: no more frames until something changes
+            settled = st.app.paused && !moving;
+            next_frame = if settled {
+                None
+            } else {
+                Some(anim::next_frame(now + offset, fps) - offset)
+            };
         }
     }
     st.kitty_clear();

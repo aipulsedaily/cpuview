@@ -13,6 +13,40 @@ pub const HIST: usize = 1024;
 pub const WINDOW_NS: i64 = 500_000_000;
 /// /proc/stat snapshots kept for the window (enough for 60 samples/s).
 const SNAPS: usize = 40;
+/// Smooth mode samples 10 times a second and blends two windows (see `dual`).
+pub const SHORT_NS: i64 = 200_000_000;
+pub const LONG_NS: i64 = 800_000_000;
+
+const DUAL_D0: f32 = 0.05;
+const DUAL_D1: f32 = 0.12;
+
+/// Per-series estimator state: held weight and its time.
+#[derive(Clone, Copy, Default)]
+pub struct EstState {
+    hold: f32,
+    hold_t: i64,
+}
+
+/// Smooth-mode load from `ld(a)` = load from time `a` to now. A short window `us`
+/// (0.2 s: ±5 % tick quantisation, 0.1 s behind) and a long one `ul` (0.8 s: ±1 %,
+/// 0.4 s behind): while they agree within the noise the long one shows, so quiet
+/// bars stay still; as they disagree the short one takes over, so real changes show
+/// within ~0.3 s. The weight holds its peak for one long window, until that lies
+/// wholly after the change: else the target would sag back towards the lagging long
+/// window for a moment after every step; then it fades over another one.
+pub fn estimate(st: &mut EstState, now: i64, ld: &dyn Fn(i64) -> f32) -> f32 {
+    let (us, ul) = (ld(now - SHORT_NS), ld(now - LONG_NS));
+    let w = (((us - ul).abs() - DUAL_D0) / (DUAL_D1 - DUAL_D0)).clamp(0.0, 1.0);
+    // held, then fading out over a second long window (a sudden drop would stall a
+    // bar that is following a ramp)
+    let age = (now - st.hold_t - LONG_NS) as f32 / LONG_NS as f32;
+    let held = st.hold * (1.0 - age.max(0.0)).max(0.0);
+    if w >= held {
+        (st.hold, st.hold_t) = (w, now);
+    }
+    let w = w.max(held);
+    ul + w * (us - ul)
+}
 
 /// Ring of per-CPU (idle, total) /proc/stat snapshots with their times; load over a
 /// sliding window instead of over the last sampling interval.
@@ -222,6 +256,8 @@ pub struct Sensor {
     fd: c_int,
     pub val: f32,
     pub hist: Ring<f32>,
+    /// highest point in `hist`
+    pub max: f32,
 }
 
 pub struct Topo {
@@ -394,6 +430,12 @@ pub struct Sampler {
     /// `clock_hold` ns after the last one. 0 = the raw reading.
     pub fe: Vec<f32>,
     pub clock_hold: i64,
+    /// smooth mode: `ur` / `tot_r` from two windows (`dual`) instead of WINDOW_NS
+    pub dual: bool,
+    /// `estimate` state per CPU, and for the total (last)
+    est: Vec<EstState>,
+    /// monotonic time of the last history point
+    pub push_t: i64,
     run_t: Vec<i64>,
     /// published values: what numbers, sorting and summaries show. `publish()` copies
     /// the latest sample here (every sample, or a few times a second in smooth mode
@@ -406,7 +448,7 @@ pub struct Sampler {
     acc_f: Vec<f32>,
     acc_n: u32,
     tot_r: f32,
-    avg_r: f32,
+    pub avg_r: f32,
     pub tot_u: f32,
     pub avg_f: f32,
     /// largest per-CPU load change in the last sample (0..1): drives the sample rate
@@ -484,6 +526,7 @@ fn find_sensors() -> Vec<Sensor> {
                     fd,
                     val: 0.0,
                     hist: Ring::new(),
+                    max: 0.0,
                 });
             }
         }
@@ -544,6 +587,9 @@ impl Sampler {
             ur: vec![0.0; n],
             fe: vec![0.0; n],
             clock_hold: 0,
+            dual: false,
+            est: vec![EstState::default(); n + 1],
+            push_t: 0,
             run_t: vec![i64::MIN / 2; n],
             f: vec![0.0; n],
             u: vec![0.0; n],
@@ -695,30 +741,76 @@ impl Sampler {
         self.acc_n += 1;
         self.avg_r = fsum / self.fr.len().max(1) as f32;
         if push > 0 {
+            self.push_t = now;
             self.push_history(push);
         }
     }
 
     /// Load over the sliding window, then remember this snapshot.
     fn window_load(&mut self, now: i64) {
+        let frac = |b: u64, t: u64| if t > 0 { b as f32 / t as f32 } else { 0.0 };
         let (mut busy, mut total) = (0u64, 0u64);
         let mut act = 0.0f32;
-        if let Some(base) = self.win.base(now, WINDOW_NS) {
+        let w = &self.win;
+        if let Some(base) = w.base(now, if self.dual { SHORT_NS } else { WINDOW_NS }) {
             for (i, (&c, &b)) in self.cur.iter().zip(base).enumerate() {
-                let (u, bz, dt) = load(c, b);
-                act = act.max((u - self.ur[i]).abs());
-                self.ur[i] = u;
+                let (mut u, bz, dt) = load(c, b);
                 busy += bz;
                 total += dt;
+                if self.dual {
+                    let ld = |a: i64| w.base(now, now - a).map_or(u, |x| load(c, x[i]).0);
+                    u = estimate(&mut self.est[i], now, &ld);
+                }
+                act = act.max((u - self.ur[i]).abs());
+                self.ur[i] = u;
             }
+        }
+        self.tot_r = frac(busy, total);
+        if self.dual {
+            let cur = &self.cur;
+            let ld = |a: i64| {
+                w.base(now, now - a).map_or(0.0, |x| {
+                    let (mut bb, mut tt) = (0u64, 0u64);
+                    for (&p, &q) in cur.iter().zip(x) {
+                        let (_, bz, dt) = load(p, q);
+                        (bb, tt) = (bb + bz, tt + dt);
+                    }
+                    frac(bb, tt)
+                })
+            };
+            let k = self.est.len() - 1;
+            self.tot_r = estimate(&mut self.est[k], now, &ld);
         }
         self.win.push(now, &self.cur);
         self.activity = act;
-        self.tot_r = if total > 0 {
-            busy as f32 / total as f32
+    }
+
+    /// Load of CPU `i` over the current (unfinished) history second.
+    pub fn part_u(&self, i: usize) -> f32 {
+        load(self.cur[i], self.step_prev[i]).0
+    }
+
+    /// Total load over the current history second.
+    pub fn part_tot(&self) -> f32 {
+        let (mut b, mut t) = (0u64, 0u64);
+        for (&c, &p) in self.cur.iter().zip(&self.step_prev) {
+            let (_, bz, dt) = load(c, p);
+            (b, t) = (b + bz, t + dt);
+        }
+        if t > 0 {
+            b as f32 / t as f32
         } else {
             0.0
-        };
+        }
+    }
+
+    /// Mean clock reading of CPU `i` over the current history second.
+    pub fn part_f(&self, i: usize) -> f32 {
+        if self.acc_n > 0 {
+            self.acc_f[i] / self.acc_n as f32
+        } else {
+            self.fr[i]
+        }
     }
 
     /// Make the latest sample the shown one (numbers, sorting, summaries).
@@ -758,6 +850,11 @@ impl Sampler {
             for s in &mut self.temps {
                 s.hist.push(s.val);
             }
+        }
+        for s in &mut self.temps {
+            s.max = (0..s.hist.len())
+                .map(|k| s.hist.back(k))
+                .fold(s.val, f32::max);
         }
     }
 
@@ -811,18 +908,16 @@ impl Sampler {
     }
 
     /// Temperature for an L3 domain: Tccd<n> on Ryzen, else Tctl / package.
-    pub fn domain_temp(&self, d: usize) -> Option<f32> {
-        // (no allocation: called on every frame)
+    /// Index of the sensor for an L3 domain (no allocation: called on every frame).
+    pub fn domain_temp_idx(&self, d: usize) -> Option<usize> {
         let ccd = |l: &str| l.strip_prefix("Tccd").and_then(|n| n.parse::<usize>().ok());
-        self.temps
-            .iter()
-            .find(|s| ccd(&s.label) == Some(d + 1))
+        let t = &self.temps;
+        t.iter()
+            .position(|s| ccd(&s.label) == Some(d + 1))
             .or_else(|| {
-                self.temps
-                    .iter()
-                    .find(|s| s.label == "Tctl" || s.label.starts_with("Pkg"))
+                t.iter()
+                    .position(|s| s.label == "Tctl" || s.label.starts_with("Pkg"))
             })
-            .map(|s| s.val)
     }
 }
 
@@ -981,6 +1076,9 @@ impl Sampler {
             ur: vec![0.0; n],
             fe: vec![0.0; n],
             clock_hold: 0,
+            dual: false,
+            est: vec![EstState::default(); n + 1],
+            push_t: 0,
             run_t: vec![i64::MIN / 2; n],
             f: vec![0.0; n],
             u: vec![0.0; n],

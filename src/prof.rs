@@ -1,5 +1,5 @@
-//! Opt-in phase profiler (CPUVIEW_PROFILE=path): thread CPU ns per phase, written at
-//! exit. Off by default; when off each probe is one predictable branch.
+//! Opt-in phase profiler (build with `--features prof`, run with CPUVIEW_PROFILE=path):
+//! thread CPU ns per phase, written at exit. Compiled out by default.
 
 use crate::term;
 
@@ -27,12 +27,12 @@ const NAMES: [&str; N] = [
 ];
 
 pub fn init() {
-    unsafe { ON = std::env::var_os("CPUVIEW_PROFILE").is_some() };
+    unsafe { ON = cfg!(feature = "prof") && std::env::var_os("CPUVIEW_PROFILE").is_some() };
 }
 
 #[inline]
 pub fn prof<T>(k: usize, f: impl FnOnce() -> T) -> T {
-    if unsafe { !ON } {
+    if !cfg!(feature = "prof") || unsafe { !ON } {
         return f();
     }
     let t0 = term::now_ns(libc::CLOCK_THREAD_CPUTIME_ID);
@@ -43,7 +43,7 @@ pub fn prof<T>(k: usize, f: impl FnOnce() -> T) -> T {
 
 pub fn prof_count(k: usize) {
     unsafe {
-        if !ON {
+        if !cfg!(feature = "prof") || !ON {
             return;
         }
         PROF[k] += 1;
@@ -56,6 +56,9 @@ pub fn prof_count(k: usize) {
 }
 
 pub fn dump(rate: usize) {
+    if !cfg!(feature = "prof") {
+        return;
+    }
     if let Some(p) = std::env::var_os("CPUVIEW_PROFILE") {
         let mut r = String::new();
         #[allow(static_mut_refs)]

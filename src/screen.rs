@@ -6,7 +6,7 @@
 //! the terminal shows, so a typical live frame touches a few hundred cells and writes a
 //! few hundred bytes in a single write(). Unchanged frames write nothing.
 
-use crate::color::{ch, contrast, mix, rgb, to_256, Rgb};
+use crate::color::{ch, contrast, mix, mix_lin, rgb, to_256, Rgb};
 use crate::gfx;
 use crate::image::Indexed;
 use crate::theme::*;
@@ -21,14 +21,14 @@ pub const NOPATCH: u32 = 1 << 26;
 /// Blanks written by widgets never get one, so a star can't be mistaken for data.
 pub const STAR_OK: u32 = 1 << 27;
 pub const DEFAULT: u32 = 1 << 24;
-/// fg bits 28..30 = k (1..7): the colour covers k/8 of the cell and is blended into
-/// the track surface (the anti-aliased edge cell of a bar)
+/// fg bits 28..31 = k (1..15): the colour covers k/16 of the cell and is blended
+/// into the track surface in linear light (the anti-aliased edge cell of a bar)
 pub const BLEND_SHIFT: u32 = 28;
-pub const BLEND: u32 = 7 << BLEND_SHIFT;
+pub const BLEND: u32 = 15 << BLEND_SHIFT;
 
 #[inline]
 fn blend_k(fg: u32) -> f32 {
-    ((fg & BLEND) >> BLEND_SHIFT) as f32 / 8.0
+    ((fg & BLEND) >> BLEND_SHIFT) as f32 / 16.0
 }
 
 #[inline]
@@ -230,7 +230,7 @@ impl Comp {
                 let fg = if c.fg & TRACK != 0 {
                     self.track_solid
                 } else if c.fg & BLEND != 0 {
-                    mix(self.track_solid, fg_rgb, blend_k(c.fg))
+                    mix_lin(self.track_solid, fg_rgb, blend_k(c.fg))
                 } else {
                     fg_rgb
                 };
@@ -338,7 +338,7 @@ impl Comp {
                     out.fg = if c.fg & TRACK != 0 {
                         trk
                     } else {
-                        mix(trk, fg_rgb, blend_k(c.fg))
+                        mix_lin(trk, fg_rgb, blend_k(c.fg))
                     };
                 }
                 out
@@ -601,7 +601,14 @@ impl Screen {
                 if ok == self.front[i] && !full {
                     continue;
                 }
-                if self.cur != (x, y) {
+                if self.cur.1 == y && x > self.cur.0 && self.cur.0 < w {
+                    // same row, further right: a shorter relative move
+                    self.out.extend_from_slice(b"\x1b[");
+                    if x - self.cur.0 > 1 {
+                        dec(&mut self.out, (x - self.cur.0) as u32);
+                    }
+                    self.out.push(b'C');
+                } else if self.cur != (x, y) {
                     self.out.extend_from_slice(b"\x1b[");
                     dec(&mut self.out, y as u32 + 1);
                     self.out.push(b';');
@@ -726,11 +733,14 @@ mod tests {
         };
         assert_eq!(comp.cell(c(0), 0, 0, None, false).fg, bar);
         assert_eq!(
-            comp.cell(c(4), 0, 0, None, false).fg,
-            mix(t.track, bar, 0.5)
+            comp.cell(c(8), 0, 0, None, false).fg,
+            mix_lin(t.track, bar, 0.5)
         );
-        let q = comp.cell(c(1), 0, 0, None, false).fg;
-        assert_eq!(q, mix(t.track, bar, 0.125));
+        let q = comp.cell(c(15), 0, 0, None, false).fg;
+        assert_eq!(q, mix_lin(t.track, bar, 15.0 / 16.0));
+        // linear light: half coverage is brighter than the sRGB midpoint
+        let l = |c: u32| crate::color::lum(c);
+        assert!(l(mix_lin(t.track, bar, 0.5)) > l(mix(t.track, bar, 0.5)));
     }
 
     #[test]
