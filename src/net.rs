@@ -36,6 +36,14 @@ fn dec(v: u64) -> String {
     f.s().to_string()
 }
 
+/// Freed heap memory back to the kernel (after the rare big transient buffers).
+fn trim() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 fn close(fd: c_int) {
     if fd >= 0 {
         unsafe { libc::close(fd) };
@@ -106,7 +114,7 @@ pub const KIND: [&str; 7] = [
 /// Interface kind from sysfs facts: `phys` (has a `device`), `wireless`, uevent
 /// DEVTYPE, ARP hardware type, tun_flags & 3 (1 tun, 2 tap).
 pub fn classify(name: &str, phys: bool, wireless: bool, devtype: &str, arp: u32, tun: u32) -> u8 {
-    const VPN: [&str; 7] = ["wg", "tun", "tailscale", "zt", "nordlynx", "proton", "ppp"];
+    const VPN: [&str; 5] = ["wg", "tun", "tailscale", "zt", "ppp"];
     if arp == 772 || name == "lo" {
         K_LO
     } else if wireless || devtype == "wlan" {
@@ -125,42 +133,6 @@ pub fn classify(name: &str, phys: bool, wireless: bool, devtype: &str, arp: u32,
         K_WIRED
     } else {
         K_VIRT
-    }
-}
-
-/// Counter snapshots: rates over ~0.5 s windows at fast sample rates.
-#[derive(Clone, Copy, Default)]
-struct Win {
-    t: [i64; 8],
-    v: [[u64; 2]; 8],
-    head: usize,
-    len: usize,
-}
-
-impl Win {
-    fn rate(&mut self, now: i64, cur: [u64; 2]) -> [f32; 2] {
-        let mut r = [0.0; 2];
-        if self.len > 0 {
-            let mut pick = (self.head + 8 - self.len) % 8;
-            for k in 0..self.len {
-                let j = (self.head + 7 - k) % 8;
-                if now - self.t[j] >= SEC / 2 - SEC / 50 {
-                    pick = j;
-                    break;
-                }
-            }
-            let dt = (now - self.t[pick]) as f32 / 1e9;
-            if dt > 0.0 {
-                for (k, x) in r.iter_mut().enumerate() {
-                    *x = cur[k].saturating_sub(self.v[pick][k]) as f32 / dt;
-                }
-            }
-        }
-        self.t[self.head] = now;
-        self.v[self.head] = cur;
-        self.head = (self.head + 1) % 8;
-        self.len = (self.len + 1).min(8);
-        r
     }
 }
 
@@ -189,7 +161,8 @@ pub struct Iface {
     pub sig: i32,
     /// per-second history: received, sent (primary links only)
     pub h: Option<Box<[Ring<f32>; 2]>>,
-    win: Win,
+    /// the counters a rate is measured from (at least 0.45 s back)
+    base: (i64, [u64; 2]),
     step: (i64, [u64; 2]),
     cur: (i64, [u64; 2]),
 }
@@ -212,7 +185,7 @@ impl Iface {
             addr_rank: 9,
             sig: 0,
             h: None,
-            win: Win::default(),
+            base: (0, [0; 2]),
             step: (0, [0; 2]),
             cur: (0, [0; 2]),
         }
@@ -226,7 +199,15 @@ impl Iface {
         }
         self.cnt = c;
         self.cur = (now, [c[0], c[1]]);
-        [self.rx, self.tx] = self.win.rate(now, [c[0], c[1]]);
+        // rates over ≥ 0.45 s (smooth reads 5 times a second)
+        let dt = (now - self.base.0) as f32 / 1e9;
+        if self.base.0 == 0 {
+            self.base = self.cur;
+        } else if dt >= 0.45 {
+            let d = |k: usize| c[k].saturating_sub(self.base.1[k]) as f32 / dt;
+            (self.rx, self.tx) = (d(0), d(1));
+            self.base = self.cur;
+        }
     }
 
     /// Received / sent bytes/s over the unfinished history second(s).
@@ -301,50 +282,87 @@ pub fn parse_wireless(b: &[u8], f: &mut dyn FnMut(&str, i32)) {
     }
 }
 
+/// A file of /sys/class/net/<n>/ (trimmed; empty if unreadable).
+#[inline(never)]
+fn sysnet(n: &str, f: &str) -> String {
+    read_str(&cat(&["/sys/class/net/", n, "/", f])).unwrap_or_default()
+}
+
+#[inline(never)]
+fn sysnet_has(n: &str, f: &str) -> bool {
+    std::path::Path::new(&cat(&["/sys/class/net/", n, "/", f])).exists()
+}
+
 /// Default-route interfaces from /proc/net/route (destination 0 and mask 0).
 pub fn parse_route(t: &str) -> Vec<String> {
-    t.lines()
-        .skip(1)
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split_ascii_whitespace().collect();
-            (f.len() > 7 && f[1] == "00000000" && f[7] == "00000000").then(|| f[0].to_string())
-        })
-        .collect()
+    let mut v = Vec::new();
+    for l in t.lines().skip(1) {
+        let f: Vec<&str> = l.split_ascii_whitespace().collect();
+        if f.len() > 7 && f[1] == "00000000" && f[7] == "00000000" {
+            v.push(f[0].to_string());
+        }
+    }
+    v
+}
+
+/// The number after `key` in a line of words ("TCP: inuse 25 orphan 0 tw 3").
+fn after(l: &str, key: &str) -> u32 {
+    let mut it = l.split_ascii_whitespace();
+    while let Some(w) = it.next() {
+        if w == key {
+            return parse_u64(it.next().unwrap_or("").as_bytes()).0 as u32;
+        }
+    }
+    0
 }
 
 pub fn fmt_ip(a: &[u8; 16], v6: bool) -> String {
     let v4m = v6 && a[..10].iter().all(|&b| b == 0) && a[10] == 0xff && a[11] == 0xff;
+    let mut s = String::with_capacity(40);
     if !v6 || v4m {
         let o = if v4m { 12 } else { 0 };
-        let mut s = String::with_capacity(15);
         for (i, b) in a[o..o + 4].iter().enumerate() {
             if i > 0 {
                 s.push('.');
             }
-            let mut f = crate::ui::F::new();
-            f.int(*b as u32, 0);
-            s += f.s();
+            s += &dec(*b as u64);
         }
         return s;
     }
-    extern "C" {
-        fn inet_ntop(
-            af: c_int,
-            src: *const libc::c_void,
-            dst: *mut libc::c_char,
-            size: u32,
-        ) -> *const libc::c_char;
+    // IPv6: eight hex groups, the longest run of zero groups (two or more) as "::"
+    // (written here: libc's inet_ntop would map another 128 KB of libc)
+    let g = |k: usize| (a[2 * k] as u32) << 8 | a[2 * k + 1] as u32;
+    let (mut bs, mut bl, mut cl) = (8, 1, 0);
+    for k in 0..8 {
+        cl = if g(k) == 0 { cl + 1 } else { 0 };
+        if cl > bl {
+            (bs, bl) = (k + 1 - cl, cl);
+        }
     }
-    let mut buf = [0 as libc::c_char; 48];
-    unsafe {
-        inet_ntop(
-            libc::AF_INET6,
-            a.as_ptr() as *const libc::c_void,
-            buf.as_mut_ptr(),
-            48,
-        );
-        CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+    let mut k = 0;
+    while k < 8 {
+        if k == bs {
+            s += "::";
+            k += bl;
+            continue;
+        }
+        if k > 0 && k != bs + bl {
+            s.push(':');
+        }
+        let mut sh = 12;
+        while sh > 0 && g(k) >> sh == 0 {
+            sh -= 4;
+        }
+        loop {
+            s.push(b"0123456789abcdef"[(g(k) >> sh & 15) as usize] as char);
+            if sh == 0 {
+                break;
+            }
+            sh -= 4;
+        }
+        k += 1;
     }
+    s
 }
 
 // ── netlink ────────────────────────────────────────────────────────────────
@@ -512,6 +530,7 @@ fn diag_msg(p: &[u8], udp: bool) -> Option<Sock> {
     Some(s)
 }
 
+#[inline]
 fn is_local(a: &[u8; 16], v6: bool) -> bool {
     if !v6 {
         return a[0] == 127;
@@ -596,20 +615,15 @@ pub struct Peer {
 pub fn group_peers(socks: &[Sock], keep: usize) -> Vec<Peer> {
     // (hash of the remote end << 20 | socket index), sorted: equal ends are runs
     // (a busy server has thousands of connections: no quadratic grouping)
-    let mut k: Vec<u64> = socks
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| s.state == ST_ESTAB && !s.udp && *i < 1 << 20)
-        .map(|(i, s)| {
-            let h =
-                s.ra.iter()
-                    .chain(&s.rp.to_ne_bytes())
-                    .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
-                        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-                    });
-            h << 20 | i as u64
-        })
-        .collect();
+    let mut k: Vec<u64> = Vec::new();
+    for (i, s) in socks.iter().enumerate().take(1 << 20) {
+        if s.state == ST_ESTAB && !s.udp {
+            let mut e = [0u8; 18];
+            e[..16].copy_from_slice(&s.ra);
+            e[16..].copy_from_slice(&s.rp.to_ne_bytes());
+            k.push(hkey(&e) << 20 | i as u64);
+        }
+    }
     // (a shell sort: the library's sort costs ~3 KB of code)
     let mut gap = k.len() / 2;
     while gap > 0 {
@@ -656,17 +670,11 @@ pub fn group_peers(socks: &[Sock], keep: usize) -> Vec<Peer> {
 pub fn port_name(p: u16) -> &'static str {
     match p {
         22 => "ssh",
-        25 | 465 | 587 => "mail",
         53 => "dns",
-        80 | 8080 => "web",
-        443 | 8443 => "https",
-        139 | 445 => "file sharing",
-        631 => "printing",
-        993 | 143 => "imap",
+        80 => "web",
+        443 => "https",
         3306 => "mysql",
         5432 => "postgres",
-        6379 => "redis",
-        27017 => "mongodb",
         _ => "",
     }
 }
@@ -778,13 +786,12 @@ pub struct ApiCtr {
     /// 0 no health check, 1 healthy, 2 starting, 3 unhealthy
     pub health: u8,
     pub ports: Vec<u16>,
-    pub ip: String,
 }
 
 pub fn parse_api(b: &[u8]) -> Vec<ApiCtr> {
-    jobjects(b)
-        .into_iter()
-        .map(|o| {
+    let mut out = Vec::new();
+    for o in jobjects(b) {
+        {
             let st = jstr(o, "State");
             let status = jstr(o, "Status");
             let mut c = ApiCtr {
@@ -813,17 +820,12 @@ pub fn parse_api(b: &[u8]) -> Vec<ApiCtr> {
                 }
                 i = n;
             }
-            let mut i = 0;
-            while let Some((v, n)) = jget(o, "IPAddress", false, i) {
-                if !v.is_empty() {
-                    c.ip = String::from_utf8_lossy(v).into_owned();
-                }
-                i = n;
+            if !c.id.is_empty() {
+                out.push(c);
             }
-            c
-        })
-        .filter(|c| !c.id.is_empty())
-        .collect()
+        }
+    }
+    out
 }
 
 /// GET `path` over a unix socket (HTTP/1.0): the body of a 200 reply.
@@ -888,7 +890,10 @@ pub const C_PODMAN: u8 = 1;
 pub const C_K8S: u8 = 2;
 pub const C_LXC: u8 = 3;
 pub const C_VM: u8 = 4;
+/// (the cgroup walk: a service, not a container)
+const SVC: u8 = 255;
 
+#[inline]
 fn hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
 }
@@ -1015,6 +1020,7 @@ fn cg_read(v2: bool, fd: &[c_int; 3], stat: u8) -> Option<(u64, u64)> {
 }
 
 /// CPU % (of one core) between two readings.
+#[inline]
 fn cpu_pct(prev: (i64, u64), now: i64, us: u64) -> f32 {
     let dt = (now - prev.0) as f32 / 1e3;
     if prev.0 == 0 || dt <= 0.0 {
@@ -1025,6 +1031,7 @@ fn cpu_pct(prev: (i64, u64), now: i64, us: u64) -> f32 {
 }
 
 /// FNV-1a: list keys of names.
+#[inline(never)]
 pub fn hkey(s: &[u8]) -> u64 {
     s.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
         (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
@@ -1078,6 +1085,20 @@ impl Drop for Svc {
 }
 
 impl Svc {
+    /// Its statistics files opened and read once (CPU % needs a second reading).
+    fn new(name: String, fd: [c_int; 3], v2: bool, now: i64) -> Svc {
+        let mut s = Svc {
+            k: hkey(name.as_bytes()),
+            name,
+            fd,
+            prev: (0, 0),
+            cpu: 0.0,
+            mem: 0.0,
+        };
+        s.read(v2, now);
+        s
+    }
+
     fn read(&mut self, v2: bool, now: i64) {
         if let Some((us, m)) = cg_read(v2, &self.fd, 1) {
             self.cpu = cpu_pct(self.prev, now, us);
@@ -1174,7 +1195,6 @@ pub struct Net {
     /// cgroup id → unit name (sockets' owners)
     cgnames: Vec<(u64, String)>,
     // container engine API
-    api_sock: Option<String>,
     pub api_err: bool,
     pub api: Vec<ApiCtr>,
     pub stopped: u32,
@@ -1218,7 +1238,6 @@ impl Net {
             svcs: Vec::new(),
             user: None,
             cgnames: Vec::new(),
-            api_sock: None,
             api_err: false,
             api: Vec::new(),
             stopped: 0,
@@ -1265,6 +1284,7 @@ impl Net {
             self.scan_step(64);
         }
         self.resolve_owners();
+        trim();
     }
 
     /// One sample. `vis`: the page is shown; `eco`: the adaptive low-CPU speed.
@@ -1348,9 +1368,8 @@ impl Net {
         }
         // the big transient buffers (socket tables, the API's JSON) go back to the
         // kernel: these jobs are rare
-        #[cfg(target_env = "gnu")]
         if j >= J_PEERS {
-            unsafe { libc::malloc_trim(0) };
+            trim();
         }
     }
 
@@ -1404,16 +1423,9 @@ impl Net {
         each_dir("/sys/class/net", &mut |n, _, _| names.push(n.to_string()));
         self.ifs.retain(|i| names.contains(&i.name));
         let dflt = parse_route(&std::fs::read_to_string("/proc/net/route").unwrap_or_default());
-        let v6d = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
-        let v6d: Vec<&str> = v6d
-            .lines()
-            .filter(|l| l.starts_with("00000000000000000000000000000000 00 "))
-            .filter_map(|l| l.split_ascii_whitespace().last())
-            .filter(|n| *n != "lo")
-            .collect();
         for n in &names {
-            let rd = |f: &str| read_str(&cat(&["/sys/class/net/", n, "/", f])).unwrap_or_default();
-            let ex = |f: &str| std::path::Path::new(&cat(&["/sys/class/net/", n, "/", f])).exists();
+            let rd = |f: &str| sysnet(n, f);
+            let ex = |f: &str| sysnet_has(n, f);
             if !self.ifs.iter().any(|i| &i.name == n) {
                 let mut i = Iface::new(n);
                 let ue = rd("uevent");
@@ -1422,7 +1434,7 @@ impl Net {
                     .find_map(|l| l.strip_prefix("DEVTYPE="))
                     .unwrap_or("");
                 let tun = if ex("tun_flags") {
-                    (hexv(rd("tun_flags").trim_start_matches("0x").as_bytes()) & 3) as u32
+                    (hexv(rd("tun_flags").as_bytes()) & 3) as u32
                 } else {
                     0
                 };
@@ -1431,21 +1443,22 @@ impl Net {
                     ex("device"),
                     ex("wireless") || ex("phy80211"),
                     dt,
-                    rd("type").parse().unwrap_or(1),
+                    parse_u64(rd("type").as_bytes()).0 as u32,
                     tun,
                 );
-                i.idx = rd("ifindex").parse().unwrap_or(0);
+                i.idx = parse_u64(rd("ifindex").as_bytes()).0 as u32;
                 self.ifs.push(i);
             }
             let i = self.ifs.iter_mut().find(|i| &i.name == n).unwrap();
             let op = rd("operstate");
             i.up = op == "up" || (op == "unknown" && rd("carrier") == "1");
+            // (unknown speed reads "-1": 0 here)
             i.speed = if i.up {
-                rd("speed").parse::<i64>().unwrap_or(0).clamp(0, 1 << 30) as u32
+                parse_u64(rd("speed").as_bytes()).0.min(1 << 30) as u32
             } else {
                 0
             };
-            i.dflt = dflt.contains(n) || v6d.contains(&n.as_str());
+            i.dflt = dflt.contains(n);
         }
         let any = self.ifs.iter().any(|i| i.kind < K_VIRT);
         let up = self.ifs.iter().any(|i| i.kind < K_VIRT && i.up);
@@ -1489,11 +1502,14 @@ impl Net {
         }
     }
 
-    /// Addresses of every interface (netlink RTM_GETADDR: no counters touched).
+    /// Addresses of every interface (netlink RTM_GETADDR: no counters touched, and
+    /// no libc getifaddrs, which maps another 128 KB of libc): a global one first
+    /// (IPv4, then IPv6), a link-local one only when there is nothing else.
     fn addrs(&mut self) {
         let fd = nl_socket(libc::NETLINK_ROUTE);
         for i in &mut self.ifs {
             i.addr_rank = 9;
+            i.addr.clear();
         }
         let mut buf = std::mem::take(&mut self.buf);
         let ifs = &mut self.ifs;
@@ -1501,8 +1517,8 @@ impl Net {
             if t != 20 || p.len() < 8 {
                 return;
             }
-            let (fam, scope) = (p[0], p[3]);
-            let idx = u32::from_ne_bytes(p[4..8].try_into().unwrap());
+            let (v6, scope) = (p[0] == libc::AF_INET6 as u8, p[3]);
+            let idx = u32::from_ne_bytes([p[4], p[5], p[6], p[7]]);
             let mut a = [0u8; 16];
             let mut have = false;
             attrs(&p[8..], &mut |at, v| {
@@ -1512,10 +1528,8 @@ impl Net {
                     have = true;
                 }
             });
-            // global addresses first (IPv4, then IPv6), link-local ones last
-            let v6 = fam == libc::AF_INET6 as u8;
             let rank = (scope == 253) as u8 * 2 + v6 as u8;
-            if let Some(i) = ifs.iter_mut().find(|i| i.idx == idx) {
+            if let Some(i) = ifs.iter_mut().find(|i| i.idx == idx && i.prim) {
                 if have && scope != 254 && rank < i.addr_rank {
                     i.addr_rank = rank;
                     i.addr = fmt_ip(&a, v6);
@@ -1524,11 +1538,6 @@ impl Net {
         });
         self.buf = buf;
         close(fd);
-        for i in &mut self.ifs {
-            if i.addr_rank == 9 {
-                i.addr.clear();
-            }
-        }
     }
 
     // ── sockets ────────────────────────────────────────────────────────────
@@ -1538,30 +1547,29 @@ impl Net {
     fn read_counts(&mut self) {
         let n = pread(self.snmp_fd, &mut self.buf);
         let t = std::str::from_utf8(&self.buf[..n]).unwrap_or("");
-        let mut tcp = t.lines().filter(|l| l.starts_with("Tcp:"));
-        if let (Some(h), Some(v)) = (tcp.next(), tcp.next()) {
-            if let Some(k) = h.split_ascii_whitespace().position(|x| x == "CurrEstab") {
-                self.estab = v
-                    .split_ascii_whitespace()
-                    .nth(k)
-                    .and_then(|x| x.parse().ok())
-                    .unwrap_or(0);
+        // "Tcp: … CurrEstab …" then "Tcp: … <value> …"
+        let mut col = None;
+        for l in t.lines() {
+            if let Some(r) = l.strip_prefix("Tcp:") {
+                match col {
+                    None => col = r.split_ascii_whitespace().position(|x| x == "CurrEstab"),
+                    Some(k) => {
+                        let v = r.split_ascii_whitespace().nth(k).unwrap_or("");
+                        self.estab = parse_u64(v.as_bytes()).0 as u32;
+                        break;
+                    }
+                }
             }
         }
         for f in 0..2 {
             let n = pread(self.ss_fd[f], &mut self.buf);
             let t = std::str::from_utf8(&self.buf[..n]).unwrap_or("");
-            if let Some(l) = t.lines().find(|l| l.starts_with(["TCP:", "TCP6:"][f])) {
-                let w: Vec<&str> = l.split_ascii_whitespace().collect();
-                let get = |k: &str| {
-                    w.iter()
-                        .position(|x| *x == k)
-                        .and_then(|p| w.get(p + 1)?.parse().ok())
-                        .unwrap_or(0)
-                };
-                self.inuse[f] = get("inuse");
-                if f == 0 {
-                    self.tw = get("tw");
+            for l in t.lines() {
+                if l.starts_with(["TCP:", "TCP6:"][f]) {
+                    self.inuse[f] = after(l, "inuse");
+                    if f == 0 {
+                        self.tw = after(l, "tw");
+                    }
                 }
             }
         }
@@ -1621,13 +1629,14 @@ impl Net {
         self.listen = group_listen(&self.socks);
         // owners: what we can't see as ours is looked up a few processes at a time
         let mine = |uid: u32| self.uid == 0 || uid == self.uid;
-        let want: Vec<u32> = self
-            .listen
-            .iter()
-            .filter(|l| mine(l.uid))
-            .flat_map(|l| l.inos.iter().copied())
-            .filter(|i| !self.owners.iter().any(|o| o.0 == *i))
-            .collect();
+        let mut want: Vec<u32> = Vec::new();
+        for l in &self.listen {
+            for &i in &l.inos {
+                if mine(l.uid) && !self.owners.iter().any(|o| o.0 == i) {
+                    want.push(i);
+                }
+            }
+        }
         self.owners
             .retain(|o| self.socks.iter().any(|s| s.ino == o.0));
         if !want.is_empty() && self.scan.is_none() {
@@ -1686,6 +1695,7 @@ impl Net {
             }
             unsafe { libc::closedir(sc.dir) };
             self.scan = None;
+            trim();
         }
     }
 
@@ -1738,30 +1748,30 @@ impl Net {
             return;
         }
         let mut found: Vec<(String, u8, String)> = Vec::new();
-        let mut svcs: Vec<(String, String)> = Vec::new();
         let mut names: Vec<(u64, String)> = Vec::new();
-        let mut stack = vec![(String::new(), 0usize)];
+        let mut stack = vec![String::new()];
         let mut dirs = 0;
-        while let Some((rel, depth)) = stack.pop() {
+        while let Some(rel) = stack.pop() {
             dirs += 1;
             if dirs > 400 {
                 break;
             }
+            let depth = rel.bytes().filter(|&b| b == b'/').count();
             let parent = rel.rsplit('/').next().unwrap_or("").to_string();
             each_dir(&cat(&[&self.cpu_root, &rel]), &mut |n, d, ino| {
                 if !d {
                     return;
                 }
                 let path = cat(&[&rel, "/", n]);
-                if names.len() < 4096 && (n.contains('.') || depth > 0) {
+                if names.len() < 4096 {
                     names.push((ino, n.to_string()));
                 }
                 if let Some((k, id)) = ctr_dir(&parent, n) {
                     found.push((path, k, id));
                 } else if let Some(s) = svc_dir(&parent, n) {
-                    svcs.push((s, path));
+                    found.push((path, SVC, s));
                 } else if depth < 6 && descend(n) {
-                    stack.push((path, depth + 1));
+                    stack.push(path);
                 }
             });
         }
@@ -1769,7 +1779,16 @@ impl Net {
         let (v2, cr, mr) = (self.cg2, self.cpu_root.clone(), self.mem_root.clone());
         // containers: keep the known ones (their counters), add the new
         self.ctrs.retain(|c| found.iter().any(|f| f.0 == c.rel));
+        self.svcs
+            .retain(|s| found.iter().any(|f| f.1 == SVC && f.2 == s.name));
         for (rel, kind, id) in found {
+            if kind == SVC {
+                if !self.svcs.iter().any(|s| s.name == id) && self.svcs.len() < 160 {
+                    self.svcs
+                        .push(Svc::new(id, cg_open(v2, &cr, &mr, &rel), v2, now));
+                }
+                continue;
+            }
             if self.ctrs.iter().any(|c| c.rel == rel) || self.ctrs.len() >= 256 {
                 continue;
             }
@@ -1799,12 +1818,12 @@ impl Net {
                 ok: false,
             });
         }
-        let host: Vec<String> = self
-            .ifs
-            .iter()
-            .filter(|i| i.prim)
-            .map(|i| i.name.clone())
-            .collect();
+        let mut host: Vec<String> = Vec::new();
+        for i in &self.ifs {
+            if i.prim {
+                host.push(i.name.clone());
+            }
+        }
         for c in &mut self.ctrs {
             if c.net < 0 {
                 c.net = ctr_net(&cr, &c.rel, &host, &mut c.host_net);
@@ -1818,35 +1837,11 @@ impl Net {
         {
             self.last[J_API] = i64::MIN / 2; // a new container: ask for its name soon
         }
-        // services, and the logged-in users' total
-        self.svcs.retain(|s| svcs.iter().any(|f| f.0 == s.name));
-        for (name, rel) in svcs {
-            if !self.svcs.iter().any(|s| s.name == name) && self.svcs.len() < 160 {
-                let mut s = Svc {
-                    k: hkey(name.as_bytes()),
-                    name,
-                    fd: cg_open(v2, &cr, &mr, &rel),
-                    prev: (0, 0),
-                    cpu: 0.0,
-                    mem: 0.0,
-                };
-                s.read(v2, now);
-                self.svcs.push(s);
-            }
-        }
+        // the logged-in users' total
         if self.user.is_none() && !self.svcs.is_empty() {
             let fd = cg_open(v2, &cr, &mr, "/user.slice");
             if fd[0] >= 0 {
-                let mut u = Svc {
-                    k: hkey(b"user.slice"),
-                    name: "user.slice".into(),
-                    fd,
-                    prev: (0, 0),
-                    cpu: 0.0,
-                    mem: 0.0,
-                };
-                u.read(v2, now);
-                self.user = Some(u);
+                self.user = Some(Svc::new("user.slice".into(), fd, v2, now));
             }
         }
         self.resolve_owners();
@@ -1901,56 +1896,32 @@ impl Net {
     /// Names, state and health from the Docker or Podman API (whichever socket we
     /// may use), else from state files we can read, else the short id.
     fn read_api(&mut self) {
-        if self.ctrs.is_empty() && self.api_sock.is_none() {
+        self.api.clear();
+        if self.ctrs.is_empty() {
             return;
         }
         let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-        let cands = [
-            "/var/run/docker.sock".to_string(),
-            "/run/podman/podman.sock".to_string(),
+        let (p, d) = (
             cat(&[&rt, "/podman/podman.sock"]),
             cat(&[&rt, "/docker.sock"]),
-        ];
-        let mut got = None;
-        let order: Vec<&String> = self.api_sock.iter().chain(cands.iter()).collect();
-        for s in order {
+        );
+        let mut ok = false;
+        self.api_err = false;
+        for s in ["/var/run/docker.sock", "/run/podman/podman.sock", &p, &d] {
             match http_get(s, "/containers/json?all=1") {
                 Ok(b) => {
-                    self.api_sock = Some(s.clone());
-                    got = Some(b);
+                    self.api = parse_api(&b);
+                    ok = true;
                     break;
                 }
-                Err(e) => {
-                    if e == libc::EACCES {
-                        self.api_err = true;
-                    }
-                }
+                Err(e) => self.api_err |= e == libc::EACCES,
             }
         }
-        match got {
-            Some(b) => {
-                self.api_err = false;
-                self.api = parse_api(&b);
-            }
-            None => {
-                self.api_sock = None;
-                self.api.clear();
-                // state files: Docker's (root only, usually), rootless Podman's
-                let home = std::env::var("HOME").unwrap_or_default();
-                let pj = cat(&[
-                    &home,
-                    "/.local/share/containers/storage/overlay-containers/containers.json",
-                ]);
-                if let Ok(b) = std::fs::read(pj) {
-                    for o in jobjects(&b) {
-                        self.api.push(ApiCtr {
-                            id: jstr(o, "id"),
-                            name: jstr(o, "names"),
-                            state: 9,
-                            ..Default::default()
-                        });
-                    }
-                }
+        if ok {
+            self.api_err = false;
+        } else {
+            {
+                // Docker's state files (readable by root, usually)
                 for c in &self.ctrs {
                     if c.kind == C_DOCKER {
                         let p = cat(&["/var/lib/docker/containers/", &c.id, "/config.v2.json"]);
@@ -1985,24 +1956,19 @@ impl Net {
         }
     }
 
-    /// Container name for a container IP address (remote ends of connections).
-    pub fn ctr_by_ip(&self, ip: &str) -> Option<&str> {
-        self.api
-            .iter()
-            .find(|a| a.ip == ip)
-            .map(|a| a.name.as_str())
-    }
-
-    /// Container name publishing a port.
-    pub fn ctr_by_port(&self, port: u16) -> Option<&str> {
-        self.api
-            .iter()
-            .find(|a| a.state == 0 && a.ports.contains(&port))
-            .map(|a| a.name.as_str())
-    }
-
-    pub fn primary(&self) -> impl Iterator<Item = &Iface> {
-        self.ifs.iter().filter(|i| i.prim)
+    /// Primary links: (how many, how many up, the first up).
+    pub fn links_up(&self) -> (usize, usize, Option<usize>) {
+        let (mut n, mut up, mut first) = (0, 0, None);
+        for (k, i) in self.ifs.iter().enumerate() {
+            if i.prim {
+                n += 1;
+                if i.up {
+                    up += 1;
+                    first = first.or(Some(k));
+                }
+            }
+        }
+        (n, up, first)
     }
 
     /// A fake set for tests and layout checks.
@@ -2086,21 +2052,18 @@ impl Net {
 /// (its cgroup.procs, or a child cgroup's for LXC). `host`: it shares the host's
 /// network (it lists one of our physical links).
 fn ctr_net(root: &str, rel: &str, host: &[String], host_net: &mut bool) -> c_int {
-    let first =
-        |d: &str| parse_u64(&std::fs::read(cat(&[d, "/cgroup.procs"])).unwrap_or_default()).0;
+    // a member process: its cgroup's first, else (LXC) a child cgroup's
     let base = cat(&[root, rel]);
-    let mut pid = first(&base);
-    if pid == 0 {
-        let mut kids = Vec::new();
-        each_dir(&base, &mut |n, d, _| {
-            if d && kids.len() < 4 {
-                kids.push(n.to_string());
-            }
-        });
-        for k in kids {
-            if pid == 0 {
-                pid = first(&cat(&[&base, "/", &k]));
-            }
+    let mut dirs = vec![base.clone()];
+    each_dir(&base, &mut |n, d, _| {
+        if d && dirs.len() < 5 {
+            dirs.push(cat(&[&base, "/", n]));
+        }
+    });
+    let mut pid = 0;
+    for d in &dirs {
+        if pid == 0 {
+            pid = parse_u64(&std::fs::read(cat(&[d, "/cgroup.procs"])).unwrap_or_default()).0;
         }
     }
     if pid == 0 {
@@ -2250,7 +2213,6 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         assert!(v[0].id.starts_with("459bbc6d13cc"));
         assert_eq!((v[0].state, v[0].health), (0, 1));
         assert_eq!(v[0].ports, vec![5435]);
-        assert_eq!(v[0].ip, "172.18.0.6");
         assert_eq!((v[1].name.as_str(), v[1].health), ("web", 3));
         assert_eq!((v[2].state, v[3].state), (3, 1));
         // the state files' forms
@@ -2491,6 +2453,37 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
             n.owners.len(),
             n.socks.capacity(),
             n.ifs.len()
+        );
+    }
+
+    #[test]
+    fn ipv6_text_like_inet_ntop() {
+        let ip = |s: &[u16; 8]| {
+            let mut a = [0u8; 16];
+            for (k, g) in s.iter().enumerate() {
+                a[2 * k..2 * k + 2].copy_from_slice(&g.to_be_bytes());
+            }
+            fmt_ip(&a, true)
+        };
+        assert_eq!(ip(&[0, 0, 0, 0, 0, 0, 0, 1]), "::1");
+        assert_eq!(ip(&[0; 8]), "::");
+        assert_eq!(
+            ip(&[0xfe80, 0, 0, 0, 0x1cf8, 0x33ff, 0xfe71, 0x5fba]),
+            "fe80::1cf8:33ff:fe71:5fba"
+        );
+        assert_eq!(ip(&[0x2001, 0xdb8, 0, 0, 1, 0, 0, 1]), "2001:db8::1:0:0:1");
+        assert_eq!(
+            ip(&[0x2001, 0xdb8, 1, 2, 3, 4, 5, 6]),
+            "2001:db8:1:2:3:4:5:6"
+        );
+        assert_eq!(
+            ip(&[0x2001, 0xdb8, 0, 1, 1, 1, 1, 1]),
+            "2001:db8:0:1:1:1:1:1"
+        );
+        assert_eq!(ip(&[1, 0, 0, 0, 0, 0, 0, 0]), "1::");
+        assert_eq!(
+            ip(&[0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0019]),
+            "10.0.0.25"
         );
     }
 

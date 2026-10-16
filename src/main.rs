@@ -11,6 +11,7 @@ mod mem;
 mod menu;
 mod net;
 mod probe;
+mod procs;
 mod prof;
 mod screen;
 mod sys;
@@ -29,8 +30,9 @@ use ui::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
-memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes) and a
-network & system page (link speeds, ports, connections, containers, services)
+memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes), a
+network & system page (link speeds, ports, connections, containers, services) and a
+processes page (every process: CPU, memory, disk, tree, groups, signals)
 
 usage: cpuview [options]
 
@@ -44,15 +46,20 @@ usage: cpuview [options]
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
   --page PAGE           start on: cpu, memory (RAM, swap, disks, filesystems),
-                        network (links, ports, containers, services) or processes
+                        network (links, ports, containers, services), or processes
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
   -V, --version         version
 
-keys: 1 2 3 4 / tab / shift-tab pages · m cpu ⇄ memory · arrows/hjkl/click select
-      s speed (+ faster, - slower) · o sort · c view · g graphs · d/enter detail
-      r reset peaks · space pause · t themes · q quit
+keys: 1 2 3 4 or tab / shift-tab pages (cpu, memory, network, processes)
+      arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
+      o sort · c view · g graphs · d/enter detail · r reset peaks · space pause
+      t themes · q quit
+processes page: arrows/pgup/pgdn/home/end/click select · o sort (cpu, mem,
+      disk, pid, name) · r reverse · / filter (esc clears) · T tree · G group by
+      program · enter/←→ fold · k or F9 signal · n nice ·
+      I CPU % of one CPU / all · K kernel threads
 ";
 
 const OUT: i32 = 1;
@@ -424,7 +431,7 @@ impl State {
                 rects.push((S_PANEL, d));
             }
         }
-        for r in self.app.ml.rects().into_iter().chain(self.app.nl.rects()) {
+        for r in self.app.ml.rects().into_iter().chain(self.app.page_rects()) {
             if r.w > 0 && r.h > 0 {
                 rects.push((S_PANEL, r));
             }
@@ -654,6 +661,38 @@ impl State {
         }
     }
 
+    /// Switch to page `p` (remembered). Always true (keep running).
+    fn set_page(&mut self, p: usize) -> bool {
+        let a = &mut self.app;
+        if a.page == p {
+            return true;
+        }
+        if a.page == ui::PG_PROC {
+            a.procs_leave();
+        }
+        a.page = p;
+        self.cfg.page = p;
+        self.cfg.save();
+        a.fit(a.w, a.h);
+        if a.mem_visible() {
+            // fresh numbers for what just appeared (outside the eco budget: input
+            // handling isn't charged)
+            a.m.refresh_fs();
+            if a.procs_visible() && !a.m.proc_ok {
+                a.m.scan_procs();
+            }
+            a.mem_retarget(false);
+        }
+        if p == ui::PG_PROC {
+            a.procs_enter();
+        }
+        if p == ui::PG_NET {
+            a.n.enter(term::mono());
+            a.net_retarget(false);
+        }
+        true
+    }
+
     /// Returns false to quit.
     fn handle(&mut self, ev: Ev) -> bool {
         if self.app.menu.is_some() {
@@ -677,6 +716,10 @@ impl State {
             Ev::Key(k) => k,
             Ev::Mouse { x, y, btn } => {
                 let (x, y) = (x as usize, y as usize);
+                // processes page: rows, column titles, wheel
+                if self.app.key_at(x, y).is_none() && self.app.proc_click(x, y, btn) {
+                    return true;
+                }
                 match btn {
                     0 => {
                         if let Some(k) = self.app.key_at(x, y) {
@@ -694,6 +737,20 @@ impl State {
                 }
             }
         };
+        // the processes page's own keys (and its dialogs / filter line) come first
+        if self.app.proc_key(key) {
+            return true;
+        }
+        // pages: 1-4, tab / shift-tab
+        let np = ui::NPAGES;
+        let p = self.app.page;
+        match key {
+            Key::Char(c @ '1'..='4') => return self.set_page(c as usize - '1' as usize),
+            Key::Tab => return self.set_page((p + 1) % np),
+            Key::BackTab => return self.set_page((p + np - 1) % np),
+            Key::Char('m') => return self.set_page(if p == ui::PG_MEM { 0 } else { ui::PG_MEM }),
+            _ => {}
+        }
         let a = &mut self.app;
         match key {
             Key::Char('q') | Key::CtrlC => return false,
@@ -714,30 +771,8 @@ impl State {
                 self.cfg.save();
                 a.fit(a.w, a.h); // CCD divider rows exist only in core order
             }
-            // pages: 1-4, Tab / Shift-Tab; m toggles CPU ⇄ memory
-            Key::Char('m') | Key::Char('1'..='4') | Key::Tab | Key::BackTab => {
-                a.page = match key {
-                    Key::Char('m') => (a.page != 1) as usize,
-                    Key::Char(c) => c as usize - '1' as usize,
-                    Key::Tab => (a.page + 1) % ui::PAGES.len(),
-                    _ => (a.page + ui::PAGES.len() - 1) % ui::PAGES.len(),
-                };
-                self.cfg.page = a.page;
-                self.cfg.save();
-                a.fit(a.w, a.h);
-                if a.page == 2 {
-                    a.n.enter(term::mono());
-                    a.net_retarget(false);
-                }
-                if a.mem_visible() {
-                    // fresh numbers for what just appeared (outside the eco budget:
-                    // input handling isn't charged)
-                    a.m.refresh_fs();
-                    if a.procs_visible() && !a.m.proc_ok {
-                        a.m.scan_procs();
-                    }
-                    a.mem_retarget(false);
-                }
+            Key::Char('p') if a.mem_visible() => {
+                a.toggle_split();
             }
             Key::Char('c') => {
                 a.view = (a.view + 1) % 3;
@@ -1055,15 +1090,9 @@ fn main() {
             }
             "--page" => {
                 let v = val();
-                page_arg = Some(match v.as_str() {
-                    "cpu" => 0,
-                    "memory" | "mem" | "storage" => 1,
-                    "network" | "net" | "system" => 2,
-                    "processes" | "proc" => 3,
-                    _ => die(&format!(
-                        "unknown page: {v} (cpu, memory, network or processes)"
-                    )),
-                });
+                page_arg = Some(ui::page_index(&v).unwrap_or_else(|| {
+                    die("unknown page (one of cpu, memory, network, processes)")
+                }));
             }
             "--image-mode" => {
                 let v = val();
@@ -1187,7 +1216,10 @@ fn main() {
     if st.app.procs_visible() {
         st.app.m.scan_procs();
     }
-    if st.app.page == 2 {
+    if st.app.page == ui::PG_PROC {
+        st.app.procs_enter();
+    }
+    if st.app.page == ui::PG_NET {
         st.app.n.enter(term::mono());
     }
     st.rebuild(img);
@@ -1429,7 +1461,7 @@ fn main() {
             // sample there (eco; other speeds twice a second), its histories get the
             // seconds in between from the next one
             cpu_held += push;
-            cpu_skip = st.app.page == 2 && (if eco { !cpu_skip } else { tick % 5 != 0 });
+            cpu_skip = st.app.page == ui::PG_NET && (if eco { !cpu_skip } else { tick % 5 != 0 });
             if !cpu_skip {
                 let push = std::mem::take(&mut cpu_held);
                 prof(0, || st.app.s.sample(push, clocks));
@@ -1440,7 +1472,6 @@ fn main() {
             // 5 s, eco 60 s) only while shown
             let vis = st.app.mem_visible();
             let pvis = st.app.procs_visible();
-            let prows = st.app.ml.procs.h.saturating_sub(3);
             let m = &mut st.app.m;
             let now = term::mono();
             // swap rates: smooth 2.5 times a second, eco every 4 s at most
@@ -1463,19 +1494,30 @@ fn main() {
                     m.last_fs = now;
                     m.refresh_fs();
                 }
-                // processes: a full scan costs ~1 µs a process, so eco does one every
-                // 2 minutes and re-reads just the ones shown every 20 s
-                let gap = if eco { 120 } else { 3 } * SEC;
+                // processes: a full scan (to find newcomers) costs ~1.3 µs a process,
+                // so it runs every 4 s (eco: 2 minutes); the biggest ones are followed
+                // live through their open statm (~1 µs each): 2.5 times a second
+                // (eco: every 10 s)
+                let gap = if eco { 120 } else { 4 } * SEC;
+                let live = if eco { 10 * SEC } else { 2 * SEC / 5 };
                 if pvis && now - m.last_proc >= gap - SEC / 5 {
                     m.scan_procs();
-                } else if pvis && eco && now - m.last_top >= 20 * SEC - SEC / 5 {
+                } else if pvis && now - m.last_top >= live - SEC / 20 {
                     m.last_top = now;
-                    m.refresh_procs(prows);
+                    m.refresh_procs();
+                    // eco: a full scan early when a big newcomer appeared
+                    if eco && m.need_scan() {
+                        m.scan_procs();
+                    }
                 }
             }
             // network & system: links every sample while shown (every 10 s hidden, to
             // keep their history), the rest on its own spread-out schedule (net::tick)
-            st.app.n.tick(now, push, st.app.page == 2, eco);
+            st.app.n.tick(now, push, st.app.page == ui::PG_NET, eco);
+            // processes page (view 4): only while shown, see App::procs_sample
+            if st.app.page == ui::PG_PROC {
+                prof(16, || st.app.procs_sample(now, eco, smooth, tick, push));
+            }
             if smooth {
                 if tick % 4 == 0 {
                     st.app.s.publish();

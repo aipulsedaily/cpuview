@@ -9,13 +9,14 @@ use std::fmt::Write as _;
 #[path = "memui.rs"]
 mod memui;
 pub use memui::*;
-// page 3: network & system (and the page-4 placeholder)
+// view 4: processes (and the page numbers / tabs shared by all views)
+#[path = "procui.rs"]
+mod procui;
+pub use procui::*;
+// view 3: network & system
 #[path = "netui.rs"]
 mod netui;
 pub use netui::*;
-
-/// Pages: `App::page` indexes these (keys 1-4, Tab / Shift-Tab, `--page`, config).
-pub const PAGES: [&str; 4] = ["cpu", "memory", "network", "processes"];
 
 const SLOT_TITLE: usize = 0;
 const SLOT_GLOAD: usize = 1;
@@ -309,6 +310,8 @@ pub const SIDE_W: usize = 190;
 pub const SIDE_H: usize = 36;
 pub const CLK: char = '▂';
 pub const LOAD: char = '▄';
+/// Fill under a history curve: the line colour blended to SOFT/16 into the track.
+const SOFT: u32 = 6;
 
 #[derive(Clone, Copy, Debug)]
 struct Plan {
@@ -418,6 +421,8 @@ pub struct App {
     pub nl: NetLay,
     nv: NA,
     ncache: Vec<u64>,
+    /// view 4: processes (procui.rs)
+    pub pv: PV,
     /// colour of the series in `vals2` that `graph` draws under its own (0: none)
     pub under: std::cell::Cell<u32>,
 }
@@ -499,6 +504,7 @@ impl App {
             nl: NetLay::default(),
             nv: NA::default(),
             ncache: Vec::new(),
+            pv: PV::new(),
             under: std::cell::Cell::new(0),
         }
         .with_bars()
@@ -618,7 +624,7 @@ impl App {
         }
         let ta = &mut self.ta;
         moving |= spring(&mut ta.0, &mut ta.1, self.s.avg_r, dt, W_CLOCK, xf, 1.0);
-        moving | self.mem_step(dt) | self.net_step(dt)
+        moving | self.mem_step(dt) | self.proc_step(dt) | self.net_step(dt)
     }
 
     /// Smooth mode: the digits follow the moving values (with hysteresis, see
@@ -776,18 +782,20 @@ impl App {
     pub fn hist_vals(&self, out: &mut Vec<f32>, n: usize, off: f32, step: f32, src: Hist) {
         let s = &self.s;
         let (len, head, part): (usize, f32, f32) = match src {
-            Hist::Tot => (s.h_tot.len(), self.live_totals().0, s.part_tot()),
+            // (smooth: the head is the number as shown, which moves in whole steps
+            // with hysteresis, so the newest column can't flicker between two dots)
+            Hist::Tot => (s.h_tot.len(), self.hy[HY_TOT] / 100.0, s.part_tot()),
             Hist::Avg => {
                 let p =
                     (0..s.fr.len()).map(|i| s.part_f(i)).sum::<f32>() / s.fr.len().max(1) as f32;
-                (s.h_avg.len(), self.ta.0, p)
+                (s.h_avg.len(), self.hy[HY_AVG], p)
             }
-            Hist::Temp(k) => (s.temps[k].hist.len(), self.tt[k].0, s.temps[k].val),
+            Hist::Temp(k) => (s.temps[k].hist.len(), self.hy[HY_TEMP + k], s.temps[k].val),
             Hist::Load(t) => {
                 let k = t.len().max(1) as f32;
                 (
                     t.iter().map(|&c| s.hu[c].len()).min().unwrap_or(0),
-                    t.iter().map(|&c| self.bu[c]).sum::<f32>() / k,
+                    t.iter().map(|&c| self.nu[c]).sum::<f32>() / k,
                     t.iter().map(|&c| s.part_u(c)).sum::<f32>() / k,
                 )
             }
@@ -820,10 +828,9 @@ impl App {
             out.extend((0..have).rev().map(pt));
             return;
         }
+        let _ = part;
         crate::anim::Curve {
-            phase: self.phase,
             head,
-            part,
             len,
             pt: &pt,
             pad: 0.0,
@@ -926,19 +933,25 @@ impl App {
             h: h.saturating_sub(2),
         };
         self.ml = MemLay::default();
-        self.nl = NetLay::default();
-        if self.page >= 2 {
-            self.fit_cpu(w, h);
-            if self.page == 2 {
-                self.nl = self.net_layout(area);
-            } else {
-                self.nl.soon = area;
-            }
-            return;
-        }
         if self.page == 1 {
             self.fit_cpu(w, h);
             self.ml = self.mem_layout(area, w >= 100 && area.h >= 20);
+            return;
+        }
+        // views 3 (network, netui.rs) and 4 (processes, procui.rs)
+        self.pv.lay = PLay::default();
+        self.nl = NetLay::default();
+        if self.page == PG_NET || self.page == PG_PROC {
+            self.fit_cpu(w, h);
+            if self.page == PG_NET {
+                self.nl = self.net_layout(area);
+            }
+            if self.page == PG_PROC {
+                self.proc_layout(area);
+                if self.pv.d.is_some() {
+                    self.psync(true);
+                }
+            }
             return;
         }
         if w >= SIDE_W && h >= SIDE_H {
@@ -1254,7 +1267,10 @@ impl App {
             if self.mem_visible() {
                 self.draw_mem(scr, false, false);
             }
-            if self.page == 2 {
+            if self.page == PG_PROC {
+                self.draw_proc_page(scr, false, true);
+            }
+            if self.page == PG_NET {
                 self.draw_net(scr, false, false);
             }
         }
@@ -1355,8 +1371,10 @@ impl App {
         if self.mem_visible() {
             prof(15, || self.draw_mem(scr, full, true));
         }
-        if self.page >= 2 {
-            self.draw_net(scr, full, true);
+        if self.page == PG_PROC {
+            prof(15, || self.draw_proc_page(scr, full, false));
+        } else if self.page == PG_NET {
+            prof(15, || self.draw_net(scr, full, true));
         }
         if full {
             self.draw_keys(scr);
@@ -1577,28 +1595,36 @@ impl App {
         ];
         let sum_short: [(&str, u32); 2] =
             [(pu.s(), cu), (if has_t { &pt.s()[1..] } else { "" }, ct)];
+        // (pages 2 to 4 have a title like the memory page's)
         let mem_page = self.page != 0;
         let no_top = !mem_page && self.lay.top.is_none();
         let mi = self.m.mi;
-        let minfo = f!(
-            "   {} RAM · {} swap",
-            bsize(mi.total as f32, false).s(),
-            bsize(mi.swap_total as f32, false).s()
-        );
+        let minfo = if mi.swap_total > 0 {
+            f!(
+                "   RAM {} · swap {}",
+                bsize(mi.total as f32, false).s(),
+                bsize(mi.swap_total as f32, false).s()
+            )
+        } else {
+            f!("   RAM {} · no swap", bsize(mi.total as f32, false).s())
+        };
         let ndk = self.m.disks.len();
-        let dinfo = f!(" · {} disk{}", ndk, if ndk == 1 { "" } else { "s" });
-        let (minfo, dinfo) = match self.page {
-            2 => self.net_info(),
-            3 => (F::new(), F::new()),
-            _ => (minfo, dinfo),
+        let dinfo = match ndk {
+            0 => F::new(),
+            1 => f!(" · 1 disk"),
+            n => f!(" · {} disks", n),
+        };
+        let (minfo, dinfo) = if self.page == PG_NET {
+            self.net_info()
+        } else {
+            (minfo, dinfo)
         };
         let mtitle = (
-            [
-                "",
-                "  memory & storage",
-                "  network & system",
-                "  processes",
-            ][self.page.min(3)],
+            match self.page {
+                PG_PROC => "  processes",
+                PG_NET => "  network & system",
+                _ => "  memory & storage",
+            },
             t.fg | BOLD,
         );
         let mut left0 = [(short.s(), t.fg | BOLD); 8];
@@ -1732,11 +1758,21 @@ impl App {
                 }
                 if code != 0 {
                     let mine = dots[2 * i][0] as usize > base || dots[2 * i + 1][0] as usize > base;
+                    // an area, not a slab: cells under the curve's edge (both halves
+                    // go on above) are a soft fill, the edge itself stays bright
+                    let inside = a > base + 4 && b > base + 4;
+                    let c = if !mine {
+                        uc
+                    } else if inside {
+                        col | SOFT << BLEND_SHIFT
+                    } else {
+                        col
+                    };
                     scr.put(
                         x0 + i,
                         y0 + r,
                         char::from_u32(0x2800 + code).unwrap(),
-                        if mine { col } else { uc },
+                        c,
                         bg,
                     );
                 } else if let (Some(k), true) = (grid_bit, i % 2 == 0) {
@@ -1811,9 +1847,15 @@ impl App {
         let pct = num("", u * 100.0, 0, "%");
         let title: [(&str, u32); 2] = [("cpu ", th.title | BOLD), (pct.s(), th.load.at(u) | BOLD)];
         if full {
-            let win = span(2 * ir.w.saturating_sub(5));
-            let sub = f!("total load · last {}", win.s());
-            self.panel(scr, r, &title, sub.s());
+            self.panel(scr, r, &title, "");
+            self.time_axis(
+                scr,
+                r,
+                ir.x + 5,
+                ir.w.saturating_sub(5),
+                2.0,
+                "load over time",
+            );
         } else {
             self.panel_top(scr, r, &title);
         }
@@ -1868,9 +1910,15 @@ impl App {
         ];
         let title = Self::pick(r.w, &vs);
         if full {
-            let win = span(2 * ir.w.saturating_sub(5));
-            let sub = f!("average clock · last {}", win.s());
-            self.panel(scr, r, title, sub.s());
+            self.panel(scr, r, title, "");
+            self.time_axis(
+                scr,
+                r,
+                ir.x + 5,
+                ir.w.saturating_sub(5),
+                2.0,
+                "average clock over time",
+            );
         } else {
             self.panel_top(scr, r, title);
         }
@@ -3509,6 +3557,36 @@ impl App {
         line(&[("window  ", th.dim), (wn.s(), th.text)], &mut yy);
     }
 
+    /// Page tabs at the footer's left, the current one highlighted: "1 cpu 2 mem
+    /// 3 net 4 proc" (narrow screens: "1 2 3 4"). Clickable (keys 1-4). Returns the x
+    /// after them.
+    fn draw_tabs(&mut self, scr: &mut Screen, y: usize) -> usize {
+        let w = self.w;
+        let long = w >= 72;
+        let th = &self.t;
+        let bar = surf(S_BAR);
+        let mut x = 0;
+        for i in 0..NPAGES {
+            let lab = page_name(i).0;
+            let x0 = x;
+            let d = (b'1' + i as u8) as char;
+            let (dc, lc, bg) = if i == self.page {
+                (th.bg | BOLD, th.bg | BOLD, th.accent)
+            } else {
+                (th.accent | BOLD, th.mid, bar)
+            };
+            scr.put(x, y, ' ', 0, bg);
+            scr.put(x + 1, y, d, dc, bg);
+            x = scr.text(x + 2, y, " ", 0, bg, w);
+            if long {
+                x = scr.text(x, y, lab, lc, bg, w);
+                x = scr.text(x, y, " ", 0, bg, w);
+            }
+            self.zones.push((x0, x, d));
+        }
+        x + 1
+    }
+
     fn draw_keys(&mut self, scr: &mut Screen) {
         let w = self.w;
         let y = self.h - 1;
@@ -3524,27 +3602,11 @@ impl App {
                 bg: bar,
             },
         );
+        // page tabs first (1 cpu 2 mem 3 net 4 proc), then the page's keys
+        self.zones.clear();
+        let tx = self.draw_tabs(scr, y);
+        let ntab = self.zones.len();
         let th = &self.t;
-        // page tabs first: "1 cpu 2 mem 3 net 4 proc" (narrow: "1 2 3 4"), current lit
-        let mut tabs = Vec::new();
-        let mut x0 = 0;
-        for (p, nm) in ["cpu", "mem", "net", "proc"].iter().enumerate() {
-            let d = (b'1' + p as u8) as char;
-            let lab = if w >= 90 {
-                f!(" {} {} ", d, nm)
-            } else {
-                f!(" {} ", d)
-            };
-            let x = x0;
-            x0 = if p == self.page {
-                scr.text(x0, y, lab.s(), th.bg | BOLD, th.accent, w)
-            } else {
-                scr.text(x0, y, lab.s(), th.mid, bar, w)
-            };
-            tabs.push((x, x0, d));
-        }
-        x0 += 1;
-        let w = w.max(x0);
         // (key, long, short, label)
         let cpu_keys: [(char, &str, Option<&str>, &str); 11] = [
             ('q', "quit", Some("quit"), "q"),
@@ -3559,22 +3621,56 @@ impl App {
             ('t', "theme", Some("theme"), "t"),
             ('\0', "select", None, "←↑↓→"),
         ];
-        let mem_keys: [(char, &str, Option<&str>, &str); 5] = [
+        let mem_keys: [(char, &str, Option<&str>, &str); 6] = [
             cpu_keys[0],
             cpu_keys[1],
             cpu_keys[2],
             ('m', "cpu view", Some("cpu"), "m"),
+            (
+                'p',
+                if self.ma.split {
+                    "by program"
+                } else {
+                    "each process"
+                },
+                Some(if self.ma.split {
+                    "programs"
+                } else {
+                    "processes"
+                }),
+                "p",
+            ),
             ('t', "theme", Some("theme"), "t"),
         ];
-        let net_keys = [cpu_keys[0], cpu_keys[1], cpu_keys[2], mem_keys[4]];
+        // view 4 (procui.rs); keys without a short text drop out first
+        let proc_keys: [(char, &str, Option<&str>, &str); 13] = [
+            ('q', "quit", Some("quit"), "q"),
+            (' ', "pause", None, "spc"),
+            ('s', "speed", Some("speed"), "s"),
+            ('o', "sort", Some("sort"), "o"),
+            ('r', "reverse", Some("rev"), "r"),
+            ('/', "filter", Some("filter"), "/"),
+            ('T', "tree", Some("tree"), "T"),
+            ('G', "group", Some("group"), "G"),
+            ('k', "kill", Some("kill"), "k"),
+            ('n', "nice", Some("nice"), "n"),
+            ('I', "cpu % scale", None, "I"),
+            ('K', "kernel threads", None, "K"),
+            ('t', "theme", Some("theme"), "t"),
+        ];
         let keys: &[(char, &str, Option<&str>, &str)] = match self.page {
-            0 => &cpu_keys,
-            1 => &mem_keys,
-            _ => &net_keys,
+            PG_MEM => &mem_keys,
+            PG_NET => &mem_keys[..3],
+            PG_PROC => &proc_keys,
+            _ => &cpu_keys,
         };
+        let pv = &self.pv;
         let state = |k: char| -> &str {
             match k {
                 's' => SPEEDS[self.speed].0,
+                'o' if self.page == PG_PROC => psort_name(pv.sort),
+                'T' if pv.tree => "on",
+                'G' if pv.group && !pv.tree => "on",
                 'o' => SORTS[self.sort],
                 'c' => VIEWS[self.view],
                 'd' if !self.show_det => "off",
@@ -3583,6 +3679,7 @@ impl App {
                 _ => "",
             }
         };
+        let w = w.saturating_sub(tx);
         // variants, most detailed first: (desc 0 long / 1 short / 2 none, pad, sep, theme name)
         for (dv, pad, sep, tn) in [
             (0, true, 2, true),
@@ -3613,12 +3710,12 @@ impl App {
                 }
                 len += sep;
             }
-            if len.saturating_sub(sep) > w - x0 && dv < 2 {
+            if len.saturating_sub(sep) > w && dv < 2 {
                 continue;
             }
-            self.zones.clear();
-            self.zones.extend_from_slice(&tabs);
-            let mut x = x0;
+            self.zones.truncate(ntab);
+            let w = w + tx;
+            let mut x = tx;
             for &(k, long, short, lab) in keys {
                 let d = match dv {
                     0 => long,
@@ -3788,6 +3885,140 @@ mod tests {
         }
     }
 
+    fn screen_text(scr: &Screen) -> String {
+        let mut t = String::new();
+        for y in 0..scr.h {
+            for x in 0..scr.w {
+                t.push(scr.buf[y * scr.w + x].ch);
+            }
+            t.push('\n');
+        }
+        t
+    }
+
+    /// Memory page text at `w` × `h` for a machine set up by `f`.
+    fn mem_text(w: usize, h: usize, page: usize, f: &dyn Fn(&mut crate::mem::Mem)) -> String {
+        let mut a = app(16, 2, 2);
+        f(&mut a.m);
+        a.page = page;
+        a.first_size(w, h);
+        a.mem_retarget(false);
+        let mut scr = Screen::new(w, h);
+        a.draw(&mut scr, true);
+        a.draw(&mut scr, false);
+        let t = screen_text(&scr);
+        assert!(!t.contains("NaN") && !t.contains("inf"), "{w}x{h}\n{t}");
+        t
+    }
+
+    #[test]
+    fn memory_page_adapts_to_any_machine() {
+        use crate::mem::Mem;
+        let sizes = [
+            (128, 45, 1),
+            (80, 24, 1),
+            (60, 20, 1),
+            (205, 50, 0),
+            (40, 12, 1),
+        ];
+        // no swap
+        for &(w, h, p) in &sizes {
+            let t = mem_text(w, h, p, &|m| {
+                m.mi.swap_total = 0;
+                m.mi.swap_free = 0;
+            });
+            if w >= 80 {
+                assert!(t.contains("no swap set up"), "{w}x{h}\n{t}");
+            }
+        }
+        // zram swap
+        let t = mem_text(128, 45, 1, &|m| m.zram = true);
+        assert!(t.contains("swap zram"), "{t}");
+        // six disks: one line each and one chart for all of them
+        let t = mem_text(128, 45, 1, &|m| *m = Mem::fake(6, 3, 24));
+        assert!(t.contains("nvme5n1") && t.contains("all disks"), "{t}");
+        for &(w, h, p) in &sizes {
+            mem_text(w, h, p, &|m| *m = Mem::fake(6, 9, 24));
+        }
+        // HDD only, no sensors at all: no temperatures, the drive's model instead
+        let hdd = |m: &mut Mem| {
+            *m = Mem::fake(1, 2, 12);
+            m.disks[0].name = "sda".into();
+            m.disks[0].model = "WDC WD40EFRX-68N32N0".into();
+            m.disks[0].size = 4_000_787_030_016;
+        };
+        for &(w, h, p) in &sizes {
+            let t = mem_text(w, h, p, &hdd);
+            if p == 1 {
+                assert!(!t.contains("°C"), "{w}x{h}\n{t}");
+            }
+        }
+        assert!(mem_text(128, 45, 1, &hdd).contains("WDC WD40EFRX"));
+        // a VM: virtio disk, no sensors, no pressure information, one filesystem
+        let vm = |m: &mut Mem| {
+            *m = Mem::fake(1, 1, 6);
+            m.disks[0].name = "vda".into();
+            m.disks[0].model = String::new();
+            m.has_psi = false;
+            m.mi.swap_total = 0;
+            m.mi.swap_free = 0;
+        };
+        for &(w, h, p) in &sizes {
+            let t = mem_text(w, h, p, &vm);
+            if p == 1 {
+                assert!(!t.contains("waiting") && !t.contains("°C"), "{w}x{h}\n{t}");
+            }
+        }
+        // no disks at all (containers): memory, storage and programs only
+        for &(w, h, p) in &sizes {
+            mem_text(w, h, p, &|m| *m = Mem::fake(0, 1, 6));
+        }
+        // a very long mount path is cut to fit
+        let t = mem_text(80, 24, 1, &|m| {
+            m.fs[1].mnt = "/srv/a/very/long/mount/point/for/the/media/library/2024".into()
+        });
+        assert!(t.lines().all(|l| l.chars().count() == 80));
+        assert!(crate::mem::swaps_zram(
+            "Filename Type Size Used Priority\n/dev/zram0 partition 8388604 0 100\n"
+        ));
+        assert!(!crate::mem::swaps_zram(
+            "Filename Type Size Used Priority\n/swap.img file 8388604 0 -2\n"
+        ));
+        assert!(!crate::mem::swaps_zram(
+            "Filename Type Size Used Priority\n"
+        ));
+    }
+
+    /// `cargo test --release dump_mem_fixtures -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_mem_fixtures() {
+        use crate::mem::Mem;
+        let w: usize = std::env::var("W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let h: usize = std::env::var("H")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(45);
+        type Fx<'a> = (&'a str, &'a dyn Fn(&mut Mem));
+        let fx: [Fx; 3] = [
+            ("6 disks", &|m: &mut Mem| *m = Mem::fake(6, 9, 24)),
+            ("vm", &|m: &mut Mem| {
+                *m = Mem::fake(1, 1, 6);
+                m.disks[0].name = "vda".into();
+                m.has_psi = false;
+                m.mi.swap_total = 0;
+                m.mi.swap_free = 0;
+            }),
+            ("none", &|m: &mut Mem| *m = Mem::fake(0, 1, 6)),
+        ];
+        for (n, f) in fx {
+            eprintln!("── {n}\n{}", mem_text(w, h, 1, f));
+        }
+    }
+
     #[test]
     fn memory_values_glide_in_smooth_mode() {
         let mut a = app(16, 2, 2);
@@ -3842,7 +4073,7 @@ mod tests {
                 a.lay.nrows,
                 a.lay.vis_rows
             );
-            assert_eq!(a.lay.cols * a.lay.nrows >= 16, true);
+            assert!(a.lay.cols * a.lay.nrows >= 16);
         }
         // 172x40 = graphs + cores + detail (one CCD per column); the detail area takes a
         // row from the graphs so the all-core heatmap (8 rows + borders) fits
@@ -3934,9 +4165,9 @@ mod tests {
         let ir = a.lay.cores.inner();
         let g = a.card_at(ir.x + 5, ir.y + 1 + 2 * a.lay.rh);
         assert_eq!(g, Some(2));
-        // page tabs first, then the keys
+        // page tabs first (1 cpu 2 mem 3 net 4 proc), then the keys
         assert_eq!(a.key_at(1, 39), Some('1'));
-        for k in ['3', 'q', 't'] {
+        for k in ['4', 'q', 't'] {
             let z = a.zones.iter().find(|z| z.2 == k).unwrap();
             assert_eq!(a.key_at(z.0, 39), Some(k));
         }
@@ -3997,11 +4228,22 @@ mod tests {
         a.speed = SMOOTH;
         a.bars_snap();
         a.bu.iter_mut().for_each(|u| *u = 0.9);
+        a.anim_numbers(1.0); // (the head is the number as shown)
         a.phase = 0.5;
         a.hist_vals(&mut v, 4, 0.0, 1.0, Hist::Tot);
         assert!((v[3] - 0.9).abs() < 1e-6, "{v:?}"); // age 0: live
         assert!((v[2] - 0.3).abs() < 1e-6, "{v:?}"); // age 1: newest point
-                                                     // strips / heatmap cells: means over 2 s
+                                                     // the stored points don't move with the sub-second phase (no "breathing":
+                                                     // a one-point peak never shrinks between two columns and regrows)
+        a.s.h_tot.push(0.9);
+        let mut w = Vec::new();
+        for ph in [0.0, 0.3, 0.7, 1.0] {
+            a.phase = ph;
+            a.hist_vals(&mut w, 6, 0.0, 1.0, Hist::Tot);
+            assert_eq!(&w[..5], &[0.3, 0.3, 0.3, 0.3, 0.9], "phase {ph}");
+        }
+        a.phase = 0.5;
+        // strips / heatmap cells: means over 2 s
         let thr = a.s.t.groups[0].clone();
         let mut c = Vec::new();
         let have = a.cells_smooth(&mut c, 6, &thr);

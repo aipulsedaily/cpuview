@@ -9,21 +9,20 @@ use super::*;
 use crate::anim::{Val, W_LOAD};
 use crate::net::*;
 
-/// Network-page panels (`w == 0`: not shown); `soon`: the page-4 placeholder.
+/// Network-page panels (`w == 0`: not shown).
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct NetLay {
     pub net: Rect,
     pub conn: Rect,
     pub ctr: Rect,
     pub svc: Rect,
-    pub soon: Rect,
     /// what the layout was made for (containers, services, links up / down, virtual)
     sig: u64,
 }
 
 impl NetLay {
-    pub fn rects(&self) -> [Rect; 5] {
-        [self.net, self.conn, self.ctr, self.svc, self.soon]
+    pub fn rects(&self) -> [Rect; 4] {
+        [self.net, self.conn, self.ctr, self.svc]
     }
 }
 
@@ -83,12 +82,13 @@ impl List {
         }
     }
 
-    /// Smooth mode: one frame. `unit(q, x)`: the display resolution of value q.
-    fn step(&mut self, dt: f32, ex: f32, unit: &dyn Fn(usize, f32) -> f32) -> bool {
+    /// Smooth mode: one frame. Values show at `bsize`'s resolution (counts: whole),
+    /// the first in tenths of a percent with `pct`.
+    fn step(&mut self, dt: f32, ex: f32, pct: bool) -> bool {
         let mut mv = false;
         for i in &mut self.it {
             for q in 0..4 {
-                let u = unit(q, i.v[q].x);
+                let u = if q == 0 && pct { 0.1 } else { bstep(i.v[q].x) };
                 mv |= i.v[q].step(dt, W_LOAD, ex, u * 0.25);
                 mv |= i.v[q].digits(dt, u, 0.0);
             }
@@ -98,10 +98,10 @@ impl List {
     }
 
     /// Rows in display order (by gliding position).
-    fn order(&self) -> impl Iterator<Item = &Item> {
+    fn order(&self) -> Vec<usize> {
         let mut o: Vec<usize> = (0..self.it.len()).collect();
         crate::sys::isort(&mut o, &|&a, &b| self.it[a].v[4].x < self.it[b].v[4].x);
-        o.into_iter().map(|i| &self.it[i])
+        o
     }
 
     fn key(&self, bars: usize, top: f32) -> u64 {
@@ -131,7 +131,6 @@ pub struct NA {
     tw: Val,
     ctrs: List,
     svc_cpu: List,
-    svc_mem: List,
     /// everything the logged-in users run (user.slice), one row
     users: List,
     peers: List,
@@ -142,90 +141,41 @@ const N_CHART: usize = 1;
 const N_CONN: usize = 2;
 const N_CTR: usize = 3;
 const N_SVC: usize = 4;
-const N_AXIS: usize = 5;
+const N_TITLE: usize = 5;
 
-pub const RATE: [&str; 6] = ["B/s", "kB/s", "MB/s", "GB/s", "TB/s", "PB/s"];
-pub const SIZE: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
-
-fn dunit(v: f32) -> (f32, usize) {
-    let (mut v, mut k) = (v.max(0.0), 0);
-    while v >= 999.5 && k < 5 {
-        v /= 1000.0;
-        k += 1;
-    }
-    (v, k)
-}
-
-/// Short decimal: "73.5k", "512", "1.20M".
-pub fn dshort(v: f32) -> F {
-    dfmt_sp(v, &SIZE, false)
-}
-
-/// Decimal size / rate with 3 significant digits: "12.3 MB/s", "512 B/s".
-pub fn dfmt(v: f32, u: &[&str; 6]) -> F {
-    dfmt_sp(v, u, true)
-}
-
-fn dfmt_sp(v: f32, u: &[&str; 6], sp: bool) -> F {
-    let (x, k) = dunit(v);
-    let mut f = F::new();
-    let c = |m: f32| (x * m).round() as u32;
-    if k == 0 || x >= 99.95 {
-        f.int(c(1.0), 0);
-    } else if x >= 9.995 {
-        f.int(c(10.0) / 10, 0);
-        f.push(b'.');
-        f.push(b'0' + (c(10.0) % 10) as u8);
-    } else {
-        f.int(c(100.0) / 100, 0);
-        f.push(b'.');
-        f.push(b'0' + (c(100.0) / 10 % 10) as u8);
-        f.push(b'0' + (c(100.0) % 10) as u8);
-    }
-    if sp {
-        f.push(b' ');
-    }
-    f.str(u[k]);
+/// A rate in decimal units (memui's `bsize` + "/s"): "4.71 kB/s", "12.3 MB/s".
+pub fn nrate(v: f32) -> F {
+    let mut f = bsize(v, false);
+    f.str("/s");
     f
 }
 
-/// The resolution `dfmt` shows `v` with.
-pub fn dstep(v: f32) -> f32 {
-    let (x, k) = dunit(v);
-    let s = if k == 0 || x >= 99.95 {
-        1.0
-    } else if x >= 9.995 {
-        0.1
-    } else {
-        0.01
-    };
-    s * [1.0, 1e3, 1e6, 1e9, 1e12, 1e15][k]
+/// Short, for tight table cells: "1.61MB", "512B".
+pub fn nshort(v: f32) -> F {
+    let mut f = bsize(v, true);
+    if f.n > 0 && f.s().as_bytes()[f.n - 1] != b'B' {
+        f.push(b'B');
+    }
+    f
 }
 
-/// A round axis value ("10 MB/s", "2.5 kB/s"): whole numbers without decimals.
+/// A round axis value ("10 MB/s", "1.5 kB/s"): whole numbers without decimals.
 pub fn dtick(v: f32) -> F {
-    let (x, k) = dunit(v);
-    let t = (x * 10.0).round() as u32;
-    let mut f = F::new();
-    f.int(t / 10, 0);
-    if t % 10 != 0 {
-        f.push(b'.');
-        f.push(b'0' + (t % 10) as u8);
-    }
-    f.push(b' ');
-    f.str(RATE[k]);
-    f
+    // bsize's "10.0 MB" / "1.50 kB" without the trailing zeros
+    let b = bsize(v, false);
+    let (num, unit) = b.s().split_once(' ').unwrap_or((b.s(), ""));
+    let num = if num.contains('.') {
+        num.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        num
+    };
+    fc(&[num, " ", unit, "/s"])
 }
 
-/// Chart scale: the next of 1, 2, 5 × 10^k bytes/s at or above `v` (1 kB/s at least).
-pub fn nice125(v: f32) -> f32 {
-    let mut s = 1000.0f32;
-    let mut k = 0;
-    while s < v && s < 1e15 {
-        s *= if k % 3 == 1 { 2.5 } else { 2.0 };
-        k += 1;
-    }
-    s
+/// Chart scale for network rates: memui's 1, 2, 3, 5 × 10ⁿ steps, but from 10 kB/s
+/// (a link is rarely as busy as a disk; quiet stays a flat line all the same).
+pub fn net_scale(v: f32) -> f32 {
+    nice_rate(v * 1e3) / 1e3
 }
 
 /// "1 Gbit/s", "2.5 Gbit/s", "100 Mbit/s".
@@ -245,23 +195,8 @@ pub fn link_speed(mbit: u32) -> F {
     f
 }
 
-/// "30s ago", "2m ago", "1m 30s ago".
-fn ago(s: usize) -> F {
-    let mut f = F::new();
-    if s >= 60 {
-        f.int((s / 60) as u32, 0);
-        f.push(b'm');
-        if s % 60 > 0 {
-            f.push(b' ');
-        }
-    }
-    if s % 60 > 0 {
-        f.int((s % 60) as u32, 0);
-        f.push(b's');
-    }
-    f.str(" ago");
-    f
-}
+/// Below this (both ways together) a link counts as quiet (bytes/s).
+const QUIET_BPS: f32 = 10e3;
 
 impl App {
     // ── layout ─────────────────────────────────────────────────────────────
@@ -269,19 +204,19 @@ impl App {
     /// What the layout depends on: changes trigger a new layout.
     fn net_sig(&self) -> u64 {
         let n = &self.n;
-        let up = n.primary().filter(|i| i.up).count();
+        let (np, up, _) = n.links_up();
         mixk(&[
             n.ctrs.len().min(64) as u64,
             n.svcs.len().min(64) as u64,
             up as u64,
-            n.primary().count() as u64,
+            np as u64,
             n.virt.is_empty() as u64,
         ])
     }
 
     /// Lay out again if the things shown changed (containers came or went...).
     pub fn net_refit(&mut self) -> bool {
-        if self.page == 2 && self.nl.sig != self.net_sig() {
+        if self.page == PG_NET && self.nl.sig != self.net_sig() {
             self.fit(self.w, self.h);
             return true;
         }
@@ -294,8 +229,9 @@ impl App {
     pub fn net_layout(&self, r: Rect) -> NetLay {
         let n = &self.n;
         let (nc, ns) = (n.ctrs.len(), n.svcs.len());
-        let nup = n.primary().filter(|i| i.up).count().max(1);
-        let extra = (n.primary().count() > nup) as usize + !n.virt.is_empty() as usize;
+        let (np, nup, _) = n.links_up();
+        let nup = nup.max(1);
+        let extra = (np > nup) as usize + !n.virt.is_empty() as usize;
         let net_want = 2 + 2 * nup + extra + 1 + 14;
         let conn_want = 4 + 2 + n.listen.len() + n.peers.len().min(8);
         let ctr_want = if nc > 0 { 3 + nc } else { 0 };
@@ -323,12 +259,7 @@ impl App {
         };
         let side = nc > 0 || ns > 0;
         if r.w >= 100 && r.h >= 20 {
-            if side && r.w >= 240 {
-                let (w1, w2) = (r.w * 40 / 100, r.w * 27 / 100);
-                l.net = at(r.x, r.y, w1, r.h);
-                l.conn = at(r.x + w1, r.y, w2, r.h);
-                (l.ctr, l.svc) = split(r.x + w1 + w2, r.w - w1 - w2, ctr_want, svc_want, 60);
-            } else if side {
+            if side {
                 // (the container table is the widest)
                 let w1 = r.w * 48 / 100;
                 (l.net, l.conn) = split(r.x, w1, net_want, conn_want, 58);
@@ -406,98 +337,73 @@ impl App {
         l
     }
 
-    /// Columns of the rate chart in the network panel and seconds per column: at
-    /// least 2 minutes, up to 5 on wide charts (at most 2 seconds a column there).
-    fn chart_geo(&self) -> (usize, usize) {
-        let w = self.nl.net.w.saturating_sub(4 + 10).max(1);
-        (w, (w * 2).clamp(120, 300).div_ceil(w).clamp(1, 8))
-    }
-
     // ── animation ──────────────────────────────────────────────────────────
 
     /// New targets after a sample (`smooth`: values glide; else they jump).
     pub fn net_retarget(&mut self, smooth: bool) {
-        if self.page != 2 {
+        if self.page != PG_NET {
             return;
         }
-        let (cols, spc) = self.chart_geo();
-        let span = cols * spc;
+        let (_, gw, b) = self.nchart_geo(self.nl.net.inner());
+        let span = gw * b;
         let n = &self.n;
-        let links: Vec<(u64, [f32; 4], f32)> = n
-            .primary()
-            .map(|i| {
-                let peak = |k: usize| {
-                    let h = i.h.as_ref().map(|h| &h[k]);
-                    let mut m = if k == 0 { i.rx } else { i.tx };
-                    if let Some(h) = h {
-                        for j in 0..h.len().min(span) {
-                            m = m.max(h.back(j));
-                        }
-                    }
-                    nice125(m)
-                };
-                (hkey(i.name.as_bytes()), [i.rx, i.tx, peak(0), peak(1)], 0.0)
-            })
-            .collect();
+        let mut links: Vec<(u64, [f32; 4], f32)> = Vec::new();
+        for i in n.ifs.iter().filter(|i| i.prim) {
+            // one scale for the stacked chart: its highest column in view
+            let mut m = i.rx + i.tx;
+            if let Some(h) = i.h.as_ref() {
+                for j in 0..h[0].len().min(span) {
+                    m = m.max(h[0].back(j) + h[1].back(j));
+                }
+            }
+            links.push((
+                hkey(i.name.as_bytes()),
+                [i.rx, i.tx, net_scale(m), 0.0],
+                0.0,
+            ));
+        }
         let a = &mut self.nv;
         a.links.set(&links, smooth, f32::INFINITY, 0.0);
         a.estab.set(n.estab as f32, smooth);
         a.tw.set(n.tw as f32, smooth);
-        let ctrs: Vec<(u64, [f32; 4], f32)> = n
-            .ctrs
-            .iter()
-            .filter(|c| c.ok)
-            .map(|c| (c.k, [c.cpu, c.mem, c.rx, c.tx], c.cpu))
-            .collect();
+        let mut ctrs: Vec<(u64, [f32; 4], f32)> = Vec::new();
+        for c in &n.ctrs {
+            if c.ok {
+                ctrs.push((c.k, [c.cpu, c.mem, c.rx, c.tx], c.cpu));
+            }
+        }
         a.ctrs.set(&ctrs, smooth, 1.2, 1.0);
-        let svc = |by_mem: bool| -> Vec<(u64, [f32; 4], f32)> {
-            n.svcs
-                .iter()
-                .map(|s| {
-                    (
-                        s.k,
-                        [s.cpu, s.mem, 0.0, 0.0],
-                        if by_mem { s.mem } else { s.cpu },
-                    )
-                })
-                .collect()
-        };
-        a.svc_cpu.set(&svc(false), smooth, 1.2, 1.0);
-        a.svc_mem.set(&svc(true), smooth, 1.1, 1e6);
+        // services: the busiest first, then the biggest (100 MB counts like 1 % CPU)
+        let mut sv: Vec<(u64, [f32; 4], f32)> = Vec::new();
+        for s in &n.svcs {
+            sv.push((s.k, [s.cpu, s.mem, 0.0, 0.0], s.cpu + s.mem / 1e8));
+        }
+        a.svc_cpu.set(&sv, smooth, 1.2, 0.5);
         let u: Vec<(u64, [f32; 4], f32)> = n
             .user
             .iter()
             .map(|s| (s.k, [s.cpu, s.mem, 0.0, 0.0], 0.0))
             .collect();
         a.users.set(&u, smooth, 1.0, 0.0);
-        let peers: Vec<(u64, [f32; 4], f32)> = n
-            .peers
-            .iter()
-            .map(|p| (peer_key(p), [p.n as f32, 0.0, 0.0, 0.0], p.n as f32))
-            .collect();
+        let mut peers: Vec<(u64, [f32; 4], f32)> = Vec::new();
+        for p in &n.peers {
+            peers.push((peer_key(p), [p.n as f32, 0.0, 0.0, 0.0], p.n as f32));
+        }
         a.peers.set(&peers, smooth, 1.25, 1.0);
     }
 
     /// Smooth mode: one frame of every network-page spring and digit.
     pub fn net_step(&mut self, dt: f32) -> bool {
-        if self.page != 2 {
+        if self.page != PG_NET {
             return false;
         }
         let ex = (-W_LOAD * dt).exp();
         let a = &mut self.nv;
-        let rate = |q: usize, x: f32| if q < 2 { dstep(x) } else { x * 0.002 + 1.0 };
-        let res = |q: usize, x: f32| match q {
-            0 => 0.1,
-            1 => bstep(x),
-            _ => dstep(x),
-        };
-        let cnt = |_: usize, _: f32| 1.0;
-        let mut mv = a.links.step(dt, ex, &rate);
-        mv |= a.ctrs.step(dt, ex, &res);
-        mv |= a.svc_cpu.step(dt, ex, &res);
-        mv |= a.svc_mem.step(dt, ex, &res);
-        mv |= a.users.step(dt, ex, &res);
-        mv |= a.peers.step(dt, ex, &cnt);
+        let mut mv = a.links.step(dt, ex, false);
+        mv |= a.ctrs.step(dt, ex, true);
+        mv |= a.svc_cpu.step(dt, ex, true);
+        mv |= a.users.step(dt, ex, true);
+        mv |= a.peers.step(dt, ex, false);
         for v in [&mut a.estab, &mut a.tw] {
             mv |= v.step(dt, W_LOAD, ex, 0.25);
             mv |= v.digits(dt, 1.0, 0.0);
@@ -518,7 +424,7 @@ impl App {
     pub fn net_info(&self) -> (F, F) {
         let n = &self.n;
         let mut a = F::new();
-        if let Some(i) = n.primary().find(|i| i.up) {
+        if let Some(i) = n.links_up().2.map(|k| &n.ifs[k]) {
             a.str("   ");
             a.str(&i.name);
             if i.speed > 0 {
@@ -595,14 +501,6 @@ impl App {
         if l.svc.w > 0 {
             self.draw_svcs(scr, l.svc, full);
         }
-        if l.soon.w > 0 && full {
-            let th = &self.t;
-            self.panel(scr, l.soon, &[("processes", th.title | BOLD)], "");
-            let ir = l.soon.inner();
-            let s = "Processes — coming soon";
-            let x = ir.x + ir.w.saturating_sub(s.chars().count()) / 2;
-            scr.text(x, ir.y + ir.h / 2, s, th.mid, surf(S_PANEL), ir.x + ir.w);
-        }
     }
 
     /// Shown rate values of a link (smooth: gliding), chart scales.
@@ -616,21 +514,72 @@ impl App {
             .map_or([Val::default(); 4], |i| [i.v[0], i.v[1], i.v[2], i.v[3]])
     }
 
+    /// The link the chart follows: the first that is up (default route first), else
+    /// the first one there is.
+    fn main_link(&self) -> Option<usize> {
+        let n = &self.n;
+        (0..n.ifs.len())
+            .find(|&i| n.ifs[i].prim && n.ifs[i].up)
+            .or(n.ifs.iter().position(|i| i.prim))
+    }
+
+    /// Chart geometry inside the network panel's inner rect, like the disk chart's:
+    /// (x of the first column, columns, seconds a column) — a 10-cell y-axis gutter,
+    /// the values now at the right edge when there is room, 2–5 s a column for 2–5
+    /// minutes.
+    fn nchart_geo(&self, ir: Rect) -> (usize, usize, usize) {
+        let gut = 10;
+        let rg = if ir.w >= 48 { 13 } else { 0 };
+        let gw = ir.w.saturating_sub(gut + rg).max(1);
+        let b = (gw * 2).clamp(120, 300).div_ceil(gw).clamp(2, 5);
+        (ir.x + gut, gw, b)
+    }
+
+    /// Column `c` of link `m`'s traffic: 0 is now (the rates as shown), then mean
+    /// download / upload over whole `b`-second buckets of the history, aligned to the
+    /// history count, so the columns step left once per bucket and never change in
+    /// between.
+    fn link_col(&self, m: usize, c: usize, b: usize) -> Option<(f32, f32)> {
+        let f = &self.n.ifs[m];
+        if c == 0 {
+            let v = self.link_vals(&f.name);
+            return Some((v[0].n, v[1].n));
+        }
+        let h = f.h.as_ref()?;
+        let lag = (self.n.pts % b as u64) as usize;
+        let (lo, hi) = (lag + (c - 1) * b, lag + c * b);
+        if hi > h[0].len() {
+            return None;
+        }
+        let (mut d, mut u) = (0.0, 0.0);
+        for p in lo..hi {
+            d += h[0].back(p);
+            u += h[1].back(p);
+        }
+        Some((d / b as f32, u / b as f32))
+    }
+
     fn draw_links(&mut self, scr: &mut Screen, r: Rect, full: bool, graphs: bool) {
         let ir = r.inner();
         let (iw, ih) = (ir.w, ir.h);
         let now = crate::term::mono();
         let n = &self.n;
-        let ups: Vec<usize> = (0..n.ifs.len())
-            .filter(|&i| n.ifs[i].prim && n.ifs[i].up)
-            .collect();
-        let downs: Vec<usize> = (0..n.ifs.len())
-            .filter(|&i| n.ifs[i].prim && !n.ifs[i].up)
-            .collect();
-        // rows: a rate line per link up; then (keeping 8 rows for the chart) details,
-        // links down, virtual links, a gap; the chart gets the rest
+        let (mut ups, mut downs) = (Vec::new(), Vec::new());
+        for (k, i) in n.ifs.iter().enumerate() {
+            if i.prim {
+                if i.up { &mut ups } else { &mut downs }.push(k);
+            }
+        }
+        let main = self.main_link();
+        // rows: a rate line per link up; then (keeping 6 rows for the chart) details,
+        // links down, virtual links, a gap; the chart (caption, legend, columns) gets
+        // the rest
         let mut rem = ih.saturating_sub(ups.len().max(1));
-        let res = if rem >= 7 { 7 } else { 0 };
+        let res = if rem >= 6 && main.is_some() && iw >= 30 {
+            6
+        } else {
+            0
+        };
         let det = !ups.is_empty() && rem >= res + ups.len();
         if det {
             rem -= ups.len();
@@ -639,27 +588,74 @@ impl App {
         rem -= dl as usize;
         let vl = !n.virt.is_empty() && rem > res;
         rem -= vl as usize;
-        let gap = res > 0 && rem >= 9;
+        let gap = res > 0 && rem >= 8;
         let ch = if res > 0 { rem - gap as usize } else { 0 };
-        let main = ups.first().copied().or(n.ifs.iter().position(|i| i.prim));
-        // chart rows: title, download body, title, upload body, time axis
-        // (odd heights: the middle label's row is exactly half the scale)
-        let body = ch.saturating_sub(3);
-        let hu = (body / 2).saturating_sub((body / 2 + 1) % 2 * (body / 2 > 1) as usize);
-        let hd = (body - hu).saturating_sub((body - hu + 1) % 2 * (body - hu > 1) as usize);
-        let ch = if ch > 0 { hd + hu + 3 } else { 0 };
         let y_chart = ir.y + ih - ch;
-        if full {
-            let sub = if ch > 0 && main.is_some() {
-                "speed now · over time"
+        let (cd, cu) = (self.t.accent, self.t.accent2);
+        // the headline: what the network is doing now
+        let (mut dn, mut up, mut bad) = (0.0f32, 0.0f32, false);
+        for &i in &ups {
+            let v = self.link_vals(&n.ifs[i].name);
+            dn += v[0].n;
+            up += v[1].n;
+            bad |= n.ifs[i].bad(now);
+        }
+        let tk = mixk(&[
+            dn.to_bits() as u64,
+            up.to_bits() as u64,
+            bad as u64,
+            ups.len() as u64,
+            iw as u64,
+        ]);
+        if self.nmemo(N_TITLE, tk) || full {
+            let th = &self.t;
+            let (d, u) = (nrate(dn), nrate(up));
+            let lab = ("network", th.title | BOLD);
+            let (dw, uw) = ((" download", th.dim), (" upload", th.dim));
+            let warn = (" · packets lost", th.warn);
+            let vs: [&[(&str, u32)]; 2] = [
+                &[
+                    lab,
+                    (" ↓ ", cd),
+                    (d.s(), cd | BOLD),
+                    dw,
+                    (" · ↑ ", cu),
+                    (u.s(), cu | BOLD),
+                    uw,
+                    if bad { warn } else { ("", 0) },
+                ],
+                &[
+                    lab,
+                    (" ↓ ", cd),
+                    (d.s(), cd | BOLD),
+                    (" ↑ ", cu),
+                    (u.s(), cu | BOLD),
+                ],
+            ];
+            let one: [(&str, u32); 2] = if ups.is_empty() {
+                [lab, (" not connected", th.crit | BOLD)]
             } else {
-                ""
+                [lab, (" quiet", th.good)]
             };
-            self.panel(scr, r, &[("network", self.t.title | BOLD)], sub);
+            let title = if ups.is_empty() || (dn + up < QUIET_BPS && !bad) {
+                &one
+            } else {
+                Self::pick(r.w, &vs)
+            };
+            if full {
+                self.panel(scr, r, title, "");
+                if ch > 0 {
+                    let (gx, gw, b) = self.nchart_geo(ir);
+                    self.time_axis(scr, r, gx, gw, b as f32, "");
+                }
+            } else {
+                self.panel_top(scr, r, title);
+            }
         }
         if ih == 0 || iw < 12 {
             return;
         }
+        let n = &self.n;
         let mut k = mixk(&[iw as u64, ih as u64, n.ifs.len() as u64]);
         for &i in ups.iter().chain(&downs) {
             let f = &n.ifs[i];
@@ -677,14 +673,19 @@ impl App {
             ]);
         }
         let maxx = ir.x + iw;
-        let (cd, cu) = (self.t.accent, self.t.accent2);
         if self.nmemo(N_TEXT, k) || full {
             let th = &self.t;
             let n = &self.n;
             let b = th.fg | BOLD;
             let mut y = ir.y;
             if ups.is_empty() {
-                Self::row(scr, ir.x, y, maxx, &[("no network connection", th.warn, 0)]);
+                Self::row(
+                    scr,
+                    ir.x,
+                    y,
+                    maxx,
+                    &[("no network link is connected", th.crit, 0)],
+                );
                 y += 1;
             }
             let kind = |f: &Iface| fc(&[" (", KIND[f.kind as usize], ")"]);
@@ -697,97 +698,63 @@ impl App {
             for &i in &ups {
                 let f = &n.ifs[i];
                 let v = self.link_vals(&f.name);
-                let (d, u) = (dfmt(v[0].n, &RATE), dfmt(v[1].n, &RATE));
+                let (d, u) = (nrate(v[0].n), nrate(v[1].n));
                 let kd = kind(f);
-                if wide {
-                    let kw = (nw + 2 - f.name.chars().count()) as i32;
-                    Self::row(
-                        scr,
-                        ir.x,
-                        y,
-                        maxx,
-                        &[
-                            (&f.name, b, 0),
-                            (kd.s(), th.mid, kw),
-                            ("↓", cd, 0),
-                            (d.s(), b, -10),
-                            (" download   ", th.dim, 0),
-                            ("↑", cu, 0),
-                            (u.s(), b, -10),
-                            (" upload", th.dim, 0),
-                        ],
-                    );
-                } else {
-                    Self::row(
-                        scr,
-                        ir.x,
-                        y,
-                        maxx,
-                        &[
-                            (&f.name, b, 0),
-                            (" ↓", cd, 0),
-                            (d.s(), b, -10),
-                            (" ↑", cu, 0),
-                            (u.s(), b, -10),
-                        ],
-                    );
-                }
+                let kw = (nw + 2 - f.name.chars().count()) as i32;
+                Self::row(
+                    scr,
+                    ir.x,
+                    y,
+                    maxx,
+                    &[
+                        (&f.name, b, 0),
+                        (
+                            if wide { kd.s() } else { "" },
+                            th.mid,
+                            if wide { kw } else { 0 },
+                        ),
+                        (if wide { "↓" } else { " ↓" }, cd, 0),
+                        (d.s(), b, -10),
+                        (if wide { " download   " } else { " " }, th.dim, 0),
+                        ("↑", cu, 0),
+                        (u.s(), b, -10),
+                        (if wide { " upload" } else { "" }, th.dim, 0),
+                    ],
+                );
                 y += 1;
                 if det {
+                    // speed, Wi-Fi signal, address, totals, then packets lost (dropped
+                    // or broken) if it fits: amber while losses grow or the signal is weak
                     let mut d = F::new();
                     if f.speed > 0 {
                         d.str(link_speed(f.speed).s());
-                        d.str(if iw >= 66 { " link · " } else { " · " });
+                        d.str(if iw >= 62 { " link · " } else { " · " });
+                    }
+                    let weak = f.kind == K_WIFI && f.sig != 0 && f.sig < -70;
+                    if f.kind == K_WIFI && f.sig != 0 {
+                        d.str("signal −");
+                        d.int(f.sig.unsigned_abs(), 0);
+                        d.str(if weak { " dBm (weak) · " } else { " dBm · " });
                     }
                     if !f.addr.is_empty() {
                         d.str(&f.addr);
                         d.str(" · ");
                     }
                     d.str("since boot ↓");
-                    d.str(dfmt(f.cnt[0] as f32, &SIZE).s());
+                    d.str(bsize(f.cnt[0] as f32, false).s());
                     d.str(" ↑");
-                    d.str(dfmt(f.cnt[1] as f32, &SIZE).s());
-                    // Wi-Fi signal, and problems: in colour only while they happen
-                    let (mut w, mut wc) = (F::new(), th.mid);
-                    if f.kind == K_WIFI && f.sig != 0 {
-                        w.str(" · signal −");
-                        w.int(f.sig.unsigned_abs(), 0);
-                        w.str(" dBm ");
-                        w.str(if f.sig >= -60 {
-                            "good"
-                        } else if f.sig >= -70 {
-                            "fair"
-                        } else {
-                            wc = th.warn;
-                            "weak"
-                        });
+                    d.str(bsize(f.cnt[1] as f32, false).s());
+                    let lost = f.cnt[2] + f.cnt[3];
+                    let p = fc(&[
+                        " · ",
+                        bsize(lost as f32, true).s().trim_end_matches('B'),
+                        " packets lost",
+                    ]);
+                    if lost > 0 && 1 + d.s().chars().count() + p.s().chars().count() <= iw {
+                        d.str(p.s());
                     }
-                    let mut p = F::new();
-                    for (c, s) in [(f.cnt[3], " dropped"), (f.cnt[2], " errors")] {
-                        if c > 0 {
-                            p.str(" · ");
-                            p.str(dshort(c as f32).s());
-                            p.str(s);
-                        }
-                    }
-                    let pc = if f.bad(now) { th.warn } else { th.dim };
-                    // (all of it or none: never a cut-off count)
-                    let len = |f: &F| f.s().chars().count();
-                    if 1 + len(&d) + len(&w) + len(&p) > iw {
-                        p = F::new();
-                    }
-                    Self::row(
-                        scr,
-                        ir.x,
-                        y,
-                        maxx,
-                        &[
-                            (" ", 0, 0),
-                            (d.s(), th.mid, 0),
-                            (w.s(), wc, 0),
-                            (p.s(), pc, 0),
-                        ],
-                    );
+                    let c = if f.bad(now) || weak { th.warn } else { th.mid };
+                    Self::row(scr, ir.x, y, maxx, &[(" ", 0, 0), (d.s(), c, 0)]);
                     y += 1;
                 }
             }
@@ -820,202 +787,161 @@ impl App {
                 y += 1;
             }
             Self::blank(scr, ir.x, &mut y, y_chart, maxx);
-            // chart titles, the legend: series, link, the value now, time span
+            // the chart's caption and legend
             if let (true, Some(m)) = (ch > 0, main) {
-                let f = &n.ifs[m];
-                let v = self.link_vals(&f.name);
-                let (cols, spc) = self.chart_geo();
-                let win = span(cols * spc);
-                for (j, y, c, w, val) in [
-                    (0, y_chart, cd, "download", v[0].n),
-                    (1, y_chart + 1 + hd, cu, "upload", v[1].n),
-                ] {
-                    let nv = dfmt(val, &RATE);
-                    let what = fc(&[w, " on ", &f.name]);
-                    let tail = if j == 0 {
-                        fc(&[" · last ", win.s()])
-                    } else {
-                        F::new()
-                    };
-                    Self::row(
-                        scr,
-                        ir.x,
-                        y,
-                        maxx,
-                        &[
-                            ("■ ", c, 0),
-                            (what.s(), th.text, 0),
-                            ("  now ", th.dim, 0),
-                            (nv.s(), b, 0),
-                            (tail.s(), th.dim, 0),
-                        ],
-                    );
-                }
+                let (_, gw, b) = self.nchart_geo(ir);
+                let span = dur(gw * b);
+                let bs = num("", b as f32, 0, " s");
+                let name = &n.ifs[m].name;
+                let cap = fc(&[
+                    name,
+                    " traffic, last ",
+                    span.s(),
+                    " · each column = ",
+                    bs.s(),
+                    " average",
+                ]);
+                Self::row(scr, ir.x, y_chart, maxx, &[(cap.s(), th.mid, 0)]);
+                Self::row(
+                    scr,
+                    ir.x,
+                    y_chart + 1,
+                    maxx,
+                    &[
+                        ("■ ", cd, 0),
+                        ("download (received)  ", th.text, 0),
+                        ("■ ", cu, 0),
+                        ("upload (sent), stacked", th.text, 0),
+                    ],
+                );
             }
         }
-        if ch == 0 || hd == 0 || !(graphs || full) {
+        if ch < 3 || !(graphs || full) {
             return;
         }
         let Some(m) = main else { return };
-        let (cols, spc) = self.chart_geo();
+        let (gx, gw, b) = self.nchart_geo(ir);
         let v = self.link_vals(&self.n.ifs[m].name);
-        let body = if self.smooth() {
-            self.body_key(0)
-        } else {
-            self.n.hist_n
-        };
         let ck = mixk(&[
-            body,
+            self.n.pts / b as u64,
             iw as u64,
             ih as u64,
             v[2].x.to_bits() as u64,
-            v[3].x.to_bits() as u64,
+            v[0].n.to_bits() as u64,
+            v[1].n.to_bits() as u64,
         ]);
         if self.nmemo(N_CHART, ck) || full {
-            let mut vals = std::mem::take(&mut self.vals);
-            let (pr, pt) = self.n.ifs[m].part();
-            for (k, y, h, c, head, part, sc) in [
-                (0, y_chart + 1, hd, cd, v[0].x, pr, v[2].x),
-                (1, y_chart + 2 + hd, hu, cu, v[1].x, pt, v[3].x),
-            ] {
-                vals.clear();
-                if let Some(hist) = &self.n.ifs[m].h {
-                    self.rate_cols(&mut vals, cols, spc, &hist[k], head, part);
-                }
-                self.rate_chart(scr, ir.x, y, iw, h, &vals, sc.max(1.0), c);
-            }
-            self.vals = vals;
-        }
-        if self.nmemo(N_AXIS, mixk(&[iw as u64, ih as u64, cols as u64])) || full {
-            self.time_axis(scr, ir.x, ir.y + ih - 1, iw, cols, spc);
+            self.link_chart(
+                scr,
+                ir,
+                m,
+                y_chart + 2,
+                ch - 2,
+                (gx, gw, b),
+                v[2].x.max(1.0),
+            );
         }
     }
 
-    /// `n` chart columns `spc` seconds each (oldest first): bucket means of the
-    /// history, aligned to whole buckets so they don't wobble; smooth: the scrolling
-    /// curve with the live value at its head.
-    fn rate_cols(
-        &self,
-        out: &mut Vec<f32>,
-        n: usize,
-        spc: usize,
-        h: &crate::sys::Ring<f32>,
-        head: f32,
-        part: f32,
-    ) {
-        out.clear();
-        if self.smooth() {
-            let mut raw = std::mem::take(&mut *self.scratch.borrow_mut());
-            crate::anim::Curve {
-                phase: self.phase,
-                head,
-                part,
-                len: h.len(),
-                pt: &|k| h.back(k),
-                pad: 0.0,
-            }
-            .sample(&mut raw, n * spc, 0.0, 1.0);
-            out.extend(raw.chunks(spc).map(|c| c.iter().sum::<f32>() / spc as f32));
-            *self.scratch.borrow_mut() = raw;
-            return;
-        }
-        let last = (self.n.pts as usize).saturating_sub(1);
-        out.resize(n, 0.0);
-        for j in 0..n.min(last / spc + 1) {
-            let b = last / spc - j;
-            let (mut s, mut c) = (0.0, 0);
-            for idx in b * spc..((b + 1) * spc).min(last + 1) {
-                if last - idx < h.len() {
-                    s += h.back(last - idx);
-                    c += 1;
-                }
-            }
-            out[n - 1 - j] = s / c.max(1) as f32;
-        }
-    }
-
-    /// Columns chart (eighth blocks) of `vals` (one per column, newest right) with a
-    /// y axis gutter: the scale at the top, half of it half way, 0 at the bottom.
+    /// The traffic chart: stacked columns (download below, upload on top) on a round
+    /// scale, newest at the right, the y axis on the left and the rates now at the
+    /// right edge — the disk chart's grammar.
     #[allow(clippy::too_many_arguments)]
-    fn rate_chart(
+    fn link_chart(
         &self,
         scr: &mut Screen,
-        x0: usize,
-        y0: usize,
-        w: usize,
-        h: usize,
-        vals: &[f32],
-        vmax: f32,
-        col: u32,
+        ir: Rect,
+        m: usize,
+        cy: usize,
+        ch: usize,
+        geo: (usize, usize, usize),
+        sc: f32,
     ) {
         const BL: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let (gx, gw, b) = geo;
+        let th = &self.t;
         let bg = surf(S_PANEL);
-        let gut = 10;
-        let cw = w.saturating_sub(gut);
-        for r in 0..h {
+        let maxx = ir.x + ir.w;
+        let (cd, cu) = (th.accent, th.accent2);
+        // y-axis: the scale, half of it, 0
+        let (lt, lh) = (dtick(sc), dtick(sc / 2.0));
+        let half = if ch >= 5 { ch / 2 } else { usize::MAX };
+        for r in 0..ch {
             let lab = if r == 0 {
-                dtick(vmax)
-            } else if r == h / 2 && h >= 4 {
-                dtick(vmax / 2.0)
+                lt.s()
+            } else if r == half {
+                lh.s()
+            } else if r + 1 == ch {
+                "0"
             } else {
-                F::new()
+                ""
             };
             Self::row(
                 scr,
-                x0,
-                y0 + r,
-                x0 + gut,
-                &[(lab.s(), self.t.dim, 1 - gut as i32)],
+                ir.x,
+                cy + r,
+                gx - 1,
+                &[(lab, th.dim, 1 - (gx - ir.x - 1) as i32)],
             );
-            let grid = lab.n > 0 && r + 1 < h;
-            let base = (h - 1 - r) * 8;
-            for i in 0..cw {
-                let v = vals
-                    .get((vals.len() + i).wrapping_sub(cw))
-                    .copied()
-                    .unwrap_or(0.0);
-                let e = if v > 0.0 {
-                    ((v / vmax * (h * 8) as f32).round() as usize).clamp(1, h * 8)
-                } else {
-                    0
-                };
-                let (c, fg) = if e >= base + 8 {
-                    ('█', col)
-                } else if e > base {
-                    (BL[e - base - 1], col)
-                } else if grid && i % 2 == 0 {
-                    ('·', self.t.border)
-                } else {
-                    (' ', NOPATCH)
-                };
-                scr.put(x0 + gut + i, y0 + r, c, fg, bg);
+            scr.put(
+                gx - 1,
+                cy + r,
+                if lab.is_empty() { '│' } else { '┤' },
+                th.border,
+                bg,
+            );
+        }
+        let e8 = (ch * 8) as f32;
+        for c in 0..gw {
+            let x = gx + gw - 1 - c;
+            let col = self.link_col(m, c, b);
+            let (d, u) = col.unwrap_or((0.0, 0.0));
+            let tot = d + u;
+            let t8 = if col.is_some() && tot > 0.0 {
+                ((tot / sc).min(1.0) * e8).round().max(1.0) as usize
+            } else {
+                0
+            };
+            let d8 = if tot > 0.0 {
+                (t8 as f32 * d / tot).round() as usize
+            } else {
+                0
+            };
+            for row in 0..ch {
+                let y = cy + ch - 1 - row;
+                let lo = row * 8;
+                if t8 <= lo {
+                    let (g, fg) = if row == 0 && col.is_some() {
+                        ('▁', TRACK)
+                    } else if half != usize::MAX && row == ch - 1 - half && c % 2 == 0 {
+                        ('·', th.border)
+                    } else {
+                        (' ', NOPATCH)
+                    };
+                    scr.put(x, y, g, fg, bg);
+                    continue;
+                }
+                let inc = (t8 - lo).min(8);
+                let dp = d8.saturating_sub(lo).min(inc);
+                scr.put(x, y, BL[inc - 1], if dp * 2 >= inc { cd } else { cu }, bg);
             }
         }
-    }
-
-    /// Time axis under the chart: "2m ago … 1m ago … now".
-    fn time_axis(&self, scr: &mut Screen, x0: usize, y: usize, w: usize, cols: usize, spc: usize) {
-        let bg = surf(S_PANEL);
-        let th = &self.t;
-        let right = x0 + w;
-        Self::row(scr, x0, y, right, &[("now", th.mid, -(w as i32))]);
-        let gx = right.saturating_sub(cols);
-        let step = [10, 15, 30, 60, 120, 300, 600, 900, 1800]
-            .into_iter()
-            .find(|&t| t / spc >= 14)
-            .unwrap_or(3600);
-        let mut lim = right - 4;
-        let mut a = step;
-        while a / spc < cols {
-            let cx = right - 1 - a / spc;
-            let s = ago(a);
-            let l = s.s().chars().count();
-            let x = (cx + 1).saturating_sub(l / 2 + 1);
-            if x + l < lim && x >= gx {
-                scr.text(x, y, s.s(), th.dim, bg, right);
-                lim = x;
+        // the rates now at the right edge
+        if gx + gw < maxx {
+            let v = self.link_vals(&self.n.ifs[m].name);
+            let (d, u) = (
+                fc(&["↓ ", nrate(v[0].n).s()]),
+                fc(&["↑ ", nrate(v[1].n).s()]),
+            );
+            for row in 0..ch {
+                let sp: [(&str, u32, i32); 2] = match row {
+                    0 => [(" now", th.mid, 0), ("", 0, 0)],
+                    1 => [(" ", 0, 0), (d.s(), cd | BOLD, 0)],
+                    2 => [(" ", 0, 0), (u.s(), cu | BOLD, 0)],
+                    _ => [("", 0, 0), ("", 0, 0)],
+                };
+                Self::row(scr, gx + gw, cy + row, maxx, &sp);
             }
-            a += step;
         }
     }
 
@@ -1065,13 +991,7 @@ impl App {
             num("", a.tw.n, 0, ""),
             num("", n.listen.len() as f32, 0, ""),
         );
-        let (w1, w2, w3) = if iw >= 76 {
-            (
-                " open connections · ",
-                " closed in the last minute · ",
-                " ports listening",
-            )
-        } else if iw >= 50 {
+        let (w1, w2, w3) = if iw >= 50 {
             (" open · ", " closed in the last minute · ", " listening")
         } else {
             (" open · ", " closing · ", " ports")
@@ -1137,7 +1057,7 @@ impl App {
             let show = lim - y;
             for (i, l) in n.listen.iter().enumerate() {
                 if i + 1 == show && nl > show {
-                    let more = fc(&["+ ", num("", (nl - i) as f32, 0, " more").s()]);
+                    let more = num("+ ", (nl - i) as f32, 0, " more");
                     Self::row(scr, ir.x, y, maxx, &[(more.s(), d, 0)]);
                     y += 1;
                     break;
@@ -1183,15 +1103,10 @@ impl App {
         Self::blank(scr, ir.x, &mut y, lim.min(end), maxx);
         if npe > 0 && end > y + 2 {
             Self::row(scr, ir.x, y, maxx, &[]);
-            Self::row(
-                scr,
-                ir.x,
-                y + 1,
-                maxx,
-                &[("most connections to (remote end)", d, 0)],
-            );
+            Self::row(scr, ir.x, y + 1, maxx, &[("most connections with", d, 0)]);
             y += 2;
-            for it in a.peers.order() {
+            for k in a.peers.order() {
+                let it = &a.peers.it[k];
                 if y >= end {
                     break;
                 }
@@ -1201,16 +1116,13 @@ impl App {
                 let ip = fmt_ip(&p.ip, p.v6);
                 let ps = num(":", p.port as f32, 0, "");
                 let host = fc(&[if p.local { "this computer" } else { &ip }, ps.s(), " "]);
+                // (a container's address, else a local port's owner: its container
+                // when it publishes the port)
                 let owner = n
-                    .ctr_by_ip(&ip)
-                    .or_else(|| p.local.then(|| n.ctr_by_port(p.port)).flatten())
-                    .or_else(|| {
-                        let l = n
-                            .listen
-                            .iter()
-                            .find(|l| p.local && l.port == p.port && l.owner != "?");
-                        l.map(|l| l.owner.as_str())
-                    });
+                    .listen
+                    .iter()
+                    .find(|l| p.local && l.port == p.port && l.owner != "?")
+                    .map(|l| l.owner.as_str());
                 let wf = fc(&["→ ", owner.unwrap_or("")]);
                 let who = if owner.is_some() {
                     wf.s()
@@ -1291,7 +1203,8 @@ impl App {
             y += 1;
         }
         let top_mem = list.it.iter().map(|i| i.v[1].x).fold(0.0, f32::max);
-        for (row, it) in list.order().enumerate() {
+        for (row, k) in list.order().into_iter().enumerate() {
+            let it = &list.it[k];
             if y >= end {
                 break;
             }
@@ -1326,8 +1239,8 @@ impl App {
             let p = pct1(v[0].n / 100.0);
             let m = bsize(v[1].n, false);
             let (rx, tx) = (
-                fc(&["↓", dshort(v[2].n).s()]),
-                fc(&[" ↑", dshort(v[3].n).s()]),
+                fc(&["↓", nshort(v[2].n).s()]),
+                fc(&[" ↑", nshort(v[3].n).s()]),
             );
             let bold = |b: bool| if b { th.fg | BOLD } else { th.text };
             Self::row(
@@ -1365,13 +1278,22 @@ impl App {
         let ir = r.inner();
         let (iw, ih) = (ir.w, ir.h);
         let n = &self.n;
-        let nrest = n.api.iter().filter(|c| c.state == 1).count();
+        // the headline: anything unhealthy or restarting (red / amber), else all fine
+        let (mut bad, mut rest, mut checked) = (0, 0, 0);
+        for c in &n.ctrs {
+            bad += (c.health == 3) as u32;
+            checked += (c.health > 0) as u32;
+            rest += (c.state == 1) as u32;
+        }
+        for c in &n.api {
+            rest += (c.state == 1 && !n.ctrs.iter().any(|x| x.id == c.id)) as u32;
+        }
         let k = mixk(&[
             iw as u64,
             ih as u64,
             self.nv.ctrs.key(12, 100.0),
             n.stopped as u64,
-            nrest as u64,
+            (bad * 1000 + rest) as u64,
             n.api_err as u64,
         ]);
         if !(self.nmemo(N_CTR, k) || full) {
@@ -1379,22 +1301,36 @@ impl App {
         }
         let (n, th) = (&self.n, &self.t);
         let nr = n.ctrs.len();
+        let c = num(" ", nr as f32, 0, " running");
+        let s = num(" · ", n.stopped as f32, 0, " stopped");
+        let (hb, hr) = (
+            num(" · ", bad as f32, 0, " unhealthy"),
+            num(" · ", rest as f32, 0, " restarting"),
+        );
+        let state = if bad > 0 {
+            (hb.s(), th.crit | BOLD)
+        } else if rest > 0 {
+            (hr.s(), th.warn | BOLD)
+        } else if checked > 0 {
+            (" · all healthy", th.good)
+        } else {
+            ("", 0)
+        };
+        let title: [(&str, u32); 4] = [
+            ("containers", th.title | BOLD),
+            (c.s(), th.text),
+            state,
+            (if n.stopped > 0 { s.s() } else { "" }, th.dim),
+        ];
         if full {
-            let c = num(" ", nr as f32, 0, " running");
-            let s = num(" · ", n.stopped as f32, 0, " stopped");
-            let title: [(&str, u32); 3] = [
-                ("containers", th.title | BOLD),
-                (c.s(), th.text),
-                (if n.stopped > 0 { s.s() } else { "" }, th.dim),
-            ];
-            let sub = if n.api_err && iw >= 50 {
-                "cpu 100% = 1 core · no docker access"
-            } else if iw >= 30 {
-                "cpu: 100% = one core"
+            let sub = if n.api_err {
+                "names: no access to docker"
             } else {
-                ""
+                "cpu: 100% = one core"
             };
             self.panel(scr, r, &title, sub);
+        } else {
+            self.panel_top(scr, r, &title);
         }
         if ih == 0 || iw < 12 {
             return;
@@ -1402,26 +1338,6 @@ impl App {
         let maxx = ir.x + iw;
         let end = ir.y + ih;
         let find = |k: u64| n.ctrs.iter().find(|c| c.k == k);
-        if ih == 1 {
-            // tiny: the count and the busiest
-            let c = num("", nr as f32, 0, " running");
-            let top = self.nv.ctrs.order().next().and_then(|i| find(i.key));
-            let p = top.map_or(F::new(), |t| pct1(t.cpu / 100.0));
-            Self::row(
-                scr,
-                ir.x,
-                ir.y,
-                maxx,
-                &[
-                    (c.s(), th.fg, 0),
-                    (if top.is_some() { " · busiest " } else { "" }, th.dim, 0),
-                    (top.map_or("", |t| &t.name), th.text, 0),
-                    (" ", 0, 0),
-                    (p.s(), th.text, 0),
-                ],
-            );
-            return;
-        }
         let get = |k: u64| {
             let c = find(k)?;
             let (s, col) = match (c.state, c.health) {
@@ -1436,11 +1352,10 @@ impl App {
         };
         let mut y = self.usage_rows(scr, ir, ir.y, end, &self.nv.ctrs, "name", true, true, &get);
         // restarting containers have no cgroup to read: listed by the API only
-        for c in n
-            .api
-            .iter()
-            .filter(|c| c.state == 1 && !n.ctrs.iter().any(|x| x.id == c.id))
-        {
+        for c in &n.api {
+            if c.state != 1 || n.ctrs.iter().any(|x| x.id == c.id) {
+                continue;
+            }
             if y >= end {
                 break;
             }
@@ -1464,7 +1379,6 @@ impl App {
             iw as u64,
             ih as u64,
             a.svc_cpu.key(12, 100.0),
-            a.svc_mem.key(0, 1.0),
             a.users.key(12, 100.0),
         ]);
         if !(self.nmemo(N_SVC, k) || full) {
@@ -1500,41 +1414,24 @@ impl App {
             ))
         };
         // what the logged-in users run (not a service: their sessions and apps), then
-        // two lists when there is room: busiest (CPU) and largest (memory)
+        // the services, busiest first, then the biggest
         let mut y = ir.y;
         if !a.users.it.is_empty() && ih >= 6 {
             y = self.usage_rows(scr, ir, y, y + 1, &a.users, "", false, false, &get);
             Self::row(scr, ir.x, y, maxx, &[]);
             y += 1;
         }
-        let two = end - y >= 12 && a.svc_mem.it.len() > 3;
-        let lim = if two { y + (end - y - 1) / 2 } else { end };
         let mut y = self.usage_rows(
             scr,
             ir,
             y,
-            lim,
+            end,
             &a.svc_cpu,
-            "services, busiest now",
+            "services, busiest first",
             false,
             false,
             &get,
         );
-        Self::blank(scr, ir.x, &mut y, lim, maxx);
-        if two {
-            Self::row(scr, ir.x, y, maxx, &[]);
-            y = self.usage_rows(
-                scr,
-                ir,
-                y + 1,
-                end,
-                &a.svc_mem,
-                "services, most memory",
-                false,
-                false,
-                &get,
-            );
-        }
         Self::blank(scr, ir.x, &mut y, end, maxx);
     }
 }
@@ -1561,22 +1458,18 @@ mod tests {
 
     #[test]
     fn decimal_formatting() {
-        assert_eq!(dfmt(12.34e6, &RATE).s(), "12.3 MB/s");
-        assert_eq!(dfmt(512.0, &RATE).s(), "512 B/s");
-        assert_eq!(dfmt(1.5e9, &SIZE).s(), "1.50 GB");
-        assert_eq!(dfmt(60.3365e9, &SIZE).s(), "60.3 GB");
-        assert_eq!(dstep(12.3e6), 1e5);
+        assert_eq!(nrate(12.34e6).s(), "12.3 MB/s");
+        assert_eq!(nrate(512.0).s(), "512 B/s");
+        assert_eq!(nshort(1.61e6).s(), "1.61MB");
+        assert_eq!(nshort(0.0).s(), "0B");
         assert_eq!(dtick(10e6).s(), "10 MB/s");
-        assert_eq!(dtick(2.5e3).s(), "2.5 kB/s");
-        assert_eq!(nice125(0.0), 1000.0);
-        assert_eq!(nice125(3e6), 5e6);
-        assert_eq!(nice125(5.1e6), 1e7);
-        assert_eq!(nice125(1.1e7), 2e7);
+        assert_eq!(dtick(1.5e3).s(), "1.5 kB/s");
+        assert_eq!(net_scale(0.0), 10e3);
+        assert_eq!(net_scale(2.6e6), 3e6);
+        assert_eq!(net_scale(3.1e6), 5e6);
         assert_eq!(link_speed(1000).s(), "1 Gbit/s");
         assert_eq!(link_speed(2500).s(), "2.5 Gbit/s");
         assert_eq!(link_speed(100).s(), "100 Mbit/s");
-        assert_eq!(ago(90).s(), "1m 30s ago");
-        assert_eq!(ago(120).s(), "2m ago");
     }
 
     #[test]
@@ -1652,19 +1545,19 @@ mod tests {
         let mut l = List::default();
         let d = |a: f32, b: f32| vec![(1, [a, 0.0, 0.0, 0.0], a), (2, [b, 0.0, 0.0, 0.0], b)];
         l.set(&d(10.0, 5.0), false, 1.2, 1.0);
-        assert_eq!(l.order().next().unwrap().key, 1);
+        assert_eq!(l.it[l.order()[0]].key, 1);
         // close: no flip-flop
         l.set(&d(10.0, 11.0), false, 1.2, 1.0);
-        assert_eq!(l.order().next().unwrap().key, 1);
+        assert_eq!(l.it[l.order()[0]].key, 1);
         l.set(&d(10.0, 20.0), false, 1.2, 1.0);
-        assert_eq!(l.order().next().unwrap().key, 2);
+        assert_eq!(l.it[l.order()[0]].key, 2);
         // smooth: positions glide to the new order
         l.set(&d(30.0, 20.0), true, 1.2, 1.0);
-        assert_eq!(l.order().next().unwrap().key, 2);
+        assert_eq!(l.it[l.order()[0]].key, 2);
         let ex = (-W_LOAD / 60.0f32).exp();
         for _ in 0..60 {
-            l.step(1.0 / 60.0, ex, &|_, _| 1.0);
+            l.step(1.0 / 60.0, ex, false);
         }
-        assert_eq!(l.order().next().unwrap().key, 1);
+        assert_eq!(l.it[l.order()[0]].key, 1);
     }
 }

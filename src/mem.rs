@@ -113,6 +113,19 @@ pub fn parse_psi(b: &[u8]) -> f32 {
     a as f32 + f as f32 / 100.0
 }
 
+/// /proc/swaps lists only zram devices (and at least one).
+pub fn swaps_zram(t: &str) -> bool {
+    let mut n = 0;
+    for l in t.lines().skip(1) {
+        let dev = l.split_ascii_whitespace().next().unwrap_or("");
+        if !dev.starts_with("/dev/zram") {
+            return false;
+        }
+        n += 1;
+    }
+    n > 0
+}
+
 /// Disk counters (sysfs `stat` / the fields after the name in /proc/diskstats): reads,
 /// read sectors, writes, write sectors, io_ticks (ms busy).
 pub type DiskCnt = [u64; 5];
@@ -307,9 +320,10 @@ pub fn slow_temp(i: usize) -> Option<f32> {
 
 // ── disks ──────────────────────────────────────────────────────────────────
 
-/// Counter snapshots kept per disk / for swap: rates over ~0.5 s at fast speeds.
-const SNAP: usize = 8;
-const RATE_NS: i64 = 500_000_000;
+/// Counter snapshots kept per disk / for swap: rates over ~1 s at fast speeds (disk
+/// rates swing wildly over shorter spans; a second is what a reader takes in anyway).
+const SNAP: usize = 16;
+const RATE_NS: i64 = 1_000_000_000;
 
 #[derive(Clone)]
 struct Snaps<const N: usize> {
@@ -445,7 +459,12 @@ fn find_disks() -> Vec<Disk> {
             continue;
         };
         let p = format!("/sys/block/{name}");
-        if std::path::Path::new(&format!("{p}/device")).exists()
+        // (not optical / floppy drives, nor eMMC boot and RPMB areas)
+        let skip = name.starts_with("sr")
+            || name.starts_with("fd")
+            || (name.starts_with("mmcblk") && (name.contains("boot") || name.contains("rpmb")));
+        if !skip
+            && std::path::Path::new(&format!("{p}/device")).exists()
             && crate::sys::read_int(&format!("{p}/size")).unwrap_or(0) > 0
         {
             v.push(Disk::new(name));
@@ -518,38 +537,61 @@ impl Fs {
 
 // ── processes ──────────────────────────────────────────────────────────────
 
+/// A process followed live: its statm stays open and is re-read with one pread.
 pub struct Proc {
     pub pid: u32,
+    /// resident and shared (file-backed + shmem) bytes, as statm reports them
     pub rss: u64,
-    pub name: String,
+    pub shared: u64,
+    /// index into `Mem::groups`
+    pub group: usize,
+    fd: c_int,
 }
 
-/// Resident pages of process `pid` (statm, opened relative to /proc).
-fn statm_rss(dfd: c_int, pid: u32) -> Option<u64> {
+/// All processes of one program (same name).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    pub name: String,
+    pub n: u32,
+    /// estimated RAM of the program: the private memory of every process plus the
+    /// largest shared part once (shared libraries and shared memory are mapped by
+    /// each process but held in RAM once)
+    pub mem: u64,
+    /// the processes not followed live, as of the last full scan
+    base_priv: u64,
+    base_shared: u64,
+    base_n: u32,
+}
+
+/// Resident and shared pages from a statm buffer.
+fn parse_statm(b: &[u8]) -> (u64, u64) {
+    let (_, k) = parse_u64(b);
+    let (r, k2) = parse_u64(&b[k..]);
+    (r, parse_u64(&b[k + k2..]).0)
+}
+
+/// Process `pid`'s statm, opened relative to /proc (`keep`: return the open fd).
+fn statm_open(dfd: c_int, pid: u32) -> c_int {
     let mut path = [0u8; 24];
     let mut f = crate::ui::F::new();
     f.int(pid, 0);
     f.str("/statm");
     f.push(0);
     path[..f.n].copy_from_slice(&f.s().as_bytes()[..f.n]);
-    let fd = unsafe {
+    unsafe {
         libc::openat(
             dfd,
             path.as_ptr() as *const _,
             libc::O_RDONLY | libc::O_CLOEXEC,
         )
-    };
-    if fd < 0 {
-        return None;
     }
+}
+
+/// (resident, shared) pages, or None if the process is gone.
+fn statm_read(fd: c_int) -> Option<(u64, u64)> {
     let mut b = [0u8; 128];
-    let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut _, b.len()) };
-    unsafe { libc::close(fd) };
-    if n <= 0 {
-        return None;
-    }
-    let (_, k) = parse_u64(&b[..n as usize]);
-    Some(parse_u64(&b[k..n as usize]).0)
+    let n = unsafe { libc::pread(fd, b.as_mut_ptr() as *mut _, b.len(), 0) };
+    (n > 0).then(|| parse_statm(&b[..n as usize]))
 }
 
 /// A process's program: argv[0]'s file name (comm is often a thread's name, such as
@@ -567,8 +609,27 @@ fn proc_name(pid: u32) -> String {
     }
 }
 
-/// Processes kept (the panel shows as many as fit).
-pub const NPROC: usize = 24;
+/// Indices of the `k` biggest of `n` values, biggest first (insertion into a short
+/// list: n ≈ 500, k ≈ 30).
+fn top_k(n: usize, k: usize, v: &dyn Fn(usize) -> u64) -> Vec<usize> {
+    let mut t: Vec<usize> = Vec::with_capacity(k + 1);
+    for i in 0..n {
+        let x = v(i);
+        if t.len() < k || x > v(t[t.len() - 1]) {
+            let at = t.iter().position(|&j| v(j) < x).unwrap_or(t.len());
+            t.insert(at, i);
+            t.truncate(k);
+        }
+    }
+    t
+}
+
+/// Processes followed live (statm kept open): the biggest ones, which is where the
+/// visible changes happen. Programs whose processes all sit below them change only
+/// at full scans.
+pub const NPROC: usize = 32;
+/// Programs kept (the panel shows as many as fit).
+pub const NGROUP: usize = 24;
 
 // ── all of it ──────────────────────────────────────────────────────────────
 
@@ -584,17 +645,32 @@ pub struct Mem {
     pub swout: f32,
     pub psi: f32,
     pub has_psi: bool,
+    /// all swap is zram (compressed RAM, not disk)
+    pub zram: bool,
     swap_snaps: Snaps<2>,
     /// used, and used + cache (fractions of RAM), one point a second
     pub h_used: Ring<f32>,
     pub h_cache: Ring<f32>,
     pub disks: Vec<Disk>,
     pub fs: Vec<Fs>,
+    /// the biggest processes, followed live, biggest first
     pub procs: Vec<Proc>,
+    /// programs (processes grouped by name), biggest first
+    pub groups: Vec<Group>,
     pub dimms: Vec<usize>,
     /// pids known to have no memory (kernel threads)
     skip: Vec<u32>,
-    all: Vec<(u32, u64)>,
+    /// every process at the last scan: pid, resident, shared (bytes), name index
+    all: Vec<(u32, u64, u64, u32)>,
+    /// indices of the biggest `groups`, biggest first
+    pub top: Vec<usize>,
+    /// names by pid (sorted by pid), interned in `names`
+    name_of: Vec<(u32, u32)>,
+    names: Vec<String>,
+    /// RAM in use and the followed processes' total at the last full scan
+    scan_used: u64,
+    scan_live: u64,
+    checks: u32,
     scans: u32,
     hidden: u32,
     held: u32,
@@ -622,15 +698,23 @@ impl Mem {
             swout: 0.0,
             psi: 0.0,
             has_psi: false,
+            zram: false,
             swap_snaps: Snaps::new(),
             h_used: Ring::new(),
             h_cache: Ring::new(),
             disks: Vec::new(),
             fs: Vec::new(),
             procs: Vec::new(),
+            groups: Vec::new(),
             dimms: Vec::new(),
             skip: Vec::new(),
             all: Vec::new(),
+            top: Vec::new(),
+            name_of: Vec::new(),
+            names: Vec::new(),
+            scan_used: 0,
+            scan_live: 0,
+            checks: 0,
             scans: 0,
             hidden: 0,
             held: 0,
@@ -653,6 +737,7 @@ impl Mem {
         m.mounts_fd = open_ro("/proc/self/mountinfo");
         m.buf = vec![0; 8192];
         m.has_psi = m.psi_fd >= 0 && pread(m.psi_fd, &mut m.buf) > 0;
+        m.zram = swaps_zram(&std::fs::read_to_string("/proc/swaps").unwrap_or_default());
         m.page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1024) as u64;
         m.disks = find_disks();
         m.dimms = find_slow(&mut m.disks);
@@ -750,9 +835,10 @@ impl Mem {
         }
     }
 
-    /// The biggest processes by resident memory (statm), `NPROC` of them. Kernel
-    /// threads (no memory) are remembered and skipped; that list is rebuilt every
-    /// tenth scan in case their pids were reused.
+    /// Full scan of /proc (~1.3 µs a process): every process's memory, grouped by
+    /// program name; the `NPROC` biggest are then followed live (`refresh_procs`).
+    /// Kernel threads (no memory) are remembered and skipped; that list is rebuilt
+    /// every tenth scan in case their pids were reused. Names are read once per pid.
     pub fn scan_procs(&mut self) {
         if self.proc_dir.is_null() {
             self.proc_dir = unsafe { libc::opendir(c"/proc".as_ptr()) };
@@ -773,7 +859,9 @@ impl Mem {
             libc::dirfd(dir)
         };
         self.all.clear();
-        let mut sk = 0;
+        let (mut sk, mut nk) = (0, 0);
+        let mut name_of = Vec::with_capacity(self.name_of.len() + 8);
+        let page = self.page;
         loop {
             let e = unsafe { libc::readdir(dir) };
             if e.is_null() {
@@ -784,66 +872,231 @@ impl Mem {
                 continue;
             }
             let pid = parse_u64(name).0 as u32;
-            // (/proc lists pids in increasing order, and so does `skip`)
+            // (/proc lists pids in increasing order, and so do `skip` and `name_of`)
             while sk < self.skip.len() && self.skip[sk] < pid {
                 sk += 1;
             }
             if !fresh && self.skip.get(sk) == Some(&pid) {
                 continue;
             }
-            let Some(rss) = statm_rss(dfd, pid) else {
+            let fd = statm_open(dfd, pid);
+            if fd < 0 {
+                continue;
+            }
+            let st = statm_read(fd);
+            unsafe { libc::close(fd) };
+            let Some((rss, sh)) = st else {
                 continue;
             };
             if rss == 0 {
                 if fresh {
                     self.skip.push(pid);
                 }
-            } else {
-                // keep the NPROC biggest, biggest first
-                let r = rss * self.page;
-                let all = &mut self.all;
-                if all.len() < NPROC || r > all[NPROC - 1].1 {
-                    let at = all.iter().position(|a| a.1 < r).unwrap_or(all.len());
-                    all.insert(at, (pid, r));
-                    all.truncate(NPROC);
+                continue;
+            }
+            while nk < self.name_of.len() && self.name_of[nk].0 < pid {
+                nk += 1;
+            }
+            let ni = match self.name_of.get(nk) {
+                Some(&(p, ni)) if p == pid => ni,
+                _ => {
+                    let n = proc_name(pid);
+                    match self.names.iter().position(|x| *x == n) {
+                        Some(i) => i as u32,
+                        None => {
+                            self.names.push(n);
+                            (self.names.len() - 1) as u32
+                        }
+                    }
+                }
+            };
+            name_of.push((pid, ni));
+            self.all.push((pid, rss * page, sh.min(rss) * page, ni));
+        }
+        self.name_of = name_of;
+        // names no process uses any more: drop them (and renumber) now and then
+        if self.names.len() > 4 * self.name_of.len().max(64) {
+            let mut used = vec![u32::MAX; self.names.len()];
+            let mut names = Vec::new();
+            for e in self
+                .name_of
+                .iter_mut()
+                .map(|e| &mut e.1)
+                .chain(self.all.iter_mut().map(|e| &mut e.3))
+            {
+                let i = *e as usize;
+                if used[i] == u32::MAX {
+                    used[i] = names.len() as u32;
+                    names.push(std::mem::take(&mut self.names[i]));
+                }
+                *e = used[i];
+            }
+            self.names = names;
+        }
+        // the NPROC biggest, followed live (fds of those already followed are kept)
+        let big = top_k(self.all.len(), NPROC, &|i| self.all[i].1);
+        // the biggest get their name read again: a pid first seen before an exec
+        // (a shell that became the program) would keep the shell's name
+        for &i in &big {
+            let (pid, ni) = (self.all[i].0, self.all[i].3);
+            let n = proc_name(pid);
+            if n != self.names[ni as usize] && !n.is_empty() {
+                let k = match self.names.iter().position(|x| *x == n) {
+                    Some(k) => k,
+                    None => {
+                        self.names.push(n);
+                        self.names.len() - 1
+                    }
+                } as u32;
+                self.all[i].3 = k;
+                if let Ok(j) = self.name_of.binary_search_by_key(&pid, |e| e.0) {
+                    self.name_of[j].1 = k;
                 }
             }
         }
-
-        let old = std::mem::take(&mut self.procs);
-        for &(pid, rss) in &self.all {
-            let name = match old.iter().find(|p| p.pid == pid) {
-                Some(p) => p.name.clone(),
-                None => proc_name(pid),
+        let mut old = std::mem::take(&mut self.procs);
+        for &(pid, rss, shared, ni) in big.iter().map(|&i| &self.all[i]) {
+            let fd = match old.iter().position(|p| p.pid == pid) {
+                Some(i) => old.swap_remove(i).fd,
+                None => statm_open(dfd, pid),
             };
-            self.procs.push(Proc { pid, rss, name });
+            if fd >= 0 {
+                self.procs.push(Proc {
+                    pid,
+                    rss,
+                    shared,
+                    group: ni as usize,
+                    fd,
+                });
+            }
         }
+        for p in old {
+            unsafe { libc::close(p.fd) };
+        }
+        // programs: every process by name; the live ones are added in `regroup`
+        let mut gi = vec![u32::MAX; self.names.len()];
+        self.groups.clear();
+        for &(pid, rss, shared, ni) in &self.all {
+            let k = ni as usize;
+            if gi[k] == u32::MAX {
+                gi[k] = self.groups.len() as u32;
+                self.groups.push(Group {
+                    name: self.names[k].clone(),
+                    n: 0,
+                    mem: 0,
+                    base_priv: 0,
+                    base_shared: 0,
+                    base_n: 0,
+                });
+            }
+            if !self.procs.iter().any(|p| p.pid == pid) {
+                let g = &mut self.groups[gi[k] as usize];
+                g.base_priv += rss - shared;
+                g.base_shared = g.base_shared.max(shared);
+                g.base_n += 1;
+            }
+        }
+        for p in &mut self.procs {
+            p.group = gi[p.group] as usize;
+        }
+        self.regroup();
+        self.scan_used = self.mi.used();
+        self.scan_live = self.procs.iter().map(|p| p.rss).sum();
         self.proc_ok = true;
     }
 
-    /// Between full scans (eco): only the first `n` processes (those shown), re-read
-    /// and re-ordered.
-    pub fn refresh_procs(&mut self, n: usize) {
-        if self.proc_dir.is_null() {
-            return;
+    /// Between full scans (eco): has a program appeared or grown that the followed
+    /// processes don't show? Checks /proc's pid list against the known one (statm
+    /// only for new pids: one with 64 MB or more counts), and whether RAM in use
+    /// changed by more than the followed processes explain (2 % of RAM, ≥ 256 MB).
+    pub fn need_scan(&mut self) -> bool {
+        let live: u64 = self.procs.iter().map(|p| p.rss).sum();
+        let d_used = self.mi.used() as i64 - self.scan_used as i64;
+        let d_live = live as i64 - self.scan_live as i64;
+        if (d_used - d_live).unsigned_abs() > (self.mi.total / 50).max(256 << 20) {
+            return true;
         }
-        let dfd = unsafe { libc::dirfd(self.proc_dir) };
-        let page = self.page;
-        let mut k = 0;
-        self.procs.retain_mut(|p| {
-            k += 1;
-            if k > n {
+        // (the pid list costs ~100 µs: every third check)
+        self.checks += 1;
+        if self.proc_dir.is_null() || self.checks % 3 != 0 {
+            return false;
+        }
+        let dir = self.proc_dir;
+        let dfd = unsafe {
+            libc::rewinddir(dir);
+            libc::dirfd(dir)
+        };
+        let (mut nk, mut sk) = (0, 0);
+        loop {
+            let e = unsafe { libc::readdir(dir) };
+            if e.is_null() {
+                return false;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*e).d_name.as_ptr()) }.to_bytes();
+            if name.is_empty() || !name.iter().all(u8::is_ascii_digit) || name.len() > 20 {
+                continue;
+            }
+            let pid = parse_u64(name).0 as u32;
+            while nk < self.name_of.len() && self.name_of[nk].0 < pid {
+                nk += 1;
+            }
+            while sk < self.skip.len() && self.skip[sk] < pid {
+                sk += 1;
+            }
+            if self.name_of.get(nk).map(|e| e.0) == Some(pid) || self.skip.get(sk) == Some(&pid) {
+                continue;
+            }
+            let fd = statm_open(dfd, pid);
+            if fd < 0 {
+                continue;
+            }
+            let st = statm_read(fd);
+            unsafe { libc::close(fd) };
+            if st.is_some_and(|(r, _)| r * self.page >= 64 << 20) {
                 return true;
             }
-            match statm_rss(dfd, p.pid) {
-                Some(r) if r > 0 => {
-                    p.rss = r * page;
-                    true
-                }
-                _ => false,
+        }
+    }
+
+    /// Re-read the processes followed live (one pread each, ~1 µs); the ones that
+    /// ended are dropped.
+    pub fn refresh_procs(&mut self) {
+        let page = self.page;
+        self.procs.retain_mut(|p| match statm_read(p.fd) {
+            Some((r, s)) if r > 0 => {
+                p.rss = r * page;
+                p.shared = s.min(r) * page;
+                true
+            }
+            _ => {
+                unsafe { libc::close(p.fd) };
+                false
             }
         });
         crate::sys::isort(&mut self.procs, &|a, b| a.rss > b.rss);
+        self.regroup();
+    }
+
+    /// Program totals from the last scan's other processes and the live ones;
+    /// the biggest `NGROUP`, biggest first.
+    fn regroup(&mut self) {
+        let mut sh: Vec<u64> = self.groups.iter().map(|g| g.base_shared).collect();
+        for g in self.groups.iter_mut() {
+            g.mem = g.base_priv;
+            g.n = g.base_n;
+        }
+        for p in &self.procs {
+            if let Some(g) = self.groups.get_mut(p.group) {
+                g.mem += p.rss - p.shared;
+                g.n += 1;
+                sh[p.group] = sh[p.group].max(p.shared);
+            }
+        }
+        for (g, s) in self.groups.iter_mut().zip(sh) {
+            g.mem += s;
+        }
+        // (groups stay in index order for the lookups above: a sorted view)
+        self.top = top_k(self.groups.len(), NGROUP, &|i| self.groups[i].mem);
     }
 }
 
@@ -895,12 +1148,26 @@ impl Mem {
             });
         }
         for k in 0..nproc {
-            m.procs.push(Proc {
-                pid: 1000 + k as u32,
-                rss: (2 * g) >> k.min(30),
-                name: format!("process-{k}"),
+            let rss = (2 * g) >> k.min(30);
+            m.groups.push(Group {
+                name: format!("program-{k}"),
+                n: 1 + (k % 3) as u32,
+                mem: rss,
+                base_priv: rss,
+                base_shared: 0,
+                base_n: 1 + (k % 3) as u32,
             });
+            if k < NPROC {
+                m.procs.push(Proc {
+                    pid: 1000 + k as u32,
+                    rss,
+                    shared: 0,
+                    group: k,
+                    fd: -1,
+                });
+            }
         }
+        m.top = (0..nproc.min(NGROUP)).collect();
         m.proc_ok = true;
         for i in 0..300 {
             m.h_used.push(0.15 + (i % 7) as f32 / 100.0);

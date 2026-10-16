@@ -1,5 +1,5 @@
 //! Smooth-mode animation primitives: critically damped springs for bars, hysteresis
-//! for the digits, and continuous-time history curves for scrolling graphs.
+//! for the digits, and history curves with a live head for scrolling graphs.
 //!
 //! Smooth mode renders on a fixed frame grid (`FPS`). Every frame advances the
 //! animation by exactly one grid interval, so motion per frame is uniform whatever the
@@ -97,6 +97,29 @@ impl Val {
     }
 }
 
+impl Val {
+    /// The shown number of a noisy rate: changes at most twice a second, and only by
+    /// more than `unit` (small wobbles are held, so it can be read); at rest it
+    /// lands on the target (also no sooner than half a second after the last change).
+    pub fn digits_hold(&mut self, dt: f32, unit: f32) -> bool {
+        self.age += dt;
+        if self.v == 0.0 && self.x == self.to {
+            let ch = self.n != self.x && self.age >= 0.5;
+            if ch {
+                self.n = self.x;
+                self.age = 0.0;
+            }
+            return ch;
+        }
+        if self.age < 0.5 || (self.x - self.n).abs() < unit {
+            return false;
+        }
+        self.n = self.x;
+        self.age = 0.0;
+        true
+    }
+}
+
 /// Digits that follow a moving value: `shown` (a multiple of `unit`) changes only
 /// once `x` is more than (0.5 + h) units away, so a value hovering at a rounding
 /// boundary doesn't flicker, and a moving one counts monotonically. Returns true
@@ -112,17 +135,16 @@ pub fn hyst(shown: &mut f32, x: f32, unit: f32, h: f32) -> bool {
     changed
 }
 
-/// A history series as a continuous function of age (seconds before now): the live
-/// value at age 0, the current second's partial mean at age φ/2 (faded in over the
-/// first half second, so a fresh second doesn't start from one noisy sample), and
-/// point k (k = 0 newest, one per second) at age φ + 0.5 + k, where φ is the time
-/// since the newest point. Linear in between. As φ grows every point slides to older
-/// ages, so a graph sampled at fixed ages scrolls continuously and its newest part
-/// grows in from the live value.
+/// A history series as a function of age (seconds before now): the live value at age 0
+/// and point k (k = 0 newest, one per second) at age 1 + k, linear in between.
+///
+/// The points sit at whole-second ages and move one step (one braille dot column)
+/// when a new point is pushed; only the head moves continuously. (Sliding them by the
+/// sub-second phase instead made every column alternate between "a point" and "the
+/// mean of two neighbours" once a second: one-point peaks shrank and regrew and
+/// one-dot features blinked off and on — amplitude aliasing, not motion.)
 pub struct Curve<'a> {
-    pub phase: f32,
     pub head: f32,
-    pub part: f32,
     pub len: usize,
     pub pt: &'a dyn Fn(usize) -> f32,
     /// value before the history starts
@@ -135,37 +157,24 @@ impl Curve<'_> {
     pub fn sample(&self, out: &mut Vec<f32>, n: usize, off: f32, step: f32) {
         out.clear();
         out.resize(n, self.pad);
-        let ph = self.phase.clamp(0.0, 1.0);
-        // knot list as (age, value), walked in step with increasing sample ages
-        let knot = |k: usize| -> (f32, f32) {
+        let at = |k: usize| -> f32 {
             if k == 0 {
-                (0.0, self.head)
-            } else if k == 1 {
-                let a = ph * 0.5;
-                (a, self.head + (self.part - self.head) * (ph * 2.0).min(1.0))
+                self.head
             } else {
-                let j = k - 2;
-                (ph + 0.5 + j as f32, (self.pt)(j))
+                (self.pt)(k - 1)
             }
         };
-        let nk = self.len + 2;
-        let mut k = 0;
-        let (mut a0, mut v0) = knot(0);
-        let (mut a1, mut v1) = knot(1);
         for j in 0..n {
             let a = off + step * j as f32;
-            while a > a1 && k + 2 < nk {
-                k += 1;
-                (a0, v0) = (a1, v1);
-                (a1, v1) = knot(k + 1);
-            }
-            if a > a1 {
+            let k = a.floor().max(0.0) as usize;
+            if k > self.len {
                 break; // older than the history: pad
             }
-            let v = if a1 > a0 {
-                v0 + (v1 - v0) * ((a - a0) / (a1 - a0)).clamp(0.0, 1.0)
+            let f = a - k as f32;
+            let v = if f <= 0.0 || k == self.len {
+                at(k)
             } else {
-                v1
+                at(k) + (at(k + 1) - at(k)) * f
             };
             out[n - 1 - j] = v;
         }
@@ -259,45 +268,46 @@ mod tests {
     }
 
     #[test]
-    fn curve_scrolls_continuously_and_meets_the_points() {
-        let pts = [10.0f32, 20.0, 30.0, 40.0];
+    fn curve_points_sit_on_whole_seconds_and_never_breathe() {
+        let pts = [10.0f32, 20.0, 0.0, 40.0];
         let f = |k: usize| pts[k];
-        let mk = |phase: f32| Curve {
-            phase,
+        let c = Curve {
             head: 5.0,
-            part: 5.0,
             len: pts.len(),
             pt: &f,
             pad: 0.0,
         };
         let mut out = Vec::new();
-        // at φ = 0.5 point k sits at age 1 + k: dot columns at integer ages hit them
-        mk(0.5).sample(&mut out, 6, 0.0, 1.0);
-        assert_eq!(out, vec![0.0, 40.0, 30.0, 20.0, 10.0, 5.0]);
-        // between: every column moves a little, continuously, towards its older neighbour
-        let mut prev = Vec::new();
-        mk(0.5).sample(&mut prev, 6, 0.0, 1.0);
-        for i in 1..=10 {
-            mk(0.5 + i as f32 * 0.04).sample(&mut out, 6, 0.0, 1.0);
-            for j in 2..5 {
-                assert!(
-                    out[j] <= prev[j] + 1e-4 && prev[j] - out[j] < 0.5,
-                    "{out:?} {prev:?}"
-                );
+        // column j at age j: the live value, then every point exactly (a one-point dip
+        // stays a full dip), then padding
+        c.sample(&mut out, 6, 0.0, 1.0);
+        assert_eq!(out, vec![0.0, 40.0, 0.0, 20.0, 10.0, 5.0]);
+        // between whole ages: linear (strip / heatmap buckets)
+        c.sample(&mut out, 2, 0.5, 1.0);
+        assert_eq!(out, vec![15.0, 7.5]);
+    }
+
+    #[test]
+    fn held_rate_digits_change_at_most_twice_a_second() {
+        let dt = 1.0 / FPS as f32;
+        let ex = (-W_LOAD * dt).exp();
+        let mut v = Val::default();
+        v.set(100.0, false);
+        let (mut last, mut changes, mut t) = (0.0f32, Vec::new(), 0.0f32);
+        for f in 0..(6 * FPS) {
+            // a noisy rate: a new target every sample, sometimes settling
+            if f % 6 == 0 {
+                v.set(if (f / 6) % 3 == 0 { 100.0 } else { 140.0 }, true);
             }
-            prev.clone_from(&out);
+            v.step(dt, W_LOAD, ex, 0.01);
+            if v.digits_hold(dt, (v.x * 0.04).max(1.0)) {
+                assert!(t - last >= 0.5 - 1e-3 || changes.is_empty(), "{t} {last}");
+                last = t;
+                changes.push(t);
+            }
+            t += dt;
         }
-        // the newest point grows in from the live value, then the partial mean
-        let c = Curve {
-            phase: 0.0,
-            head: 50.0,
-            part: 0.0,
-            len: 1,
-            pt: &|_| 10.0,
-            pad: 0.0,
-        };
-        c.sample(&mut out, 2, 0.0, 1.0);
-        assert_eq!(out[1], 50.0);
+        assert!(!changes.is_empty());
     }
 
     #[test]

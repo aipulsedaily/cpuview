@@ -161,9 +161,8 @@ impl Menu {
             return Action::None;
         }
         match k {
-            Key::Up | Key::Char('k') => self.go(-1),
+            Key::Up | Key::Char('k') | Key::BackTab => self.go(-1),
             Key::Down | Key::Char('j') | Key::Tab => self.go(1),
-            Key::BackTab => self.go(-1),
             Key::PgUp => self.go(-(self.rows as isize)),
             Key::PgDn => self.go(self.rows as isize),
             Key::Home => self.go(-(self.cur as isize)),

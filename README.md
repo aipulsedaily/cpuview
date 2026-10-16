@@ -2,9 +2,13 @@
 
 A btop-style terminal monitor that shows **every core's clock speed and load at once**, grouped
 by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds,
-plus a **Memory & Storage** page (`m` or `2`): RAM, swap, disk I/O, filesystems and the
-biggest processes, and a **Network & System** page (`3`): download / upload per link with a
-rate-over-time chart, listening ports and who owns them, connections, containers and services, live. Native Rust, one 1.03 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+plus a **Memory & Storage** page (`m` or `2`) written for people who aren't Linux experts: how much
+RAM is in use and whether that's fine, what the disk is doing now and did a minute ago, how full
+each drive is, and which programs use the most memory, live; a **Network & System** page (`3`):
+download and upload per link now and over the last minutes, the listening ports and who owns
+them, connections, containers and services; and a **Processes** page (`4`):
+every process with its CPU, memory and disk use, as a list, grouped by program or as a tree, with
+signals and nice. Native Rust, one 1.1 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -23,19 +27,33 @@ column sits beside the CPU view, so both are visible without switching.
 
 ![Memory & Storage page, 128×45](docs/screenshots/rust-memory-128x45.webp)
 
-*`m`: the Memory & Storage page at 128×45 — RAM as a stacked bar (used · cache · free) with a
-used/cache history, swap with its in/out rates and memory pressure, DIMM temperatures, the NVMe
-drive's read/write rates, IOPS, busy time, temperature and history, every real filesystem, and
-the processes holding the most memory. Captured during a synthetic CPU and disk load.*
+*`m`: the Memory & Storage page at 128×45. Each panel opens with its answer in the title ("RAM
+31% in use · 9.91 of 32.2 GB · plenty free", "disk reading 117 MB/s · writing 15 MB/s · 3%
+busy", "storage system (/) 9% full · 1.59 TB free"), coloured by health. Rows read like the CPU
+view's (label → value → bar → %) with a short plain hint. History charts say "over time", have
+units on the y-axis, "… ago · now" along the bottom and the current value at the right edge: RAM
+in use (with "rising: 18% 1 min ago, 31% now"), and disk activity as stacked columns (reading
+below, writing on top, each column a 2–5 s average) with totals and the peak in words. Then every
+real filesystem, and the programs using the most memory, live. Captured during a synthetic CPU
+and disk load.*
+
+![Processes page, 128×45](docs/screenshots/rust-processes-128x45.webp)
+
+*`4`: the Processes page at 128×45, smooth, grouped by program (`G`) and sorted by CPU (`o`). CPU %
+is of one CPU thread (`I`: of the whole machine), memory is resident, disk is bytes read and
+written per second (`?` where another user's process doesn't let us read it). The selected
+process gets its whole command line, working directory, cgroup, and CPU and memory over the last
+minute. The busy process is a test load (`videoenc`) running on this machine.*
 
 ![Network & System page, 128×45](docs/screenshots/rust-network-128x45.webp)
 
-*`3`: the Network & System page at 128×45 — the wired link's download and upload now, its
-speed, address and totals since boot, the links that aren't connected and the virtual ones;
-download and upload over the last 2½ minutes (here a 2.5 MB/s burst about 1–2 minutes ago);
+*`3`: the Network & System page at 128×45 — what the network is doing now in the title, the
+wired link's download and upload, its speed, address and totals since boot, the links that
+aren't connected and the virtual ones; the traffic of the last ~2 minutes as stacked columns
+(here a 2.5 MB/s ping flood about a minute ago) with the rates now at its right edge;
 connection counts, the listening ports with what they listen on and the program or container
-behind them, the busiest remote ends; the Docker containers' CPU, memory and network; what the
-logged-in users run and the busiest / biggest systemd services.*
+behind them, the busiest remote ends; the Docker containers' health, CPU, memory and network;
+what the logged-in users run and the systemd services, busiest first.*
 
 ![4K, 415x105, CPU view with the memory column](docs/screenshots/rust-4k-memory.webp)
 
@@ -87,38 +105,99 @@ terminal.
 
 ### Memory & Storage
 
-- **RAM**: used · cache (buffers + page cache + reclaimable slab) · free as one stacked bar,
-  used / available / cache / free / shared, and a history of used with cache stacked above it.
-  Numbers are what `free` reports (procps-ng 4: used = total − available)
-- **DIMM temperatures** (`spd5118` DDR5 / `jc42` DDR4 sensors), **swap** used of total (file,
-  partition or zram), swap-in / swap-out rates from `/proc/vmstat`, and memory **pressure**
-  (PSI `some avg10`, the share of time tasks stalled waiting for memory)
-- **Disk I/O** per physical disk (no partitions, loop, dm, md or zram devices): read and write
-  MB/s and IOPS, % busy (time with I/O in flight), drive temperature (`nvme` / `drivetemp`), and
-  read / write history graphs that rescale in powers of two
+Made to be read at a glance by someone who isn't a Linux expert: every panel was checked with
+fresh readers who saw only a screenshot and had to answer what it says. Sizes are decimal (1 GB = 10⁹
+bytes, like disk makers and `df -H`; the RAM total reads 32.2 GB on a "32 GB" machine), and
+every rate is in MB/s, so all of them compare directly.
+
+- **One answer per panel**, in its title and coloured by health (green fine, amber watch, red
+  act): RAM "31% in use · 9.91 of 32.2 GB · plenty free" (amber from 80 % in use, or when
+  programs wait for RAM ≥ 5 % of the time, or swap traffic ≥ 1 MB/s with less than 20 %
+  available; red from 90 % / 20 % / 20 MB/s: "getting full", "nearly full", "RAM is tight"); disk
+  "reading 117 MB/s · writing 15 MB/s · 3% busy", or "idle · nothing being read or written";
+  storage "system (/) 9% full · 1.59 TB free" (amber from 90 %, red from 95 %); drive
+  temperature OK / warm (70 °C) / too hot (80 °C), RAM sticks OK / warm (70 °C) / hot (85 °C).
+- **RAM**: in use (what `free` calls used: total − available) with a bar and %, available ("free
+  for programs now"), cache ("files kept for speed, part of available"), swap with a bar and
+  whether it is active ("no activity (fine)", "little activity", "busy 3 MB/s"), "waiting" (PSI
+  `some avg10`: the share of time programs waited for RAM), RAM stick temperatures (`spd5118` /
+  `jc42`). A chart of **RAM in use over time** (0–100 %, a line with a soft fill, no cache slab)
+  says the trend in words: "rising: 18% 1 min ago, 31% now".
+- **Disk activity** (physical disks only: no partitions, loop, dm, md, zram, optical or eMMC boot
+  areas): reading ("programs loading files") and writing ("programs saving files") in MB/s over
+  ~1 s, busy % (time the disk was working), temperature (`nvme` / `drivetemp`) and model. The
+  **disk activity over time** chart is a stacked column chart, not a waveform: each column is
+  the average of 2–5 s (aligned so columns step once per bucket and never change in between),
+  reading below and writing on top in two colours the theme can't make alike, a round MB/s
+  scale (1-2-3-5 steps, 10 MB/s at least, so an idle disk is a flat line labelled "idle"), the
+  current rates at the right edge, and in words: "read 95 GB · written 1.9 GB in the last 2 min ·
+  peak 2731 MB/s 45 s ago · 1 min ago 2650, now 133 MB/s". Three or more disks: one line each and
+  one chart of all of them.
 - **Storage**: every real filesystem once (no tmpfs, snaps, overlays, network mounts or bind
-  duplicates): used / size and use % as `df` computes them, the device, type and free space
-- **Processes** using the most memory (resident set, % of RAM) on larger layouts
-- Small windows stack the panels (memory, disk, storage, processes) and drop history first;
-  from 100 columns the page has two columns; from ≈ 190×36 the column joins the CPU view
-- Same themes, picture backgrounds and smooth animation: bars glide, digits count through the
-  values in between, graphs scroll continuously
+  duplicates): "1.59 TB free", a bar, "9% full" (`df`'s use %), then "system & home · 152 GB used
+  of 1.84 TB · ext4 · device".
+- **Top programs by memory**, live: processes grouped by program ("postgres ×27 613 MB": each
+  process's private memory plus the largest shared part once, since shared libraries and shared
+  memory sit in RAM once); `p` shows each process instead. Rows keep their place unless another
+  is clearly bigger (3 %, 2 MB), and in smooth mode cross-fade when they trade places; sizes
+  count smoothly.
+- Small windows keep the answers and drop charts first: a chart becomes a one-line history with
+  words ("1 min ago ▁▂▃▅ now · rising 19% → 31%", "· peak 2723 MB/s 46 s ago"), storage can
+  shrink to the root filesystem ("+ 2 more"). From 100 columns the page has two columns; from ≈
+  190×36 the column joins the CPU view.
+- Works on any Linux machine: no swap ("swap none · no swap set up"), zram swap ("swap zram"),
+  no sensors (no temperature rows), no PSI (no "waiting" row), NVMe / SATA / HDD / eMMC / virtio,
+  any number of disks and filesystems, long mount paths.
+
+### Processes
+
+- **Every process**: PID, user, CPU % (from `utime + stime` over the last second, of one CPU
+  thread or, with `I`, of the whole machine), resident memory and % of RAM, disk read / write
+  per second (`/proc/<pid>/io`), threads, state and age; the command line after the name.
+  Columns drop out as the window narrows (age, disk, threads, state, % RAM, bar, user, PID)
+- **Sort** by CPU, memory, disk, PID or name (`o`, `r` reverses, or click the column titles);
+  near-ties don't flip-flop: a new value counts at once past a margin (CPU: 2.5 points or 20 %,
+  memory 2 %), otherwise only once it has lasted 4 s
+- **Group by program** (`G`, on by default): `postgres ×31` with summed CPU, memory, disk and
+  threads; `enter` / `→` expands a group, `←` folds it. **Tree** (`T`): children under their
+  parents, foldable the same way. **Filter** (`/`): name, command line, user or PID; `esc`
+  clears it
+- **Detail strip** for the selected process (or group): whole command line, parent, user, state,
+  threads, nice, age, swap, the PID inside its container, working directory, cgroup, and CPU and
+  memory charts for the last 60 s
+- **Signals** (`k` or `F9`: TERM, KILL, HUP, INT, STOP, CONT) and **nice** (`n`) go through a
+  dialog and never happen without `enter`; a process is identified by PID *and* start time (and
+  signalled through a pidfd), so a reused PID is never hit; refusals are spelled out
+  (another user's process, raising priority without root, already exited)
+- **Any Linux, any user**: with `/proc` mounted `hidepid=2` you see your own processes and a note
+  says why; unreadable files show `?`; kernel threads are counted and hidden (`K` shows them);
+  zombies show `<defunct>`; long command lines are cut with `…`; names with spaces and
+  parentheses parse; thousands of processes are fine (~150 bytes each: under 5 MB of RAM with
+  5,400 processes); user names from `/etc/passwd`, LDAP / sssd users through the system's user
+  database; no systemd needed
+- **Live and smooth**: in smooth mode the rows on screen are re-read 2.5 times a second (their
+  `stat` and `statm` stay open), CPU % is over the last second, digits count and bars glide,
+  rows *slide* to a new place over ~0.3 s instead of jumping, new processes fade in and exited
+  ones fade out. In eco the rows shown are re-read every 4 s and the whole list every 30 s
 
 ### Network & System
 
 Everything is detected at run time; what a machine doesn't have simply isn't shown (no Docker,
 no systemd, no Wi-Fi...). No root needed, no extra packages.
 
-- **Links**: each physical link (wired, Wi-Fi), VPN / tunnel (WireGuard, Tailscale, tun, PPP),
-  bond and VLAN: download and upload now in plain words, link speed, address (netlink, global
-  ones first), totals since boot, Wi-Fi signal (`/proc/net/wireless`, "weak" in amber), and
-  errors / drops only when there are any — in amber only while they are growing. Links that
-  are down share one line; bridges and veths (`docker0`, `br-…`, container links) one more.
-  Inside a container or VM without a physical link, its virtual links are the network.
-- **Over time**: download and upload as two column charts (each column a few seconds' mean)
-  with a time axis ("2m ago … 1m ago … now"), round y-axis ticks in B/s · kB/s · MB/s, the
-  value now in each chart's title, and a legend. "Right now" values are horizontal bars and
-  numbers; "over time" is always a chart with a time axis.
+- **Links**: the panel title answers "what is the network doing" (download and upload now,
+  "quiet" in green, "not connected" in red, "packets lost" in amber). Each physical link
+  (wired, Wi-Fi), VPN / tunnel (WireGuard, Tailscale, tun, PPP), bond and VLAN: download and
+  upload now, link speed, address (global ones first), totals since boot, Wi-Fi signal
+  (`/proc/net/wireless`, "weak" in amber) and packets lost (dropped or broken) only when there
+  are any — in amber only while they grow. Links that are down share one line; bridges and
+  veths (`docker0`, `br-…`, container links) one more. Inside a container or VM without a
+  physical link, its virtual links are the network.
+- **Over time**: the Memory & Storage page's chart grammar — a caption ("eno1 traffic, last
+  2 min 16 s · each column = 4 s average"), a legend, stacked columns (download below, upload on
+  top) on a round 1 / 2 / 3 / 5 × 10ⁿ scale with labelled y-axis ticks in B/s · kB/s · MB/s, the
+  rates now at its right edge and "2 min ago · 1 min ago · now" in the panel's bottom border.
+  Columns are whole buckets of the history, so they step left once per bucket and never wobble.
 - **Connections & ports**: open connections and those closed in the last minute (TIME_WAIT),
   from `/proc/net/snmp` and `/proc/net/sockstat` (constant cost); the listening TCP / UDP ports
   (sock_diag netlink, listening sockets only), merged per port, with where they listen (all
@@ -126,7 +205,8 @@ no systemd, no Wi-Fi...). No root needed, no extra packages.
   the port (Docker / Podman API), else the program (socket inode → `/proc/<pid>/fd`, looked up
   a few processes per sample and only for sockets you may see; `?` otherwise), else the systemd
   unit or cgroup the socket was opened in (its cgroup id, readable without root); and the remote
-  ends with the most connections, named when they are a container or a local program.
+  ends with the most connections, named when they are a port on this computer (its container
+  or program) or a well-known service.
 - **Containers** (only if there are any): Docker, Podman (rootful and rootless), LXC,
   systemd-nspawn / libvirt machines and Kubernetes pods, found in the cgroup tree (v2, or v1
   with the cgroupfs or systemd driver). Per container: CPU (100 % = one core, as `docker stats`),
@@ -136,12 +216,13 @@ no systemd, no Wi-Fi...). No root needed, no extra packages.
   Docker or Podman API over its unix socket (one `GET /containers/json`, parsed by a small
   field extractor), else Docker's `config.v2.json` when readable, else the short id.
 - **Services** (only if there are any): systemd services (`system.slice/*.service`) or OpenRC
-  services (`openrc.*` cgroups): the busiest by CPU and the biggest by memory, plus everything the
-  logged-in users run (`user.slice`) on its own line. No failed-unit count: that needs D-Bus.
+  services (`openrc.*` cgroups), busiest first, then the biggest, with CPU and memory, plus
+  everything the logged-in users run (`user.slice`) on its own line above them. No failed-unit
+  count: that needs D-Bus.
 - Lists keep their order until an item clearly overtakes the one above it, and rows slide to
-  their new places in smooth mode; numbers count, bars glide and the charts scroll there too.
-- 40×12 shows the link's rates and the container count; from 100 columns the page has two
-  columns, from 240 three.
+  their new places in smooth mode; numbers count and bars glide.
+- 40×12 shows the link's rates and the containers' count and health; from 100 columns the page
+  has two columns.
 
 ## Install
 
@@ -167,9 +248,9 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 |---|---|
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
-| `1` `2` `3` `4` | page: CPU · Memory & Storage · Network & System · Processes (remembered; `--page cpu\|memory\|network\|processes`); the footer's tabs are clickable |
-| `tab` / `shift-tab` | next / previous page |
+| `1` `2` `3` `4` / `tab` / `shift-tab` | pages: CPU, Memory & Storage, Network & System, Processes (remembered; `--page cpu\|memory\|network\|processes`; the footer's tabs are clickable) |
 | `m` | CPU view ⇄ Memory & Storage page |
+| `p` | Memory & Storage: top programs by memory ⇄ each process |
 | `+` / `-` | faster / slower (`=` works as `+`) |
 | `o` | sort cores: number → load → clock |
 | `c` | view: auto → full → compact |
@@ -180,6 +261,24 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 | `space` | pause (stops sampling entirely) |
 | `t` | theme menu |
 | `q` / `ctrl-c` | quit (`ctrl-z` suspends) |
+
+On the Processes page (`4`) the arrows, `pgup` / `pgdn` / `home` / `end`, the mouse wheel
+and clicks move the selection, and these keys change meaning (the global ones — `q`, `space`,
+`s`, `+` `-`, `t`, `1`–`4`, `tab` — still work):
+
+| Key | Processes page |
+|---|---|
+| `o` / `r` | sort column: CPU → memory → disk → PID → name / reverse |
+| `/` | filter by name, command, user or PID (`enter` keeps it, `esc` clears it) |
+| `G` / `T` | group by program (default) / tree |
+| `enter` / `→` / `←` | expand / fold the selected group or branch |
+| `k` or `F9` | send a signal (TERM, KILL, HUP, INT, STOP, CONT): choose with `←→`, `enter` sends, `esc` cancels |
+| `n` | change nice (`←→` or `-` `+`, `enter` applies) |
+| `I` | CPU % of one CPU thread ⇄ of the whole machine |
+| `K` | show / hide kernel threads |
+
+`k` is "up" on the CPU page (vim keys); on the Processes page it opens the signal dialog, as in
+`top` and `htop`, which is safe because nothing happens before `enter`.
 
 Theme menu: `↑↓` preview live, `enter` apply, `esc` cancel, `←→` picture brightness,
 `b` blur, `m` image mode, `a` add a picture (path or URL).
@@ -210,10 +309,13 @@ jumping, on a fixed frame grid.
 - **Digits** count along with their bar (90 → 91 → … → 99), with hysteresis while it moves so a
   value near a rounding edge never flickers; exact once it rests. Totals, CCD figures and
   temperatures (read every second, eased over ~1 s) do the same; colours follow the digits.
-- **Graphs** scroll continuously: history is a curve through the per-second points with the
-  live value at its head, sampled at fixed ages, so every graph, strip and heatmap column slides
-  along a little at a time (15 updates a second, staggered over the frames) and the newest
-  column grows in, instead of jumping a cell every 2 s.
+- **Graphs** keep every per-second point on its own braille dot column and move it one column
+  when the next point arrives; only the newest column is live (the number as shown, held to
+  whole dots, so it can't flicker at a dot's edge). An earlier version slid the points by the
+  sub-second phase, which made every column alternate between a point and the mean of two
+  neighbours once a second: one-point peaks shrank and regrew and one-dot features blinked off
+  and on. Checked frame by frame: no cell changes and returns within 6 frames in 40 s runs at
+  128×45 and 172×40, CPU view and Memory & Storage, Midnight and a picture theme.
 - **Pictures**: sixel/iTerm pixel patches are sent only with full repaints (start, keys,
   resize), never mid-animation; a cell that turns blank in between shows the half-block
   backdrop until then.
@@ -337,31 +439,51 @@ field 1 in nanoseconds), while another workload kept the load average at 1.4–3
 
 | 60 s run | CPU per second | % of one thread | RSS |
 |---|---|---|---|
-| Midnight, CPU view: 128×45 · 172×40 · 415×105 (4K, with the memory column) | 84.9 · 81.1 · 80.2 µs | ≤ 0.0085 % | 3.8 · 3.9 · 4.7 MB |
-| Midnight, Memory & Storage page: 128×45 · 172×40 · 415×105 | 80.3 · 80.0 · 76.2 µs | ≤ 0.0080 % | 4.0 · 4.1 · 4.7 MB |
+| Midnight, CPU view: 128×45 · 415×105 (4K, with the memory column) | 82.1 · 95.8 µs | ≤ 0.0096 % | 3.9 · 4.9 MB |
+| Midnight, Memory & Storage page: 128×45 · 415×105 | 83.5 · 90.6 µs | ≤ 0.0091 % | 4.1 · 4.8 MB |
+| the same, the build before the clearer memory page: CPU view · memory page 128×45 | 82.1 · 82.1 µs (load 2.3) | ≤ 0.0083 % | 4.1 MB |
 | Midnight, the build before the memory page: 128×45 · 172×40 · 415×105 | 83.6 · 82.7 · 77.4 µs | ≤ 0.0084 % | 3.8 · 3.9 · 4.7 MB |
 | Midnight (default), 172×40, earlier builds | 68.6 · 71.3 · 82.1 µs | ≤ 0.0082 % | 3.9 MB |
 | Space · ISS aurora picture (sixel) · Midnight 120×30, earlier build | 73.4 · 63.8 · 73.3 µs | ≤ 0.0073 % | 4.0 · 7.2 · 3.8 MB |
 
-Smooth, 60 s runs with the Memory & Storage page at 128×45 · 172×40: Midnight 2.6 · 2.4 ms/s and
-12 · 13 KB/s, NASA Webb picture (sixel) 2.9 · 2.9 ms/s and 11 · 16 KB/s (CPU view in the same
-session: 2.3 · 2.5 ms/s, 38 · 44 KB/s; 2.2 · 2.9 ms/s, 44 · 36 KB/s); frames stay on the 60 fps
-grid (consecutive frame intervals p95 / median 1.01–1.03, no picture data after the first paint).
+| Midnight, Processes page (~130 processes, load 6–7): 128×45 · 415×105 | 68.3 · 68.6 µs | ≤ 0.0069 % | 4.0 · 5.0 MB |
 
-Binary: 1,033,464 bytes with the network page (981,368 before it; `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
+Processes page, smooth, 60 s at 128×45 · 172×40 with a load average of 7: 2.8 · 2.8 ms/s, 18 · 22
+KB/s, frames on the 60 fps grid (the base Memory & Storage page under the same load: 3.2 ms/s).
+With 5,400 processes it stays at 4.7 MB of RAM (128×45). A full scan of every process's `stat`
+costs ~1–1.5 ms here, so smooth does one about every 1–4 s (spaced by its measured cost), eco
+every 30 s or more; nothing is read for the page while it isn't shown.
+
+(The rows above were measured while other monitors and builds kept the load average at 3.6–3.8.)
+
+Smooth, 40 s runs at 128×45 · 172×40 under the same load: Memory & Storage page Midnight 3.4 ·
+3.5 ms/s and 7 · 7 KB/s, NASA Webb picture (sixel) 3.2 · 3.3 ms/s and 11 · 10 KB/s; CPU view 3.7 ·
+3.9 ms/s and 66 · 73 KB/s, 4.2 · 4.2 ms/s and 53 · 52 KB/s; frames stay on the 60 fps grid
+(consecutive frame intervals p95 / median 1.03–1.04, ≤ 0.1 % off the grid, no picture data after
+the first paint).
+
+Binary: 979,432 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
 stripped; `"s"` is 13 KB larger and not measurably faster here, `2`/`3` exceed 1 MB). The memory
 page fits in less than before: no float formatting code at all (a non-constant `f32::clamp`
 pulled in ~30 KB of it for its panic message), short lists sorted by one small insertion sort
-instead of std's ~4 KB sort per element type, ASCII lower-casing instead of Unicode tables.
+instead of std's ~4 KB sort per element type, ASCII lower-casing instead of Unicode tables, and
+the picture download runs `curl` through `posix_spawnp` instead of `std::process::Command`
+(~33 KB less).
+The Processes page adds about 68 KB the same way, plus: one non-generic heap sort, string
+tables kept out of the binary's relocations (every `&str` in a constant table costs 40 bytes in a
+position-independent binary; a `match` costs none), and no `core::fmt` for numbers.
 
 **Memory & Storage data** is read the same way, with every reading's cost in mind (cold cache,
 this machine): `/proc/meminfo` and each disk's sysfs `stat` (the `/proc/diskstats` counters for
 that disk alone: 0.9 µs instead of 8 µs for the whole table) every sample, every third while
 the page is hidden so the histories keep going; `/proc/vmstat` (swap in/out, 10 µs) and PSI at
 most every 4 s in eco (2.5 times a second in smooth); `statvfs` every 10 s (3 s); the mount table
-only when `poll()` on `/proc/self/mountinfo` reports a change. The process scan costs ~1 µs a
-process, so eco does a full one every 2 minutes and re-reads only the processes shown every
-20 s (3 s at other speeds; kernel threads are remembered and skipped). DIMM (`spd5118`, SMBus)
+only when `poll()` on `/proc/self/mountinfo` reports a change. A full process scan costs ~1.3 µs
+a process (names are read once per pid, kernel threads remembered and skipped), so it runs every
+4 s (eco: 2 minutes); in between the 32 biggest processes are followed live through their open
+`statm` (one `pread`, ~1 µs each) 2.5 times a second (eco: every 10 s), and eco re-scans early
+when RAM in use changes by more than those processes explain or, every 30 s, when a new pid of
+64 MB or more appears. DIMM (`spd5118`, SMBus)
 and NVMe temperatures cost 40–65 µs of CPU and 1–20 ms of *wall* time per read, so a helper
 thread reads them every 60 s in eco (5 s otherwise) and only while they're shown: the main loop
 never waits for a sensor, and smooth frames stay on time.
@@ -386,18 +508,24 @@ yours appears that isn't known yet. While the page is shown no CPU numbers are v
 CPU sampler runs every other sample there (twice a second in smooth). Eco on this page updates
 every ~3–5 s (the NIC read and the cold caches of a busy machine are most of a sample).
 
-| network page, 60 s runs (load 3–7 from other work) | CPU per second | output | RSS |
+| network page, 60 s runs (load ~2 from other work) | CPU per second | output | RSS |
 |---|---|---|---|
-| eco 128×45 · 415×105 | 68 · 51 µs | 0.2 · 0.8 KB/s | 4.1 · 5.0 MB |
-| smooth 128×45 · 172×40 | 2.9 · 2.9 ms | 12 · 14 KB/s | 4.1 MB |
+| eco 128×45 · 415×105 | 74.8 · 62.4 µs | 0.3 · 0.2 KB/s | 4.1 · 4.9 MB |
+| smooth 128×45 · 172×40 | 3.1 · 3.2 ms | 12.5 · 12.4 KB/s | 4.1 · 4.2 MB |
+| (same session) CPU view eco 128×45 · 415×105; without the network page | 75.5 · 74.3 µs; 76.3 µs | | 4.0 · 5.0 MB |
 
-Smooth frames on the network page stay on the 60 fps grid as on the other pages (consecutive
-frame intervals p95 / median 1.08; the Memory & Storage page measured 1.08 in the same session).
+Smooth frames on the network page stay on the 60 fps grid (consecutive frame intervals p95 /
+median 1.04, none off the grid; the Memory & Storage page measured 1.05 in the same session).
+RSS: IPv6 addresses are written by cpuview, not libc's `inet_ntop`, which would map another
+128 KB of libc for a few link-local addresses.
 Download / upload rates match `/proc/net/dev` deltas over the same second within 0.5 % (a
 2.5 MB/s ping flood), container memory matches `docker stats`, listening ports and their
-owners match `ss -ltnup` (run as root). The binary grew by 52 KB for the page; to make room,
-image downloads start `curl` with `posix_spawn` instead of `std::process::Command` (−16 KB with
-its dependencies) and the palette's median cut sorts by one channel with a counting sort.
+owners match `ss -ltnup` (run as root). The page adds 69.5 KB to the binary (1,117,088 bytes),
+written to be small: no format machinery on its paths (string concatenation into the stack
+formatter), loops instead of iterator chains and closures (each extra function costs its unwind
+tables too), one generic insertion sort, a shell sort for the connection table; and to make room,
+the palette's median cut sorts by one channel with a counting sort (−4 KB) and the stack
+formatter's constructor isn't inlined at its hundreds of call sites (−4 KB).
 
 What makes that possible:
 

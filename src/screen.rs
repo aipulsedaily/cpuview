@@ -838,11 +838,8 @@ mod tests {
         );
         s.put(1, 1, ' ', NOPATCH, surf(S_PANEL));
         s.put(2, 0, 'x', 0xffffff, surf(S_PANEL));
-        let out = String::from_utf8_lossy(
-            &s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel)
-                .to_vec(),
-        )
-        .to_string();
+        let out = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
         // rows 0..=2 get patches (h - 2 = 3 rows); row 0 is split by the 'x'
         let patches: Vec<&str> = out.split("\x1bP0;1;0q").skip(1).collect();
         assert_eq!(patches.len(), 5, "{out:?}"); // row0: [0..2) and [3..4); row1: [0..1) and [2..4); row2: [0..4)
@@ -859,18 +856,12 @@ mod tests {
             .is_empty());
         // text then blank again: the cell gets its half-block and a new patch
         s.put(0, 2, '7', 0xffffff, surf(S_PANEL));
-        let o1 = String::from_utf8_lossy(
-            &s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel)
-                .to_vec(),
-        )
-        .to_string();
+        let o1 = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
         assert!(!o1.contains("\x1bP0;1;0q"));
         s.put(0, 2, ' ', 0, surf(S_PANEL));
-        let o2 = String::from_utf8_lossy(
-            &s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel)
-                .to_vec(),
-        )
-        .to_string();
+        let o2 = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
         assert!(
             o2.contains("▀") && o2.contains("\x1b[3;1H\x1bP0;1;0q\"1;1;2;4"),
             "{o2:?}"

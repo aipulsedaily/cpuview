@@ -15,6 +15,7 @@ pub enum Key {
     Tab,
     /// Shift-Tab
     BackTab,
+    F9,
     Home,
     End,
     PgUp,
@@ -251,6 +252,7 @@ impl Parser {
                     3 => out.push(k(Key::Delete)),
                     5 => out.push(k(Key::PgUp)),
                     6 => out.push(k(Key::PgDn)),
+                    20 => out.push(k(Key::F9)),
                     _ => {}
                 },
                 _ => {} // replies (…t, …c, …R) and anything unknown
