@@ -1,8 +1,9 @@
 # cpuview
 
 A btop-style terminal monitor that shows **every core's clock speed and load at once**, grouped
-by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds.
-Native Rust, one 0.99 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds,
+plus a **Memory & Storage** page (`m`): RAM, swap, disk I/O, filesystems and the biggest
+processes, live. Native Rust, one 0.98 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -16,11 +17,23 @@ Ryzen 9 9950X with a synthetic load running. Captured headlessly: the app ran in
 output was replayed in a VT emulator (pyte) and painted with DejaVu Sans Mono.*
 
 The layout adapts from 40×12 to 4K: every core stays visible, and bigger windows get more history
-instead of longer bars.
+instead of longer bars. From a maximised 1080p window up (≈ 190×36 cells), a Memory & Storage
+column sits beside the CPU view, so both are visible without switching.
+
+![Memory & Storage page, 128×45](docs/screenshots/rust-memory-128x45.webp)
+
+*`m`: the Memory & Storage page at 128×45 — RAM as a stacked bar (used · cache · free) with a
+used/cache history, swap with its in/out rates and memory pressure, DIMM temperatures, the NVMe
+drive's read/write rates, IOPS, busy time, temperature and history, every real filesystem, and
+the processes holding the most memory. Captured during a synthetic CPU and disk load.*
+
+![4K, 415x105, CPU view with the memory column](docs/screenshots/rust-4k-memory.webp)
+
+*415×105 (4K at 100 %): the CPU view with the Memory & Storage column beside it.*
 
 | | |
 |---|---|
-| ![4K, 275x70](docs/screenshots/rust-4k-275x70.webp) 275×70 (4K at 150 %): per-core history grid | ![172x40](docs/screenshots/rust-default.webp) 172×40, Midnight |
+| ![4K, 275x70](docs/screenshots/rust-4k-275x70.webp) 275×70 (4K at 150 %): per-core history grid, memory column | ![172x40](docs/screenshots/rust-default.webp) 172×40, Midnight |
 | ![60x20](docs/screenshots/rust-60x20.webp) 60×20: one row per core, live summary in the title | ![40x12](docs/screenshots/rust-40x12.webp) 40×12, Nebula: all 16 cores |
 | ![Nebula](docs/screenshots/rust-nebula.webp) Nebula | ![Synthwave](docs/screenshots/rust-synthwave.webp) Synthwave Sunset |
 | ![ISS aurora picture, sixel](docs/screenshots/rust-iss.webp) Picture theme (ISS aurora), sixel mode¹ | ![Night city picture, sixel](docs/screenshots/rust-city.webp) Picture theme (pixel night city), sixel mode¹ |
@@ -62,6 +75,25 @@ terminal.
 - No root, no daemon: reads `/proc/stat` and sysfs; works on any Linux x86_64 / aarch64 and
   degrades gracefully without cpufreq, hwmon, SMT or CCD information
 
+### Memory & Storage
+
+- **RAM**: used · cache (buffers + page cache + reclaimable slab) · free as one stacked bar,
+  used / available / cache / free / shared, and a history of used with cache stacked above it.
+  Numbers are what `free` reports (procps-ng 4: used = total − available)
+- **DIMM temperatures** (`spd5118` DDR5 / `jc42` DDR4 sensors), **swap** used of total (file,
+  partition or zram), swap-in / swap-out rates from `/proc/vmstat`, and memory **pressure**
+  (PSI `some avg10`, the share of time tasks stalled waiting for memory)
+- **Disk I/O** per physical disk (no partitions, loop, dm, md or zram devices): read and write
+  MB/s and IOPS, % busy (time with I/O in flight), drive temperature (`nvme` / `drivetemp`), and
+  read / write history graphs that rescale in powers of two
+- **Storage**: every real filesystem once (no tmpfs, snaps, overlays, network mounts or bind
+  duplicates): used / size and use % as `df` computes them, the device, type and free space
+- **Processes** using the most memory (resident set, % of RAM) on larger layouts
+- Small windows stack the panels (memory, disk, storage, processes) and drop history first;
+  from 100 columns the page has two columns; from ≈ 190×36 the column joins the CPU view
+- Same themes, picture backgrounds and smooth animation: bars glide, digits count through the
+  values in between, graphs scroll continuously
+
 ## Install
 
 Needs a Rust toolchain (<https://rustup.rs>) on Linux.
@@ -86,6 +118,7 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 |---|---|
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
+| `m` | CPU view ⇄ Memory & Storage page (remembered; `--page cpu\|memory`) |
 | `+` / `-` | faster / slower (`=` works as `+`) |
 | `o` | sort cores: number → load → clock |
 | `c` | view: auto → full → compact |
@@ -120,7 +153,9 @@ jumping, on a fixed frame grid.
 - **Load** blends two windows of `/proc/stat` (which counts in 10 ms ticks): 0.8 s (±1 %) while
   it agrees with 0.2 s (±5 %) within the noise, the short one as they disagree. Quiet bars stay
   still; a step 10 % → 80 % reaches 90 % in ~0.45 s. Changes below ±0.8 % load / ±1.5 % clock
-  don't move a bar.
+  don't move a bar. A disagreement within the short window's noise counts only if the sample
+  before agreed in sign, and once a step or ramp has ended the bar settles on a 0.4 s window:
+  ramp ends no longer overshoot (they did by ~3 %, about 0.4 cell, before settling).
 - **Digits** count along with their bar (90 → 91 → … → 99), with hysteresis while it moves so a
   value near a rounding edge never flickers; exact once it rests. Totals, CCD figures and
   temperatures (read every second, eased over ~1 s) do the same; colours follow the digits.
@@ -251,12 +286,34 @@ field 1 in nanoseconds), while another workload kept the load average at 1.4–3
 
 | 60 s run | CPU per second | % of one thread | RSS |
 |---|---|---|---|
-| Midnight, this build: 128×45 · 172×40 · 415×105 (4K) | 83.6 · 82.7 · 77.4 µs | ≤ 0.0084 % | 3.8 · 3.9 · 4.7 MB |
+| Midnight, CPU view: 128×45 · 172×40 · 415×105 (4K, with the memory column) | 84.9 · 81.1 · 80.2 µs | ≤ 0.0085 % | 3.8 · 3.9 · 4.7 MB |
+| Midnight, Memory & Storage page: 128×45 · 172×40 · 415×105 | 80.3 · 80.0 · 76.2 µs | ≤ 0.0080 % | 4.0 · 4.1 · 4.7 MB |
+| Midnight, the build before the memory page: 128×45 · 172×40 · 415×105 | 83.6 · 82.7 · 77.4 µs | ≤ 0.0084 % | 3.8 · 3.9 · 4.7 MB |
 | Midnight (default), 172×40, earlier builds | 68.6 · 71.3 · 82.1 µs | ≤ 0.0082 % | 3.9 MB |
 | Space · ISS aurora picture (sixel) · Midnight 120×30, earlier build | 73.4 · 63.8 · 73.3 µs | ≤ 0.0073 % | 4.0 · 7.2 · 3.8 MB |
 
-Binary: 986,408 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
-stripped; `"s"` is 13 KB larger and not measurably faster here, `2`/`3` exceed 1 MB).
+Smooth, 60 s runs with the Memory & Storage page at 128×45 · 172×40: Midnight 2.6 · 2.4 ms/s and
+12 · 13 KB/s, NASA Webb picture (sixel) 2.9 · 2.9 ms/s and 11 · 16 KB/s (CPU view in the same
+session: 2.3 · 2.5 ms/s, 38 · 44 KB/s; 2.2 · 2.9 ms/s, 44 · 36 KB/s); frames stay on the 60 fps
+grid (consecutive frame intervals p95 / median 1.01–1.03, no picture data after the first paint).
+
+Binary: 981,368 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
+stripped; `"s"` is 13 KB larger and not measurably faster here, `2`/`3` exceed 1 MB). The memory
+page fits in less than before: no float formatting code at all (a non-constant `f32::clamp`
+pulled in ~30 KB of it for its panic message), short lists sorted by one small insertion sort
+instead of std's ~4 KB sort per element type, ASCII lower-casing instead of Unicode tables.
+
+**Memory & Storage data** is read the same way, with every reading's cost in mind (cold cache,
+this machine): `/proc/meminfo` and each disk's sysfs `stat` (the `/proc/diskstats` counters for
+that disk alone: 0.9 µs instead of 8 µs for the whole table) every sample, every third while
+the page is hidden so the histories keep going; `/proc/vmstat` (swap in/out, 10 µs) and PSI at
+most every 4 s in eco (2.5 times a second in smooth); `statvfs` every 10 s (3 s); the mount table
+only when `poll()` on `/proc/self/mountinfo` reports a change. The process scan costs ~1 µs a
+process, so eco does a full one every 2 minutes and re-reads only the processes shown every
+20 s (3 s at other speeds; kernel threads are remembered and skipped). DIMM (`spd5118`, SMBus)
+and NVMe temperatures cost 40–65 µs of CPU and 1–20 ms of *wall* time per read, so a helper
+thread reads them every 60 s in eco (5 s otherwise) and only while they're shown: the main loop
+never waits for a sensor, and smooth frames stay on time.
 
 What makes that possible:
 
@@ -303,7 +360,7 @@ What makes that possible:
 ## Development
 
 ```sh
-cargo test --release         # parsing, layout fit at many sizes, probe matrix, sixel round trip, input parser …
+cargo test --release         # parsing (/proc/stat, meminfo, vmstat, diskstats, mountinfo), layout fit at many sizes, probe matrix, sixel round trip, input parser …
 cargo clippy --release
 cargo build --release --features prof && CPUVIEW_PROFILE=/tmp/prof.txt target/release/cpuview  # per-phase CPU time, written on exit
 python3 themes/reference.py render nebula out.png   # the theme spec's reference renderer

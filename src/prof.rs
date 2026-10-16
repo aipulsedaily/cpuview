@@ -3,7 +3,7 @@
 
 use crate::term;
 
-const N: usize = 16;
+const N: usize = 17;
 static mut PROF: [i64; N] = [0; N];
 static mut ON: bool = false;
 static mut CPU0: i64 = 0;
@@ -23,7 +23,8 @@ const NAMES: [&str; N] = [
     "d.detail",
     "d.sort",
     "anim",
-    "-",
+    "d.mem",
+    "mem",
 ];
 
 pub fn init() {

@@ -6,6 +6,10 @@ use crate::sys::Sampler;
 use crate::theme::*;
 use std::fmt::Write as _;
 
+#[path = "memui.rs"]
+mod memui;
+pub use memui::*;
+
 const SLOT_TITLE: usize = 0;
 const SLOT_GLOAD: usize = 1;
 const SLOT_GFREQ: usize = 2;
@@ -291,6 +295,9 @@ pub const STRIP_SECS: usize = 2;
 /// width of the selected core's statistics beside the history grid
 const GRID_STATS: usize = 30;
 /// bar glyphs: clock bars are thinner than load bars (load is what changes)
+/// The memory column joins the CPU view from this size (1080p maximised ≈ 205×50).
+pub const SIDE_W: usize = 190;
+pub const SIDE_H: usize = 36;
 pub const CLK: char = '▂';
 pub const LOAD: char = '▄';
 
@@ -340,6 +347,8 @@ pub struct App {
     pub order: Vec<usize>,
     pub lay: Layout,
     pub w: usize,
+    /// width of the CPU view (less than `w` with the memory column beside it)
+    pub cw: usize,
     pub h: usize,
     pub zones: Vec<(usize, usize, char)>,
     pub scroll: usize,
@@ -388,6 +397,15 @@ pub struct App {
     pub anim: bool,
     /// widest clock / load bar in cells (sets the animation's resolution)
     bar_cells: (usize, usize),
+    /// memory, swap, disks, filesystems, processes
+    pub m: crate::mem::Mem,
+    /// page: 0 CPU (with the memory column beside it on big screens), 1 memory & storage
+    pub page: usize,
+    pub ml: MemLay,
+    ma: MA,
+    mcache: Vec<u64>,
+    /// colour of the series in `vals2` that `graph` draws under its own (0: none)
+    pub under: std::cell::Cell<u32>,
 }
 
 impl App {
@@ -422,6 +440,7 @@ impl App {
             order: (0..n).collect(),
             lay: Layout::default(),
             w: 0,
+            cw: 0,
             h: 0,
             zones: Vec::new(),
             scroll: 0,
@@ -457,6 +476,12 @@ impl App {
             frame: 0,
             anim: false,
             bar_cells: (8, 8),
+            m: crate::mem::Mem::empty(),
+            page: 0,
+            ml: MemLay::default(),
+            ma: MA::default(),
+            mcache: Vec::new(),
+            under: std::cell::Cell::new(0),
         }
         .with_bars()
     }
@@ -510,6 +535,7 @@ impl App {
         self.hy.iter_mut().for_each(|h| *h = -1e9);
         self.na.clear();
         self.anim_numbers(1.0);
+        self.mem_retarget(false);
     }
 
     /// Smooth mode, after a sample: the bars' new targets.
@@ -531,6 +557,7 @@ impl App {
             );
             db(&mut self.tu[i], self.s.ur[i].clamp(0.0, 1.0), DEADBAND_U);
         }
+        self.mem_retarget(true);
     }
 
     /// Smooth mode: advance every spring by `dt` s. Returns whether anything moves.
@@ -571,7 +598,7 @@ impl App {
         }
         let ta = &mut self.ta;
         moving |= spring(&mut ta.0, &mut ta.1, self.s.avg_r, dt, W_CLOCK, xf, 1.0);
-        moving
+        moving | self.mem_step(dt)
     }
 
     /// Smooth mode: the digits follow the moving values (with hysteresis, see
@@ -866,9 +893,45 @@ impl App {
         self.fit(w, h);
     }
 
+    /// Lay out the page for a `w` × `h` screen: the CPU view (with the memory column
+    /// beside it from SIDE_W × SIDE_H up, as long as every core still fits) or the
+    /// memory page.
     pub fn fit(&mut self, w: usize, h: usize) {
         self.w = w;
         self.h = h;
+        let area = Rect {
+            x: 0,
+            y: 1,
+            w,
+            h: h.saturating_sub(2),
+        };
+        self.ml = MemLay::default();
+        if self.page == 1 {
+            self.fit_cpu(w, h);
+            self.ml = self.mem_layout(area, w >= 100 && area.h >= 20);
+            return;
+        }
+        if w >= SIDE_W && h >= SIDE_H {
+            let sw = (w * 26 / 100).clamp(56, 100);
+            self.fit_cpu(w - sw, h);
+            if self.lay.fits && self.lay.nrows <= self.lay.vis_rows {
+                self.ml = self.mem_layout(
+                    Rect {
+                        x: w - sw,
+                        w: sw,
+                        ..area
+                    },
+                    false,
+                );
+                return;
+            }
+        }
+        self.fit_cpu(w, h);
+    }
+
+    /// CPU view layout in the leftmost `w` columns.
+    fn fit_cpu(&mut self, w: usize, h: usize) {
+        self.cw = w;
         let n = self.ngroups();
         let avail = h.saturating_sub(2);
         let plan = self.plan(w, h);
@@ -1040,21 +1103,19 @@ impl App {
 
     pub fn resort(&mut self) {
         let s = &self.s;
-        let key = |g: usize, f: &dyn Fn(usize) -> f32| -> f32 {
-            s.t.groups[g].iter().map(|&c| f(c)).fold(0.0, f32::max)
-        };
         let n = self.ngroups();
         self.order.clear();
         self.order.extend(0..n);
-        match self.sort {
-            1 => self
-                .order
-                .sort_by(|&a, &b| key(b, &|c| s.u[c]).total_cmp(&key(a, &|c| s.u[c]))),
-            2 => self
-                .order
-                .sort_by(|&a, &b| key(b, &|c| s.f[c]).total_cmp(&key(a, &|c| s.f[c]))),
-            _ => {}
+        if self.sort == 0 {
+            return;
         }
+        let v = if self.sort == 1 { &s.u } else { &s.f };
+        let key: Vec<f32> =
+            s.t.groups
+                .iter()
+                .map(|g| g.iter().map(|&c| v[c]).fold(0.0, f32::max))
+                .collect();
+        crate::sys::isort(&mut self.order, &|&a, &b| key[a] > key[b]);
     }
 
     // ── actions ────────────────────────────────────────────────────────────
@@ -1104,6 +1165,9 @@ impl App {
     }
 
     pub fn card_at(&self, x: usize, y: usize) -> Option<usize> {
+        if self.page != 0 {
+            return None;
+        }
         if let Some(g) = self.grid_at(x, y) {
             return Some(g);
         }
@@ -1154,7 +1218,12 @@ impl App {
     /// the panels and graphs change on the other frames, in `draw`.
     pub fn draw_bars(&mut self, scr: &mut Screen) {
         if self.menu.is_none() {
-            prof(11, || self.draw_cores(scr, false));
+            if self.page == 0 {
+                prof(11, || self.draw_cores(scr, false));
+            }
+            if self.mem_visible() {
+                self.draw_mem(scr, false, false);
+            }
         }
     }
 
@@ -1179,7 +1248,8 @@ impl App {
         let (h, m, sec) = self.clock;
         let sec = if self.speed > 0 { sec } else { 0 };
         // without the graph band the title carries a live summary (load, clock, temp)
-        let summary = if self.lay.top.is_none() {
+        let cpu = self.page == 0;
+        let summary = if cpu && self.lay.top.is_none() {
             let (u, f, t) = self.summary();
             mixk(&[
                 (u * 100.0).round() as u64,
@@ -1199,10 +1269,10 @@ impl App {
                 summary,
             ]),
         ) {
-            let full = full || self.lay.top.is_none();
+            let full = full || !cpu || self.lay.top.is_none();
             prof(8, || self.draw_title(scr, full));
         }
-        if self.lay.top.is_some() {
+        if cpu && self.lay.top.is_some() {
             let (u, f, topf) = self.totals();
             let ku = (u * 100.0).round() as u64;
             let kf = mixk(&[(f / 10.0) as u64, (topf / 10.0) as u64]);
@@ -1227,8 +1297,10 @@ impl App {
                 });
             }
         }
-        prof(11, || self.draw_cores(scr, full));
-        if self.lay.det.is_some() {
+        if cpu {
+            prof(11, || self.draw_cores(scr, full));
+        }
+        if cpu && self.lay.det.is_some() {
             let g = self.selected;
             let s = &self.s;
             let mut k = g as u64;
@@ -1246,6 +1318,9 @@ impl App {
             if self.memo(SLOT_DETAIL, k) || body {
                 prof(12, || self.draw_detail(scr, full, body));
             }
+        }
+        if self.mem_visible() {
+            prof(15, || self.draw_mem(scr, full, true));
         }
         if full {
             self.draw_keys(scr);
@@ -1466,11 +1541,30 @@ impl App {
         ];
         let sum_short: [(&str, u32); 2] =
             [(pu.s(), cu), (if has_t { &pt.s()[1..] } else { "" }, ct)];
-        let no_top = self.lay.top.is_none();
+        let mem_page = self.page == 1;
+        let no_top = !mem_page && self.lay.top.is_none();
+        let mi = self.m.mi;
+        let minfo = f!(
+            "   {} RAM · {} swap",
+            bsize(mi.total as f32, false).s(),
+            bsize(mi.swap_total as f32, false).s()
+        );
+        let ndk = self.m.disks.len();
+        let dinfo = f!(" · {} disk{}", ndk, if ndk == 1 { "" } else { "s" });
+        let mtitle = ("  memory & storage", t.fg | BOLD);
         let mut left0 = [(short.s(), t.fg | BOLD); 8];
         left0[1..].copy_from_slice(&sum_full);
         // (left part, short tail = clock only without uptime), most detailed first
-        let lefts: [(&[(&str, u32)], bool); 6] = if no_top {
+        let lefts: [(&[(&str, u32)], bool); 6] = if mem_page {
+            [
+                (&[mtitle, (minfo.s(), t.mid), (dinfo.s(), t.dim)], false),
+                (&[mtitle, (minfo.s(), t.mid)], false),
+                (&[mtitle], false),
+                (&[mtitle], true),
+                (&[], true),
+                (&[], true),
+            ]
+        } else if no_top {
             [
                 (&left0, false),
                 (&sum_full, false),
@@ -1539,22 +1633,30 @@ impl App {
         }
         let bg = surf(S_PANEL);
         let top = (h * 4) as f32;
-        let n = vals.len();
         // dot height of every half-column, computed once (not once per row)
         let w = w.min(1024);
-        let mut dots = [0u16; 2048];
-        for (i, d) in dots.iter_mut().enumerate().take(2 * w) {
-            // i over 0..2w; vals are right-aligned (newest last)
-            let j = n as isize - 2 * w as isize + i as isize;
-            if j < 0 {
-                continue;
-            }
-            let v = vals[j as usize];
-            if v > 0.0 {
-                *d = (v / vmax * top).round().clamp(1.0, top) as u16;
+        // a second series drawn under the first in its own colour (`under`, `vals2`)
+        let uc = self.under.get();
+        let mut dots = [[0u16; 2]; 2048];
+        for (k, vals) in [vals, &self.vals2[..]]
+            .into_iter()
+            .enumerate()
+            .take(1 + (uc != 0) as usize)
+        {
+            let n = vals.len();
+            for (i, d) in dots.iter_mut().enumerate().take(2 * w) {
+                // i over 0..2w; vals are right-aligned (newest last)
+                let j = n as isize - 2 * w as isize + i as isize;
+                if j < 0 {
+                    continue;
+                }
+                let v = vals[j as usize];
+                if v > 0.0 {
+                    d[k] = (v / vmax * top).round().max(1.0).min(top) as u16;
+                }
             }
         }
-        let dot = |i: usize| dots[i] as usize;
+        let dot = |i: usize| dots[i][0].max(dots[i][1]) as usize;
         let gl = [
             (0.25 * top).round() as usize,
             (0.5 * top).round() as usize,
@@ -1580,11 +1682,12 @@ impl App {
                     }
                 }
                 if code != 0 {
+                    let mine = dots[2 * i][0] as usize > base || dots[2 * i + 1][0] as usize > base;
                     scr.put(
                         x0 + i,
                         y0 + r,
                         char::from_u32(0x2800 + code).unwrap(),
-                        col,
+                        if mine { col } else { uc },
                         bg,
                     );
                 } else if let (Some(k), true) = (grid_bit, i % 2 == 0) {
@@ -3374,10 +3477,11 @@ impl App {
         );
         let th = &self.t;
         // (key, long, short, label)
-        let keys: [(char, &str, Option<&str>, &str); 10] = [
+        let cpu_keys: [(char, &str, Option<&str>, &str); 11] = [
             ('q', "quit", Some("quit"), "q"),
             (' ', "pause", Some("pause"), "spc"),
             ('s', "speed −/+", Some("speed"), "s"),
+            ('m', "memory", Some("mem"), "m"),
             ('o', "sort", Some("sort"), "o"),
             ('c', "view", Some("view"), "c"),
             ('g', "graphs", Some("graphs"), "g"),
@@ -3386,6 +3490,15 @@ impl App {
             ('t', "theme", Some("theme"), "t"),
             ('\0', "select", None, "←↑↓→"),
         ];
+        let mem_keys: [(char, &str, Option<&str>, &str); 5] = [
+            cpu_keys[0],
+            cpu_keys[1],
+            cpu_keys[2],
+            ('m', "cpu view", Some("cpu"), "m"),
+            ('t', "theme", Some("theme"), "t"),
+        ];
+        let keys: &[(char, &str, Option<&str>, &str)] =
+            if self.page == 1 { &mem_keys } else { &cpu_keys };
         let state = |k: char| -> &str {
             match k {
                 's' => SPEEDS[self.speed].0,
@@ -3408,7 +3521,7 @@ impl App {
         ] {
             let st = |k: char| if k == 't' && !tn { "" } else { state(k) };
             let mut len = 0;
-            for (k, long, short, lab) in keys {
+            for &(k, long, short, lab) in keys {
                 let d = match dv {
                     0 => long,
                     1 => short.unwrap_or(""),
@@ -3432,7 +3545,7 @@ impl App {
             }
             self.zones.clear();
             let mut x = 0;
-            for (k, long, short, lab) in keys {
+            for &(k, long, short, lab) in keys {
                 let d = match dv {
                     0 => long,
                     1 => short.unwrap_or(""),
@@ -3492,12 +3605,19 @@ mod tests {
         for _ in 0..200 {
             s.sample_fake();
         }
-        App::new(s, crate::theme::load("default").unwrap())
+        let mut a = App::new(s, crate::theme::load("default").unwrap());
+        a.m = crate::mem::Mem::fake(1, 3, 12);
+        a
     }
 
     fn check(a: &App, w: usize, h: usize) {
+        check_mem(a, w, h);
+        if a.page == 1 {
+            return;
+        }
         let l = &a.lay;
-        let inside = |r: Rect| r.x + r.w <= w && r.y >= 1 && r.y + r.h <= h - 1;
+        let w = a.cw;
+        let inside = |r: Rect| r.x + r.w <= w && r.y >= 1 && r.y + r.h < h;
         assert!(inside(l.cores), "{w}x{h} cores {:?}", l.cores);
         if let Some(t) = l.top {
             assert!(inside(t) && t.y + t.h <= l.cores.y, "{w}x{h} top");
@@ -3513,6 +3633,125 @@ mod tests {
         let step = l.rh + l.gap as usize;
         let used = l.header as usize + l.vis_rows.min(l.nrows) * step - l.gap as usize;
         assert!(used <= ir.h, "{w}x{h} rows overflow: {used} > {}", ir.h);
+    }
+
+    /// Memory panels: on screen, beside (not over) the CPU view, not overlapping,
+    /// tall enough for a border and a row.
+    fn check_mem(a: &App, w: usize, h: usize) {
+        let rs: Vec<Rect> = a.ml.rects().into_iter().filter(|r| r.w > 0).collect();
+        for (i, r) in rs.iter().enumerate() {
+            assert!(
+                r.x + r.w <= w && r.y >= 1 && r.y + r.h < h,
+                "{w}x{h} mem {r:?}"
+            );
+            assert!(r.h >= 3 && r.w >= 20, "{w}x{h} mem panel too small {r:?}");
+            if a.page == 0 {
+                assert!(r.x >= a.cw, "{w}x{h} mem over the CPU view");
+            }
+            for q in &rs[i + 1..] {
+                let apart =
+                    r.x + r.w <= q.x || q.x + q.w <= r.x || r.y + r.h <= q.y || q.y + q.h <= r.y;
+                assert!(apart, "{w}x{h} overlap {r:?} {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn memory_page_and_column_fit_at_all_sizes() {
+        for (nd, nfs) in [(1, 3), (0, 0), (3, 8), (2, 1)] {
+            for w in (20..=420).step_by(41) {
+                for h in (6..=110).step_by(13) {
+                    for page in [0, 1] {
+                        let mut a = app(16, 2, 2);
+                        a.m = crate::mem::Mem::fake(nd, nfs, 24);
+                        a.page = page;
+                        a.first_size(w, h);
+                        if h >= 8 && w >= 30 {
+                            check(&a, w, h);
+                        }
+                        let mut scr = Screen::new(w, h);
+                        a.draw(&mut scr, true);
+                        a.draw(&mut scr, false);
+                        a.draw_bars(&mut scr);
+                    }
+                }
+            }
+        }
+        // the memory page shows every panel at the usual sizes
+        for (w, h) in [(128, 45), (80, 24), (172, 40), (415, 105)] {
+            let mut a = app(16, 2, 2);
+            a.page = 1;
+            a.first_size(w, h);
+            let l = a.ml;
+            assert!(
+                l.mem.w > 0 && l.disk.w > 0 && l.fs.w > 0 && l.procs.w > 0,
+                "{w}x{h} {l:?}"
+            );
+        }
+        // 40x12: memory, disk and storage
+        let mut a = app(16, 2, 2);
+        a.page = 1;
+        a.first_size(40, 12);
+        assert!(a.ml.mem.w > 0 && a.ml.disk.w > 0 && a.ml.fs.w > 0);
+        // the column beside the CPU view from 1080p maximised up, all cores still visible
+        for (w, h, side) in [
+            (128, 45, false),
+            (172, 40, false),
+            (205, 50, true),
+            (275, 70, true),
+            (415, 105, true),
+        ] {
+            let mut a = app(16, 2, 2);
+            a.first_size(w, h);
+            assert_eq!(a.mem_visible(), side, "{w}x{h}");
+            assert!(a.lay.fits && a.lay.nrows <= a.lay.vis_rows, "{w}x{h}");
+            if side {
+                assert!(
+                    a.lay.top.is_some() && a.lay.det.is_some() && a.ml.procs.w > 0,
+                    "{w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_values_glide_in_smooth_mode() {
+        let mut a = app(16, 2, 2);
+        a.page = 1;
+        a.first_size(128, 45);
+        a.bars_snap();
+        let g = (1u64 << 30) as f32;
+        assert_eq!(a.ma.used.x, 5.0 * g);
+        a.speed = SMOOTH;
+        a.m.mi.avail = 20 * (1 << 30); // used 5 → 10 GiB
+        a.m.disks[0].rd = 100e6;
+        a.retarget();
+        let dt = 1.0 / crate::anim::FPS as f32;
+        let (mut prev, mut shown, mut t) = (a.ma.used.x, vec![a.ma.used.n], 0.0);
+        let mut scr = Screen::new(128, 45);
+        while a.anim_step(dt) | a.anim_numbers(dt) {
+            assert!(
+                a.ma.used.x >= prev && a.ma.used.x <= 10.0 * g * 1.0001,
+                "monotone, no overshoot"
+            );
+            prev = a.ma.used.x;
+            if shown.last() != Some(&a.ma.used.n) {
+                shown.push(a.ma.used.n);
+            }
+            a.anim = true;
+            a.frame += 1;
+            a.draw(&mut scr, false);
+            t += dt;
+            assert!(t < 4.0);
+        }
+        assert_eq!(a.ma.used.x, 10.0 * g);
+        assert_eq!(a.ma.used.n, 10.0 * g);
+        // the digits counted through the values in between
+        assert!(
+            shown.len() > 10 && shown.windows(2).all(|w| w[1] > w[0]),
+            "{shown:?}"
+        );
+        assert!(a.ma.disk[0][0].x == 100e6);
     }
 
     #[test]

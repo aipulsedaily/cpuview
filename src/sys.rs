@@ -20,32 +20,49 @@ pub const LONG_NS: i64 = 800_000_000;
 const DUAL_D0: f32 = 0.05;
 const DUAL_D1: f32 = 0.12;
 
-/// Per-series estimator state: held weight and its time.
+/// Per-series estimator state: held weight and its time, the last deviation.
 #[derive(Clone, Copy, Default)]
 pub struct EstState {
     hold: f32,
     hold_t: i64,
+    prev_d: f32,
 }
+
+/// Coasting on a held weight, the fast side is this window (half the short one's
+/// tick noise).
+pub const MID_NS: i64 = 400_000_000;
 
 /// Smooth-mode load from `ld(a)` = load from time `a` to now. A short window `us`
 /// (0.2 s: ±5 % tick quantisation, 0.1 s behind) and a long one `ul` (0.8 s: ±1 %,
 /// 0.4 s behind): while they agree within the noise the long one shows, so quiet
 /// bars stay still; as they disagree the short one takes over, so real changes show
-/// within ~0.3 s. The weight holds its peak for one long window, until that lies
-/// wholly after the change: else the target would sag back towards the lagging long
-/// window for a moment after every step; then it fades over another one.
+/// within ~0.3 s. A disagreement within the short window's noise (below DUAL_D1)
+/// counts only when the previous sample's had the same sign: a lone tick of noise
+/// doesn't move the bar. The weight holds its peak for one long window, until that
+/// lies wholly after the change: else the target would sag back towards the lagging
+/// long window for a moment after every step; then it fades over another one. While
+/// it only coasts on that hold (the short window agrees with the long one again: a
+/// ramp or step has ended) the fast side is the 0.4 s window, so the short window's
+/// noise can't push the bar past where it settles.
 pub fn estimate(st: &mut EstState, now: i64, ld: &dyn Fn(i64) -> f32) -> f32 {
     let (us, ul) = (ld(now - SHORT_NS), ld(now - LONG_NS));
-    let w = (((us - ul).abs() - DUAL_D0) / (DUAL_D1 - DUAL_D0)).clamp(0.0, 1.0);
+    let d = us - ul;
+    let raw = ((d.abs() - DUAL_D0) / (DUAL_D1 - DUAL_D0)).clamp(0.0, 1.0);
+    let w = if raw >= 1.0 || (st.prev_d * d > 0.0 && st.prev_d.abs() >= DUAL_D0) {
+        raw
+    } else {
+        0.0
+    };
+    st.prev_d = d;
     // held, then fading out over a second long window (a sudden drop would stall a
     // bar that is following a ramp)
     let age = (now - st.hold_t - LONG_NS) as f32 / LONG_NS as f32;
     let held = st.hold * (1.0 - age.max(0.0)).max(0.0);
     if w >= held {
         (st.hold, st.hold_t) = (w, now);
+        return ul + w * d;
     }
-    let w = w.max(held);
-    ul + w * (us - ul)
+    ul + held * (ld(now - MID_NS) - ul)
 }
 
 /// Ring of per-CPU (idle, total) /proc/stat snapshots with their times; load over a
@@ -473,11 +490,6 @@ pub struct Sampler {
 
 fn find_sensors() -> Vec<Sensor> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("/sys/class/hwmon") else {
-        return out;
-    };
-    let mut dirs: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-    dirs.sort();
     let wanted = [
         "k10temp",
         "zenpower",
@@ -486,29 +498,17 @@ fn find_sensors() -> Vec<Sensor> {
         "cpu-thermal",
         "soc_thermal",
     ];
-    for d in dirs {
-        let name = read_str(&format!("{}/name", d.display())).unwrap_or_default();
+    for d in hwmon_dirs() {
+        let name = read_str(&format!("{d}/name")).unwrap_or_default();
         if !wanted.contains(&name.as_str()) {
             continue;
         }
-        let mut inputs: Vec<(u32, String)> = std::fs::read_dir(&d)
-            .map(|r| {
-                r.filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        let n = e.file_name().to_string_lossy().to_string();
-                        let num = n
-                            .strip_prefix("temp")?
-                            .strip_suffix("_input")?
-                            .parse()
-                            .ok()?;
-                        Some((num, n))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        inputs.sort();
-        for (num, inp) in inputs {
-            let label = read_str(&format!("{}/temp{num}_label", d.display()));
+        for num in 1..32 {
+            let inp = format!("temp{num}_input");
+            if !std::path::Path::new(&format!("{d}/{inp}")).exists() {
+                continue;
+            }
+            let label = read_str(&format!("{d}/temp{num}_label"));
             let label = match label {
                 Some(l) if name == "coretemp" && l.starts_with("Core") => continue, // per-core: too many
                 Some(l) => l.replace("Package id ", "Pkg"),
@@ -519,7 +519,7 @@ fn find_sensors() -> Vec<Sensor> {
                     "CPU".to_string()
                 }
             };
-            let fd = open_ro(&format!("{}/{}", d.display(), inp));
+            let fd = open_ro(&format!("{d}/{inp}"));
             if fd >= 0 {
                 out.push(Sensor {
                     label,
@@ -535,6 +535,38 @@ fn find_sensors() -> Vec<Sensor> {
         }
     }
     out
+}
+
+/// hwmon device directories in number order (no sorting: std's sort costs ~4 KB of
+/// binary per element type).
+pub fn hwmon_dirs() -> Vec<String> {
+    let mut v = Vec::new();
+    let mut miss = 0;
+    for i in 0..256 {
+        let d = format!("/sys/class/hwmon/hwmon{i}");
+        if std::path::Path::new(&d).exists() {
+            v.push(d);
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss > 8 {
+                break;
+            }
+        }
+    }
+    v
+}
+
+/// Stable insertion sort for short lists (one small copy per element type instead
+/// of std's ~4 KB sort machinery).
+pub fn isort<T>(v: &mut [T], lt: &dyn Fn(&T, &T) -> bool) {
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && lt(&v[j], &v[j - 1]) {
+            v.swap(j, j - 1);
+            j -= 1;
+        }
+    }
 }
 
 /// Parse the per-CPU lines of /proc/stat into (idle + iowait, total) jiffies.
@@ -987,6 +1019,83 @@ mod tests {
             "per-interval load quantises"
         );
         assert!(lo >= 0.27 && hi <= 0.33, "windowed load {lo}..{hi}");
+    }
+
+    /// A CPU ramping 10 → 90 % over 3 s, then steady, as /proc/stat shows it (whole
+    /// 10 ms ticks of a 10 ms PWM, sampled 10 times a second with timer jitter): the
+    /// estimate followed by the bar spring must not overshoot where it settles (the
+    /// short window's tick noise used to push it ~3 % past at the end of the ramp).
+    #[test]
+    fn ramp_end_does_not_overshoot() {
+        use crate::anim::{spring, FPS, W_LOAD};
+        let tick = 10_000_000i64;
+        let duty = |t: i64| {
+            let s = t as f64 / 1e9;
+            if s < 3.0 {
+                0.1
+            } else if s < 6.0 {
+                0.1 + 0.8 * (s - 3.0) / 3.0
+            } else {
+                0.9
+            }
+        };
+        let mut worst = 0.0f32;
+        for seed in 0..12u64 {
+            // busy time of a 10 ms PWM (busy first), counted in whole 10 ms ticks
+            let phase = (seed * 3_700_000) as i64 % tick;
+            let busy_ticks = |t: i64| -> u64 {
+                let mut ns = 0i64;
+                let mut p = -phase;
+                while p < t {
+                    // ± 15 % per period: preemption, wakeup latency
+                    let r = ((p / tick) as u64 ^ seed.wrapping_mul(0x9E37_79B9))
+                        .wrapping_mul(0x2545_F491_4F6C_DD1D)
+                        >> 40;
+                    let jit = (r % 1000) as f64 / 1000.0 * 0.3 - 0.15;
+                    let on = ((duty(p.max(0)) + jit).clamp(0.0, 1.0) * tick as f64) as i64;
+                    ns += on.min(t - p).max(0);
+                    p += tick;
+                }
+                (ns / tick) as u64
+            };
+            let mut w = StatWindow::new(1);
+            let mut st = EstState::default();
+            let (mut x, mut v, mut tgt) = (0.1f32, 0.0f32, 0.1f32);
+            let dt = 1.0 / FPS as f32;
+            let ex = (-W_LOAD * dt).exp();
+            let mut lcg = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let (mut maxx, mut settled) = (0.0f32, 0.0f32);
+            for f in 0..(9 * FPS) {
+                let now = f * 1_000_000_000 / FPS;
+                if f % 6 == 0 {
+                    lcg = lcg
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let t = now + (lcg >> 40) as i64 % 3_000_000;
+                    let total = (t / tick) as u64;
+                    let cur = (total - busy_ticks(t), total);
+                    if t > 1_000_000_000 {
+                        let ld = |a: i64| w.base(t, t - a).map_or(0.0, |b| load(cur, b[0]).0);
+                        let n = estimate(&mut st, t, &ld);
+                        if (n - tgt).abs() >= 0.008 {
+                            tgt = n;
+                        }
+                    }
+                    w.push(t, &[cur]);
+                }
+                spring(&mut x, &mut v, tgt, dt, W_LOAD, ex, 1e-5);
+                let s = now as f32 / 1e9;
+                if (6.0..8.0).contains(&s) {
+                    maxx = maxx.max(x);
+                }
+                if (8.0..9.0).contains(&s) {
+                    settled = settled.max(x);
+                }
+            }
+            worst = worst.max(maxx - settled);
+        }
+        // (the old estimator: 2.4 %; this one stays within the load's own noise)
+        assert!(worst < 0.016, "ramp end overshoots by {worst}");
     }
 
     #[test]

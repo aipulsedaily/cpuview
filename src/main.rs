@@ -7,6 +7,7 @@ mod config;
 mod gfx;
 mod image;
 mod input;
+mod mem;
 mod menu;
 mod probe;
 mod prof;
@@ -26,7 +27,8 @@ use theme::*;
 use ui::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor
+const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
+memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes)
 
 usage: cpuview [options]
 
@@ -39,13 +41,15 @@ usage: cpuview [options]
                         smooth (10 samples/s, everything animated at a steady
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
+  --page PAGE           start on: cpu, or memory (RAM, swap, disks, filesystems)
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
   -V, --version         version
 
-keys: arrows/hjkl/click select · s speed (+ faster, - slower) · o sort · c view
-      g graphs · d/enter detail · r reset peaks · space pause · t themes · q quit
+keys: arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
+      o sort · c view · g graphs · d/enter detail · r reset peaks · space pause
+      t themes · q quit
 ";
 
 const OUT: i32 = 1;
@@ -404,16 +408,23 @@ impl State {
                 },
             ),
         ];
-        if l.top.is_some() {
-            rects.extend([
-                (S_PANEL, l.g_load),
-                (S_PANEL, l.g_freq),
-                (S_PANEL, l.sensors),
-            ]);
+        if self.app.page == 0 {
+            if l.top.is_some() {
+                rects.extend([
+                    (S_PANEL, l.g_load),
+                    (S_PANEL, l.g_freq),
+                    (S_PANEL, l.sensors),
+                ]);
+            }
+            rects.push((S_PANEL, l.cores));
+            if let Some(d) = l.det {
+                rects.push((S_PANEL, d));
+            }
         }
-        rects.push((S_PANEL, l.cores));
-        if let Some(d) = l.det {
-            rects.push((S_PANEL, d));
+        for r in self.app.ml.rects() {
+            if r.w > 0 && r.h > 0 {
+                rects.push((S_PANEL, r));
+            }
         }
         if let Some(m) = &self.app.menu {
             rects.push((S_DIALOG, m.rect));
@@ -700,6 +711,21 @@ impl State {
                 self.cfg.save();
                 a.fit(a.w, a.h); // CCD divider rows exist only in core order
             }
+            Key::Char('m') => {
+                a.page = 1 - a.page;
+                self.cfg.page = a.page;
+                self.cfg.save();
+                a.fit(a.w, a.h);
+                if a.mem_visible() {
+                    // fresh numbers for what just appeared (outside the eco budget:
+                    // input handling isn't charged)
+                    a.m.refresh_fs();
+                    if a.procs_visible() && !a.m.proc_ok {
+                        a.m.scan_procs();
+                    }
+                    a.mem_retarget(false);
+                }
+            }
             Key::Char('c') => {
                 a.view = (a.view + 1) % 3;
                 self.cfg.view = a.view;
@@ -975,6 +1001,7 @@ fn main() {
     let mut image_arg = None;
     let mut mode_arg = None;
     let mut speed_arg = None;
+    let mut page_arg = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1013,6 +1040,14 @@ fn main() {
                 }
                 speed_arg = Some(n);
             }
+            "--page" => {
+                let v = val();
+                page_arg = Some(match v.as_str() {
+                    "cpu" => 0,
+                    "memory" | "mem" | "storage" => 1,
+                    _ => die(&format!("unknown page: {v} (cpu or memory)")),
+                });
+            }
             "--image-mode" => {
                 let v = val();
                 mode_arg = Some(
@@ -1025,6 +1060,10 @@ fn main() {
     }
     if let Some(n) = speed_arg {
         cfg.speed = n;
+        cfg.save();
+    }
+    if let Some(p) = page_arg {
+        cfg.page = p;
         cfg.save();
     }
     if let Some(m) = mode_arg {
@@ -1107,6 +1146,8 @@ fn main() {
     auto_pin(&sampler.t);
     let (t, img) = load_theme(&cfg.theme, &cfg).unwrap_or((theme0, None));
     let mut app = App::new(sampler, t);
+    app.m = mem::Mem::new();
+    app.page = cfg.page;
     app.sort = cfg.sort;
     app.view = cfg.view;
     app.speed = cfg.speed;
@@ -1125,6 +1166,9 @@ fn main() {
     };
     st.scr.tmux = st.g.tmux();
     st.app.first_size(cols as usize, rows as usize);
+    if st.app.procs_visible() {
+        st.app.m.scan_procs();
+    }
     st.rebuild(img);
     update_clock(&mut st.app);
     st.app.s.sample(0, true);
@@ -1360,6 +1404,45 @@ fn main() {
             // smooth: clocks 5 times a second, numbers / order 2.5 times
             let clocks = !smooth || tick % 2 == 0;
             prof(0, || st.app.s.sample(push, clocks));
+            // memory & storage: memory and disks every sample (cheap, their histories
+            // keep going); swap rates and pressure, filesystems (every 3 s, eco 10 s),
+            // processes (below) and the DIMM / drive temperatures (helper thread, every
+            // 5 s, eco 60 s) only while shown
+            let vis = st.app.mem_visible();
+            let pvis = st.app.procs_visible();
+            let prows = st.app.ml.procs.h.saturating_sub(3);
+            let m = &mut st.app.m;
+            let now = term::mono();
+            // swap rates: smooth 2.5 times a second, eco every 4 s at most
+            let vm = if eco {
+                now - m.last_vm >= 4 * SEC - SEC / 5
+            } else {
+                !smooth || tick % 4 == 0
+            };
+            prof(16, || m.sample(push, now, vis, vm));
+            mem::slow_period(if !vis {
+                0
+            } else if eco {
+                60_000
+            } else {
+                5_000
+            });
+            if vis {
+                let gap = if eco { 10 } else { 3 } * SEC;
+                if now - m.last_fs >= gap {
+                    m.last_fs = now;
+                    m.refresh_fs();
+                }
+                // processes: a full scan costs ~1 µs a process, so eco does one every
+                // 2 minutes and re-reads just the ones shown every 20 s
+                let gap = if eco { 120 } else { 3 } * SEC;
+                if pvis && now - m.last_proc >= gap - SEC / 5 {
+                    m.scan_procs();
+                } else if pvis && eco && now - m.last_top >= 20 * SEC - SEC / 5 {
+                    m.last_top = now;
+                    m.refresh_procs(prows);
+                }
+            }
             if smooth {
                 if tick % 4 == 0 {
                     st.app.s.publish();

@@ -186,19 +186,19 @@ impl Env {
         let g = |k: &str| std::env::var(k).unwrap_or_default();
         Env {
             term: g("TERM"),
-            colorterm: g("COLORTERM").to_lowercase(),
+            colorterm: g("COLORTERM").to_ascii_lowercase(),
             tmux: !g("TMUX").is_empty(),
         }
     }
 }
 
 pub fn in_tmux(c: &Caps, e: &Env) -> bool {
-    e.tmux || c.name.to_lowercase().starts_with("tmux")
+    e.tmux || c.name.to_ascii_lowercase().starts_with("tmux")
 }
 
 /// Is the terminal truecolor? (COLORTERM, DECRQSS echo, or a known modern terminal name)
 pub fn truecolor(c: &Caps, e: &Env) -> bool {
-    let name = c.name.to_lowercase();
+    let name = c.name.to_ascii_lowercase();
     e.colorterm == "truecolor"
         || e.colorterm == "24bit"
         || c.truecolor_echo
@@ -206,7 +206,7 @@ pub fn truecolor(c: &Caps, e: &Env) -> bool {
 }
 
 pub fn choose_mode(c: &Caps, e: &Env, req: Mode) -> (Mode, String) {
-    let name = c.name.to_lowercase();
+    let name = c.name.to_ascii_lowercase();
     let tmux = in_tmux(c, e);
     let screen = e.term.starts_with("screen") && !tmux;
     let colorterm = e.colorterm == "truecolor" || e.colorterm == "24bit";

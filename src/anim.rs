@@ -35,6 +35,68 @@ pub fn spring(x: &mut f32, v: &mut f32, target: f32, dt: f32, w: f32, ex: f32, e
     true
 }
 
+/// An animated quantity (memory view): spring position `x` and velocity `v` towards
+/// `to`, and the number shown `n` following `x` like the core digits (`App::anim_numbers`).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Val {
+    pub x: f32,
+    pub v: f32,
+    pub to: f32,
+    pub n: f32,
+    age: f32,
+}
+
+impl Val {
+    /// New target; other speeds than smooth jump to it.
+    pub fn set(&mut self, to: f32, smooth: bool) {
+        self.to = to;
+        if !smooth {
+            *self = Val {
+                x: to,
+                to,
+                n: to,
+                ..Default::default()
+            };
+        }
+    }
+    /// Spring step (`ex` = exp(-w·dt)); settles within `eps` (+ 0.1 % of the target).
+    pub fn step(&mut self, dt: f32, w: f32, ex: f32, eps: f32) -> bool {
+        spring(
+            &mut self.x,
+            &mut self.v,
+            self.to,
+            dt,
+            w,
+            ex,
+            eps + self.to.abs() * 1e-3,
+        )
+    }
+    /// The shown number: at most 4 changes a second while `x` wanders, every frame
+    /// while it moves faster than half of `full` a second, exactly the target at rest.
+    /// `unit`: the display resolution at the current value.
+    pub fn digits(&mut self, dt: f32, unit: f32, full: f32) -> bool {
+        self.age += dt;
+        let rest = self.v == 0.0 && self.x == self.to;
+        if !(rest || self.v.abs() >= 0.5 * full || self.age >= 0.25) {
+            return false;
+        }
+        let ch = hyst(
+            &mut self.n,
+            self.x,
+            unit.max(1e-9),
+            if rest { 0.0 } else { 1.0 },
+        );
+        if rest && self.n != self.x && (self.n - self.x).abs() < unit {
+            // land on the value itself (the formatter rounds it)
+            self.n = self.x;
+        }
+        if ch {
+            self.age = 0.0;
+        }
+        ch
+    }
+}
+
 /// Digits that follow a moving value: `shown` (a multiple of `unit`) changes only
 /// once `x` is more than (0.5 + h) units away, so a value hovering at a rounding
 /// boundary doesn't flicker, and a moving one counts monotonically. Returns true

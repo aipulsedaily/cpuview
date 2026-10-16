@@ -260,11 +260,15 @@ fn resample(src: &Img, crop: (f64, f64, f64, f64), dw: usize, dh: usize) -> Vec<
         }
     } else {
         for oy in 0..dh {
-            let sy = (y0 + (oy as f64 + 0.5) * fy - 0.5).clamp(0.0, src.h as f64 - 1.0);
+            let sy = (y0 + (oy as f64 + 0.5) * fy - 0.5)
+                .max(0.0)
+                .min(src.h as f64 - 1.0);
             let (iy, ty) = (sy.floor() as usize, (sy - sy.floor()) as f32);
             let iy1 = (iy + 1).min(src.h - 1);
             for ox in 0..dw {
-                let sx = (x0 + (ox as f64 + 0.5) * fx - 0.5).clamp(0.0, src.w as f64 - 1.0);
+                let sx = (x0 + (ox as f64 + 0.5) * fx - 0.5)
+                    .max(0.0)
+                    .min(src.w as f64 - 1.0);
                 let (ix, tx) = (sx.floor() as usize, (sx - sx.floor()) as f32);
                 let ix1 = (ix + 1).min(src.w - 1);
                 let d = (oy * dw + ox) * 3;
@@ -521,7 +525,7 @@ pub fn palette_from(img: &Img) -> ImgPalette {
         h[1] * h[2] * c.1.sqrt()
     };
     let mut vivid = cols.clone();
-    vivid.sort_by(|a, b| vivid_score(b).total_cmp(&vivid_score(a)));
+    crate::sys::isort(&mut vivid, &|a, b| vivid_score(a) > vivid_score(b));
     let acc1 = vivid[0].0;
     let h1 = rgb_to_hsv(acc1)[0];
     let acc2 = vivid[1..]

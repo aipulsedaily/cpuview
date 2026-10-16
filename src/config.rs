@@ -17,6 +17,8 @@ pub struct Config {
     pub sort: usize,
     pub view: usize,
     pub speed: usize,
+    /// 0 CPU, 1 memory & storage
+    pub page: usize,
     pub imgs: Vec<ImgOpt>,
 }
 
@@ -28,6 +30,7 @@ impl Default for Config {
             sort: 0,
             view: 0,
             speed: 0,
+            page: 0,
             imgs: Vec::new(),
         }
     }
@@ -76,7 +79,7 @@ pub fn wallpaper_dirs() -> Vec<PathBuf> {
 }
 
 pub fn is_image_name(n: &str) -> bool {
-    let l = n.to_lowercase();
+    let l = n.to_ascii_lowercase();
     [".png", ".jpg", ".jpeg"].iter().any(|e| l.ends_with(e))
 }
 
@@ -97,7 +100,7 @@ pub fn list_images() -> Vec<(String, PathBuf)> {
             .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
             .filter(|(n, p)| is_image_name(n) && p.is_file() && !n.starts_with('.'))
             .collect();
-        v.sort();
+        crate::sys::isort(&mut v, &|a, b| a.0 < b.0);
         for (n, p) in v {
             if !out.iter().any(|(m, _)| *m == n) {
                 out.push((n, p));
@@ -147,6 +150,7 @@ impl Config {
                 "sort" => c.sort = crate::ui::SORTS.iter().position(|s| *s == v).unwrap_or(0),
                 "view" => c.view = crate::ui::VIEWS.iter().position(|s| *s == v).unwrap_or(0),
                 "speed" => c.speed = crate::ui::speed_index(v),
+                "page" => c.page = (v == "memory") as usize,
                 _ => {
                     // image.<file>.dim / image.<file>.blur
                     if let Some(rest) = k.strip_prefix("image.") {
@@ -196,6 +200,11 @@ impl Config {
         s += &format!("sort = {}\n", crate::ui::SORTS[self.sort]);
         s += &format!("view = {}\n", crate::ui::VIEWS[self.view]);
         s += &format!("speed = {}\n", crate::ui::SPEEDS[self.speed].0);
+        s += if self.page == 1 {
+            "page = memory\n"
+        } else {
+            "page = cpu\n"
+        };
         for o in &self.imgs {
             s += &format!(
                 "image.{}.dim = {}.{}\nimage.{}.blur = {}\n",

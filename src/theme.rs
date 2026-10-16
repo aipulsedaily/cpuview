@@ -165,14 +165,15 @@ impl Theme {
 pub fn builtin_ids() -> Vec<&'static str> {
     // default first, then by label, transparent last (menu order)
     let mut v: Vec<&P> = THEMES.iter().collect();
-    v.sort_by_key(|t| {
+    let key = |t: &&P| {
         let n = t.s("name").unwrap_or("");
         (
             n != "default",
             n == "transparent",
             t.s("label").unwrap_or(n),
         )
-    });
+    };
+    crate::sys::isort(&mut v, &|a, b| key(a) < key(b));
     v.iter().map(|t| t.s("name").unwrap_or("")).collect()
 }
 
