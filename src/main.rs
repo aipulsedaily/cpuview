@@ -726,6 +726,9 @@ impl State {
                     a.mem_retarget(false);
                 }
             }
+            Key::Char('p') if a.mem_visible() => {
+                a.toggle_split();
+            }
             Key::Char('c') => {
                 a.view = (a.view + 1) % 3;
                 self.cfg.view = a.view;
@@ -1410,7 +1413,6 @@ fn main() {
             // 5 s, eco 60 s) only while shown
             let vis = st.app.mem_visible();
             let pvis = st.app.procs_visible();
-            let prows = st.app.ml.procs.h.saturating_sub(3);
             let m = &mut st.app.m;
             let now = term::mono();
             // swap rates: smooth 2.5 times a second, eco every 4 s at most
@@ -1433,14 +1435,21 @@ fn main() {
                     m.last_fs = now;
                     m.refresh_fs();
                 }
-                // processes: a full scan costs ~1 µs a process, so eco does one every
-                // 2 minutes and re-reads just the ones shown every 20 s
-                let gap = if eco { 120 } else { 3 } * SEC;
+                // processes: a full scan (to find newcomers) costs ~1.3 µs a process,
+                // so it runs every 4 s (eco: 2 minutes); the biggest ones are followed
+                // live through their open statm (~1 µs each): 2.5 times a second
+                // (eco: every 10 s)
+                let gap = if eco { 120 } else { 4 } * SEC;
+                let live = if eco { 10 * SEC } else { 2 * SEC / 5 };
                 if pvis && now - m.last_proc >= gap - SEC / 5 {
                     m.scan_procs();
-                } else if pvis && eco && now - m.last_top >= 20 * SEC - SEC / 5 {
+                } else if pvis && now - m.last_top >= live - SEC / 20 {
                     m.last_top = now;
-                    m.refresh_procs(prows);
+                    m.refresh_procs();
+                    // eco: a full scan early when a big newcomer appeared
+                    if eco && m.need_scan() {
+                        m.scan_procs();
+                    }
                 }
             }
             if smooth {

@@ -2,8 +2,9 @@
 
 A btop-style terminal monitor that shows **every core's clock speed and load at once**, grouped
 by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds,
-plus a **Memory & Storage** page (`m`): RAM, swap, disk I/O, filesystems and the biggest
-processes, live. Native Rust, one 0.98 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+plus a **Memory & Storage** page (`m`) written for people who aren't Linux experts: how much
+RAM is in use and whether that's fine, what the disk is doing now and did a minute ago, how full
+each drive is, and which programs use the most memory, live. Native Rust, one 0.98 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -22,10 +23,15 @@ column sits beside the CPU view, so both are visible without switching.
 
 ![Memory & Storage page, 128×45](docs/screenshots/rust-memory-128x45.webp)
 
-*`m`: the Memory & Storage page at 128×45 — RAM as a stacked bar (used · cache · free) with a
-used/cache history, swap with its in/out rates and memory pressure, DIMM temperatures, the NVMe
-drive's read/write rates, IOPS, busy time, temperature and history, every real filesystem, and
-the processes holding the most memory. Captured during a synthetic CPU and disk load.*
+*`m`: the Memory & Storage page at 128×45. Each panel opens with its answer in the title ("RAM
+31% in use · 9.91 of 32.2 GB · plenty free", "disk reading 117 MB/s · writing 15 MB/s · 3%
+busy", "storage system (/) 9% full · 1.59 TB free"), coloured by health. Rows read like the CPU
+view's (label → value → bar → %) with a short plain hint. History charts say "over time", have
+units on the y-axis, "… ago · now" along the bottom and the current value at the right edge: RAM
+in use (with "rising: 18% 1 min ago, 31% now"), and disk activity as stacked columns (reading
+below, writing on top, each column a 2–5 s average) with totals and the peak in words. Then every
+real filesystem, and the programs using the most memory, live. Captured during a synthetic CPU
+and disk load.*
 
 ![4K, 415x105, CPU view with the memory column](docs/screenshots/rust-4k-memory.webp)
 
@@ -77,22 +83,49 @@ terminal.
 
 ### Memory & Storage
 
-- **RAM**: used · cache (buffers + page cache + reclaimable slab) · free as one stacked bar,
-  used / available / cache / free / shared, and a history of used with cache stacked above it.
-  Numbers are what `free` reports (procps-ng 4: used = total − available)
-- **DIMM temperatures** (`spd5118` DDR5 / `jc42` DDR4 sensors), **swap** used of total (file,
-  partition or zram), swap-in / swap-out rates from `/proc/vmstat`, and memory **pressure**
-  (PSI `some avg10`, the share of time tasks stalled waiting for memory)
-- **Disk I/O** per physical disk (no partitions, loop, dm, md or zram devices): read and write
-  MB/s and IOPS, % busy (time with I/O in flight), drive temperature (`nvme` / `drivetemp`), and
-  read / write history graphs that rescale in powers of two
+Made to be read at a glance by someone who isn't a Linux expert: every panel was checked with
+fresh readers who saw only a screenshot and had to answer what it says. Sizes are decimal (1 GB = 10⁹
+bytes, like disk makers and `df -H`; the RAM total reads 32.2 GB on a "32 GB" machine), and
+every rate is in MB/s, so all of them compare directly.
+
+- **One answer per panel**, in its title and coloured by health (green fine, amber watch, red
+  act): RAM "31% in use · 9.91 of 32.2 GB · plenty free" (amber from 80 % in use, or when
+  programs wait for RAM ≥ 5 % of the time, or swap traffic ≥ 1 MB/s with less than 20 %
+  available; red from 90 % / 20 % / 20 MB/s: "getting full", "nearly full", "RAM is tight"); disk
+  "reading 117 MB/s · writing 15 MB/s · 3% busy", or "idle · nothing being read or written";
+  storage "system (/) 9% full · 1.59 TB free" (amber from 90 %, red from 95 %); drive
+  temperature OK / warm (70 °C) / too hot (80 °C), RAM sticks OK / warm (70 °C) / hot (85 °C).
+- **RAM**: in use (what `free` calls used: total − available) with a bar and %, available ("free
+  for programs now"), cache ("files kept for speed, part of available"), swap with a bar and
+  whether it is active ("no activity (fine)", "little activity", "busy 3 MB/s"), "waiting" (PSI
+  `some avg10`: the share of time programs waited for RAM), RAM stick temperatures (`spd5118` /
+  `jc42`). A chart of **RAM in use over time** (0–100 %, a line with a soft fill, no cache slab)
+  says the trend in words: "rising: 18% 1 min ago, 31% now".
+- **Disk activity** (physical disks only: no partitions, loop, dm, md, zram, optical or eMMC boot
+  areas): reading ("programs loading files") and writing ("programs saving files") in MB/s over
+  ~1 s, busy % (time the disk was working), temperature (`nvme` / `drivetemp`) and model. The
+  **disk activity over time** chart is a stacked column chart, not a waveform: each column is
+  the average of 2–5 s (aligned so columns step once per bucket and never change in between),
+  reading below and writing on top in two colours the theme can't make alike, a round MB/s
+  scale (1-2-3-5 steps, 10 MB/s at least, so an idle disk is a flat line labelled "idle"), the
+  current rates at the right edge, and in words: "read 95 GB · written 1.9 GB in the last 2 min ·
+  peak 2731 MB/s 45 s ago · 1 min ago 2650, now 133 MB/s". Three or more disks: one line each and
+  one chart of all of them.
 - **Storage**: every real filesystem once (no tmpfs, snaps, overlays, network mounts or bind
-  duplicates): used / size and use % as `df` computes them, the device, type and free space
-- **Processes** using the most memory (resident set, % of RAM) on larger layouts
-- Small windows stack the panels (memory, disk, storage, processes) and drop history first;
-  from 100 columns the page has two columns; from ≈ 190×36 the column joins the CPU view
-- Same themes, picture backgrounds and smooth animation: bars glide, digits count through the
-  values in between, graphs scroll continuously
+  duplicates): "1.59 TB free", a bar, "9% full" (`df`'s use %), then "system & home · 152 GB used
+  of 1.84 TB · ext4 · device".
+- **Top programs by memory**, live: processes grouped by program ("postgres ×27 613 MB": each
+  process's private memory plus the largest shared part once, since shared libraries and shared
+  memory sit in RAM once); `p` shows each process instead. Rows keep their place unless another
+  is clearly bigger (3 %, 2 MB), and in smooth mode cross-fade when they trade places; sizes
+  count smoothly.
+- Small windows keep the answers and drop charts first: a chart becomes a one-line history with
+  words ("1 min ago ▁▂▃▅ now · rising 19% → 31%", "· peak 2723 MB/s 46 s ago"), storage can
+  shrink to the root filesystem ("+ 2 more"). From 100 columns the page has two columns; from ≈
+  190×36 the column joins the CPU view.
+- Works on any Linux machine: no swap ("swap none · no swap set up"), zram swap ("swap zram"),
+  no sensors (no temperature rows), no PSI (no "waiting" row), NVMe / SATA / HDD / eMMC / virtio,
+  any number of disks and filesystems, long mount paths.
 
 ## Install
 
@@ -119,6 +152,7 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
 | `m` | CPU view ⇄ Memory & Storage page (remembered; `--page cpu\|memory`) |
+| `p` | Memory & Storage: top programs by memory ⇄ each process |
 | `+` / `-` | faster / slower (`=` works as `+`) |
 | `o` | sort cores: number → load → clock |
 | `c` | view: auto → full → compact |
@@ -159,10 +193,13 @@ jumping, on a fixed frame grid.
 - **Digits** count along with their bar (90 → 91 → … → 99), with hysteresis while it moves so a
   value near a rounding edge never flickers; exact once it rests. Totals, CCD figures and
   temperatures (read every second, eased over ~1 s) do the same; colours follow the digits.
-- **Graphs** scroll continuously: history is a curve through the per-second points with the
-  live value at its head, sampled at fixed ages, so every graph, strip and heatmap column slides
-  along a little at a time (15 updates a second, staggered over the frames) and the newest
-  column grows in, instead of jumping a cell every 2 s.
+- **Graphs** keep every per-second point on its own braille dot column and move it one column
+  when the next point arrives; only the newest column is live (the number as shown, held to
+  whole dots, so it can't flicker at a dot's edge). An earlier version slid the points by the
+  sub-second phase, which made every column alternate between a point and the mean of two
+  neighbours once a second: one-point peaks shrank and regrew and one-dot features blinked off
+  and on. Checked frame by frame: no cell changes and returns within 6 frames in 40 s runs at
+  128×45 and 172×40, CPU view and Memory & Storage, Midnight and a picture theme.
 - **Pictures**: sixel/iTerm pixel patches are sent only with full repaints (start, keys,
   resize), never mid-animation; a cell that turns blank in between shows the half-block
   backdrop until then.
@@ -286,31 +323,40 @@ field 1 in nanoseconds), while another workload kept the load average at 1.4–3
 
 | 60 s run | CPU per second | % of one thread | RSS |
 |---|---|---|---|
-| Midnight, CPU view: 128×45 · 172×40 · 415×105 (4K, with the memory column) | 84.9 · 81.1 · 80.2 µs | ≤ 0.0085 % | 3.8 · 3.9 · 4.7 MB |
-| Midnight, Memory & Storage page: 128×45 · 172×40 · 415×105 | 80.3 · 80.0 · 76.2 µs | ≤ 0.0080 % | 4.0 · 4.1 · 4.7 MB |
+| Midnight, CPU view: 128×45 · 415×105 (4K, with the memory column) | 82.1 · 95.8 µs | ≤ 0.0096 % | 3.9 · 4.9 MB |
+| Midnight, Memory & Storage page: 128×45 · 415×105 | 83.5 · 90.6 µs | ≤ 0.0091 % | 4.1 · 4.8 MB |
+| the same, the build before the clearer memory page: CPU view · memory page 128×45 | 82.1 · 82.1 µs (load 2.3) | ≤ 0.0083 % | 4.1 MB |
 | Midnight, the build before the memory page: 128×45 · 172×40 · 415×105 | 83.6 · 82.7 · 77.4 µs | ≤ 0.0084 % | 3.8 · 3.9 · 4.7 MB |
 | Midnight (default), 172×40, earlier builds | 68.6 · 71.3 · 82.1 µs | ≤ 0.0082 % | 3.9 MB |
 | Space · ISS aurora picture (sixel) · Midnight 120×30, earlier build | 73.4 · 63.8 · 73.3 µs | ≤ 0.0073 % | 4.0 · 7.2 · 3.8 MB |
 
-Smooth, 60 s runs with the Memory & Storage page at 128×45 · 172×40: Midnight 2.6 · 2.4 ms/s and
-12 · 13 KB/s, NASA Webb picture (sixel) 2.9 · 2.9 ms/s and 11 · 16 KB/s (CPU view in the same
-session: 2.3 · 2.5 ms/s, 38 · 44 KB/s; 2.2 · 2.9 ms/s, 44 · 36 KB/s); frames stay on the 60 fps
-grid (consecutive frame intervals p95 / median 1.01–1.03, no picture data after the first paint).
+(The rows above were measured while other monitors and builds kept the load average at 3.6–3.8.)
 
-Binary: 981,368 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
+Smooth, 40 s runs at 128×45 · 172×40 under the same load: Memory & Storage page Midnight 3.4 ·
+3.5 ms/s and 7 · 7 KB/s, NASA Webb picture (sixel) 3.2 · 3.3 ms/s and 11 · 10 KB/s; CPU view 3.7 ·
+3.9 ms/s and 66 · 73 KB/s, 4.2 · 4.2 ms/s and 53 · 52 KB/s; frames stay on the 60 fps grid
+(consecutive frame intervals p95 / median 1.03–1.04, ≤ 0.1 % off the grid, no picture data after
+the first paint).
+
+Binary: 979,432 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
 stripped; `"s"` is 13 KB larger and not measurably faster here, `2`/`3` exceed 1 MB). The memory
 page fits in less than before: no float formatting code at all (a non-constant `f32::clamp`
 pulled in ~30 KB of it for its panic message), short lists sorted by one small insertion sort
-instead of std's ~4 KB sort per element type, ASCII lower-casing instead of Unicode tables.
+instead of std's ~4 KB sort per element type, ASCII lower-casing instead of Unicode tables, and
+the picture download runs `curl` through `posix_spawnp` instead of `std::process::Command`
+(~33 KB less).
 
 **Memory & Storage data** is read the same way, with every reading's cost in mind (cold cache,
 this machine): `/proc/meminfo` and each disk's sysfs `stat` (the `/proc/diskstats` counters for
 that disk alone: 0.9 µs instead of 8 µs for the whole table) every sample, every third while
 the page is hidden so the histories keep going; `/proc/vmstat` (swap in/out, 10 µs) and PSI at
 most every 4 s in eco (2.5 times a second in smooth); `statvfs` every 10 s (3 s); the mount table
-only when `poll()` on `/proc/self/mountinfo` reports a change. The process scan costs ~1 µs a
-process, so eco does a full one every 2 minutes and re-reads only the processes shown every
-20 s (3 s at other speeds; kernel threads are remembered and skipped). DIMM (`spd5118`, SMBus)
+only when `poll()` on `/proc/self/mountinfo` reports a change. A full process scan costs ~1.3 µs
+a process (names are read once per pid, kernel threads remembered and skipped), so it runs every
+4 s (eco: 2 minutes); in between the 32 biggest processes are followed live through their open
+`statm` (one `pread`, ~1 µs each) 2.5 times a second (eco: every 10 s), and eco re-scans early
+when RAM in use changes by more than those processes explain or, every 30 s, when a new pid of
+64 MB or more appears. DIMM (`spd5118`, SMBus)
 and NVMe temperatures cost 40–65 µs of CPU and 1–20 ms of *wall* time per read, so a helper
 thread reads them every 60 s in eco (5 s otherwise) and only while they're shown: the main loop
 never waits for a sensor, and smooth frames stay on time.

@@ -236,6 +236,58 @@ fn sanitize(name: &str) -> String {
     }
 }
 
+extern "C" {
+    static environ: *const *mut libc::c_char;
+}
+
+/// Run a program (found on PATH) with stdin, stdout and stderr on /dev/null and an
+/// empty signal mask; returns its exit code (-1 if a signal ended it). posix_spawn
+/// instead of std::process::Command keeps ~15 KB of std out of the binary.
+fn run_quiet(args: &[&str]) -> Result<i32, String> {
+    let cs = args
+        .iter()
+        .map(|a| std::ffi::CString::new(*a).map_err(|_| "bad argument".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut argv: Vec<*mut libc::c_char> = cs.iter().map(|c| c.as_ptr() as *mut _).collect();
+    argv.push(std::ptr::null_mut());
+    unsafe {
+        let mut fa: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        let mut at: libc::posix_spawnattr_t = std::mem::zeroed();
+        libc::posix_spawn_file_actions_init(&mut fa);
+        libc::posix_spawnattr_init(&mut at);
+        for fd in 0..3 {
+            let fl = if fd == 0 {
+                libc::O_RDONLY
+            } else {
+                libc::O_WRONLY
+            };
+            libc::posix_spawn_file_actions_addopen(&mut fa, fd, c"/dev/null".as_ptr(), fl, 0);
+        }
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::posix_spawnattr_setsigmask(&mut at, &none);
+        libc::posix_spawnattr_setflags(&mut at, libc::POSIX_SPAWN_SETSIGMASK as _);
+        let mut pid = 0;
+        let r = libc::posix_spawnp(&mut pid, argv[0], &fa, &at, argv.as_ptr(), environ);
+        libc::posix_spawn_file_actions_destroy(&mut fa);
+        libc::posix_spawnattr_destroy(&mut at);
+        if r != 0 {
+            return Err(std::io::Error::from_raw_os_error(r).to_string());
+        }
+        let mut st = 0;
+        while libc::waitpid(pid, &mut st, 0) < 0 {
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        Ok(if libc::WIFEXITED(st) {
+            libc::WEXITSTATUS(st)
+        } else {
+            -1
+        })
+    }
+}
+
 const MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Copy (path) or download (http/https URL, via curl) a picture into the images
@@ -248,30 +300,27 @@ pub fn import_image(src: &str) -> Result<String, String> {
     let base = if is_url {
         let path = src.split(['?', '#']).next().unwrap_or("");
         let last = path.rsplit('/').next().unwrap_or("");
-        let st = std::process::Command::new("curl")
-            .args([
-                "-fsSL",
-                "--proto",
-                "=http,https",
-                "--proto-redir",
-                "=http,https",
-                "--max-time",
-                "15",
-            ])
-            .args(["--max-filesize", &MAX_BYTES.to_string(), "-o"])
-            .arg(&tmp)
-            .arg(src)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("curl: {e} (is curl installed?)"))?;
-        if !st.success() {
+        let max = MAX_BYTES.to_string();
+        let out = tmp.to_string_lossy();
+        let code = run_quiet(&[
+            "curl",
+            "-fsSL",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            &max,
+            "-o",
+            &out,
+            src,
+        ])
+        .map_err(|e| format!("curl: {e} (is curl installed?)"))?;
+        if code != 0 {
             let _ = std::fs::remove_file(&tmp);
-            return Err(format!(
-                "download failed (curl exit {})",
-                st.code().unwrap_or(-1)
-            ));
+            return Err(format!("download failed (curl exit {code})"));
         }
         last.to_string()
     } else {
@@ -330,6 +379,13 @@ pub fn import_image(src: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawned_programs_report_their_exit_code() {
+        assert_eq!(super::run_quiet(&["true"]), Ok(0));
+        assert_eq!(super::run_quiet(&["sh", "-c", "echo noise; exit 3"]), Ok(3));
+        assert!(super::run_quiet(&["no-such-program-cpuview-test"]).is_err());
+    }
+
     use super::*;
     #[test]
     fn sanitize_names() {

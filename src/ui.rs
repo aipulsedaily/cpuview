@@ -300,6 +300,8 @@ pub const SIDE_W: usize = 190;
 pub const SIDE_H: usize = 36;
 pub const CLK: char = '▂';
 pub const LOAD: char = '▄';
+/// Fill under a history curve: the line colour blended to SOFT/16 into the track.
+const SOFT: u32 = 6;
 
 #[derive(Clone, Copy, Debug)]
 struct Plan {
@@ -756,18 +758,20 @@ impl App {
     pub fn hist_vals(&self, out: &mut Vec<f32>, n: usize, off: f32, step: f32, src: Hist) {
         let s = &self.s;
         let (len, head, part): (usize, f32, f32) = match src {
-            Hist::Tot => (s.h_tot.len(), self.live_totals().0, s.part_tot()),
+            // (smooth: the head is the number as shown, which moves in whole steps
+            // with hysteresis, so the newest column can't flicker between two dots)
+            Hist::Tot => (s.h_tot.len(), self.hy[HY_TOT] / 100.0, s.part_tot()),
             Hist::Avg => {
                 let p =
                     (0..s.fr.len()).map(|i| s.part_f(i)).sum::<f32>() / s.fr.len().max(1) as f32;
-                (s.h_avg.len(), self.ta.0, p)
+                (s.h_avg.len(), self.hy[HY_AVG], p)
             }
-            Hist::Temp(k) => (s.temps[k].hist.len(), self.tt[k].0, s.temps[k].val),
+            Hist::Temp(k) => (s.temps[k].hist.len(), self.hy[HY_TEMP + k], s.temps[k].val),
             Hist::Load(t) => {
                 let k = t.len().max(1) as f32;
                 (
                     t.iter().map(|&c| s.hu[c].len()).min().unwrap_or(0),
-                    t.iter().map(|&c| self.bu[c]).sum::<f32>() / k,
+                    t.iter().map(|&c| self.nu[c]).sum::<f32>() / k,
                     t.iter().map(|&c| s.part_u(c)).sum::<f32>() / k,
                 )
             }
@@ -800,10 +804,9 @@ impl App {
             out.extend((0..have).rev().map(pt));
             return;
         }
+        let _ = part;
         crate::anim::Curve {
-            phase: self.phase,
             head,
-            part,
             len,
             pt: &pt,
             pad: 0.0,
@@ -1544,13 +1547,21 @@ impl App {
         let mem_page = self.page == 1;
         let no_top = !mem_page && self.lay.top.is_none();
         let mi = self.m.mi;
-        let minfo = f!(
-            "   {} RAM · {} swap",
-            bsize(mi.total as f32, false).s(),
-            bsize(mi.swap_total as f32, false).s()
-        );
+        let minfo = if mi.swap_total > 0 {
+            f!(
+                "   RAM {} · swap {}",
+                bsize(mi.total as f32, false).s(),
+                bsize(mi.swap_total as f32, false).s()
+            )
+        } else {
+            f!("   RAM {} · no swap", bsize(mi.total as f32, false).s())
+        };
         let ndk = self.m.disks.len();
-        let dinfo = f!(" · {} disk{}", ndk, if ndk == 1 { "" } else { "s" });
+        let dinfo = match ndk {
+            0 => F::new(),
+            1 => f!(" · 1 disk"),
+            n => f!(" · {} disks", n),
+        };
         let mtitle = ("  memory & storage", t.fg | BOLD);
         let mut left0 = [(short.s(), t.fg | BOLD); 8];
         left0[1..].copy_from_slice(&sum_full);
@@ -1683,11 +1694,21 @@ impl App {
                 }
                 if code != 0 {
                     let mine = dots[2 * i][0] as usize > base || dots[2 * i + 1][0] as usize > base;
+                    // an area, not a slab: cells under the curve's edge (both halves
+                    // go on above) are a soft fill, the edge itself stays bright
+                    let inside = a > base + 4 && b > base + 4;
+                    let c = if !mine {
+                        uc
+                    } else if inside {
+                        col | SOFT << BLEND_SHIFT
+                    } else {
+                        col
+                    };
                     scr.put(
                         x0 + i,
                         y0 + r,
                         char::from_u32(0x2800 + code).unwrap(),
-                        if mine { col } else { uc },
+                        c,
                         bg,
                     );
                 } else if let (Some(k), true) = (grid_bit, i % 2 == 0) {
@@ -1762,9 +1783,15 @@ impl App {
         let pct = num("", u * 100.0, 0, "%");
         let title: [(&str, u32); 2] = [("cpu ", th.title | BOLD), (pct.s(), th.load.at(u) | BOLD)];
         if full {
-            let win = span(2 * ir.w.saturating_sub(5));
-            let sub = f!("total load · last {}", win.s());
-            self.panel(scr, r, &title, sub.s());
+            self.panel(scr, r, &title, "");
+            self.time_axis(
+                scr,
+                r,
+                ir.x + 5,
+                ir.w.saturating_sub(5),
+                2.0,
+                "load over time",
+            );
         } else {
             self.panel_top(scr, r, &title);
         }
@@ -1819,9 +1846,15 @@ impl App {
         ];
         let title = Self::pick(r.w, &vs);
         if full {
-            let win = span(2 * ir.w.saturating_sub(5));
-            let sub = f!("average clock · last {}", win.s());
-            self.panel(scr, r, title, sub.s());
+            self.panel(scr, r, title, "");
+            self.time_axis(
+                scr,
+                r,
+                ir.x + 5,
+                ir.w.saturating_sub(5),
+                2.0,
+                "average clock over time",
+            );
         } else {
             self.panel_top(scr, r, title);
         }
@@ -3490,11 +3523,25 @@ impl App {
             ('t', "theme", Some("theme"), "t"),
             ('\0', "select", None, "←↑↓→"),
         ];
-        let mem_keys: [(char, &str, Option<&str>, &str); 5] = [
+        let mem_keys: [(char, &str, Option<&str>, &str); 6] = [
             cpu_keys[0],
             cpu_keys[1],
             cpu_keys[2],
             ('m', "cpu view", Some("cpu"), "m"),
+            (
+                'p',
+                if self.ma.split {
+                    "by program"
+                } else {
+                    "each process"
+                },
+                Some(if self.ma.split {
+                    "programs"
+                } else {
+                    "processes"
+                }),
+                "p",
+            ),
             ('t', "theme", Some("theme"), "t"),
         ];
         let keys: &[(char, &str, Option<&str>, &str)] =
@@ -3714,6 +3761,140 @@ mod tests {
         }
     }
 
+    fn screen_text(scr: &Screen) -> String {
+        let mut t = String::new();
+        for y in 0..scr.h {
+            for x in 0..scr.w {
+                t.push(scr.buf[y * scr.w + x].ch);
+            }
+            t.push('\n');
+        }
+        t
+    }
+
+    /// Memory page text at `w` × `h` for a machine set up by `f`.
+    fn mem_text(w: usize, h: usize, page: usize, f: &dyn Fn(&mut crate::mem::Mem)) -> String {
+        let mut a = app(16, 2, 2);
+        f(&mut a.m);
+        a.page = page;
+        a.first_size(w, h);
+        a.mem_retarget(false);
+        let mut scr = Screen::new(w, h);
+        a.draw(&mut scr, true);
+        a.draw(&mut scr, false);
+        let t = screen_text(&scr);
+        assert!(!t.contains("NaN") && !t.contains("inf"), "{w}x{h}\n{t}");
+        t
+    }
+
+    #[test]
+    fn memory_page_adapts_to_any_machine() {
+        use crate::mem::Mem;
+        let sizes = [
+            (128, 45, 1),
+            (80, 24, 1),
+            (60, 20, 1),
+            (205, 50, 0),
+            (40, 12, 1),
+        ];
+        // no swap
+        for &(w, h, p) in &sizes {
+            let t = mem_text(w, h, p, &|m| {
+                m.mi.swap_total = 0;
+                m.mi.swap_free = 0;
+            });
+            if w >= 80 {
+                assert!(t.contains("no swap set up"), "{w}x{h}\n{t}");
+            }
+        }
+        // zram swap
+        let t = mem_text(128, 45, 1, &|m| m.zram = true);
+        assert!(t.contains("swap zram"), "{t}");
+        // six disks: one line each and one chart for all of them
+        let t = mem_text(128, 45, 1, &|m| *m = Mem::fake(6, 3, 24));
+        assert!(t.contains("nvme5n1") && t.contains("all disks"), "{t}");
+        for &(w, h, p) in &sizes {
+            mem_text(w, h, p, &|m| *m = Mem::fake(6, 9, 24));
+        }
+        // HDD only, no sensors at all: no temperatures, the drive's model instead
+        let hdd = |m: &mut Mem| {
+            *m = Mem::fake(1, 2, 12);
+            m.disks[0].name = "sda".into();
+            m.disks[0].model = "WDC WD40EFRX-68N32N0".into();
+            m.disks[0].size = 4_000_787_030_016;
+        };
+        for &(w, h, p) in &sizes {
+            let t = mem_text(w, h, p, &hdd);
+            if p == 1 {
+                assert!(!t.contains("°C"), "{w}x{h}\n{t}");
+            }
+        }
+        assert!(mem_text(128, 45, 1, &hdd).contains("WDC WD40EFRX"));
+        // a VM: virtio disk, no sensors, no pressure information, one filesystem
+        let vm = |m: &mut Mem| {
+            *m = Mem::fake(1, 1, 6);
+            m.disks[0].name = "vda".into();
+            m.disks[0].model = String::new();
+            m.has_psi = false;
+            m.mi.swap_total = 0;
+            m.mi.swap_free = 0;
+        };
+        for &(w, h, p) in &sizes {
+            let t = mem_text(w, h, p, &vm);
+            if p == 1 {
+                assert!(!t.contains("waiting") && !t.contains("°C"), "{w}x{h}\n{t}");
+            }
+        }
+        // no disks at all (containers): memory, storage and programs only
+        for &(w, h, p) in &sizes {
+            mem_text(w, h, p, &|m| *m = Mem::fake(0, 1, 6));
+        }
+        // a very long mount path is cut to fit
+        let t = mem_text(80, 24, 1, &|m| {
+            m.fs[1].mnt = "/srv/a/very/long/mount/point/for/the/media/library/2024".into()
+        });
+        assert!(t.lines().all(|l| l.chars().count() == 80));
+        assert!(crate::mem::swaps_zram(
+            "Filename Type Size Used Priority\n/dev/zram0 partition 8388604 0 100\n"
+        ));
+        assert!(!crate::mem::swaps_zram(
+            "Filename Type Size Used Priority\n/swap.img file 8388604 0 -2\n"
+        ));
+        assert!(!crate::mem::swaps_zram(
+            "Filename Type Size Used Priority\n"
+        ));
+    }
+
+    /// `cargo test --release dump_mem_fixtures -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_mem_fixtures() {
+        use crate::mem::Mem;
+        let w: usize = std::env::var("W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let h: usize = std::env::var("H")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(45);
+        type Fx<'a> = (&'a str, &'a dyn Fn(&mut Mem));
+        let fx: [Fx; 3] = [
+            ("6 disks", &|m: &mut Mem| *m = Mem::fake(6, 9, 24)),
+            ("vm", &|m: &mut Mem| {
+                *m = Mem::fake(1, 1, 6);
+                m.disks[0].name = "vda".into();
+                m.has_psi = false;
+                m.mi.swap_total = 0;
+                m.mi.swap_free = 0;
+            }),
+            ("none", &|m: &mut Mem| *m = Mem::fake(0, 1, 6)),
+        ];
+        for (n, f) in fx {
+            eprintln!("── {n}\n{}", mem_text(w, h, 1, f));
+        }
+    }
+
     #[test]
     fn memory_values_glide_in_smooth_mode() {
         let mut a = app(16, 2, 2);
@@ -3768,7 +3949,7 @@ mod tests {
                 a.lay.nrows,
                 a.lay.vis_rows
             );
-            assert_eq!(a.lay.cols * a.lay.nrows >= 16, true);
+            assert!(a.lay.cols * a.lay.nrows >= 16);
         }
         // 172x40 = graphs + cores + detail (one CCD per column); the detail area takes a
         // row from the graphs so the all-core heatmap (8 rows + borders) fits
@@ -3920,11 +4101,22 @@ mod tests {
         a.speed = SMOOTH;
         a.bars_snap();
         a.bu.iter_mut().for_each(|u| *u = 0.9);
+        a.anim_numbers(1.0); // (the head is the number as shown)
         a.phase = 0.5;
         a.hist_vals(&mut v, 4, 0.0, 1.0, Hist::Tot);
         assert!((v[3] - 0.9).abs() < 1e-6, "{v:?}"); // age 0: live
         assert!((v[2] - 0.3).abs() < 1e-6, "{v:?}"); // age 1: newest point
-                                                     // strips / heatmap cells: means over 2 s
+                                                     // the stored points don't move with the sub-second phase (no "breathing":
+                                                     // a one-point peak never shrinks between two columns and regrows)
+        a.s.h_tot.push(0.9);
+        let mut w = Vec::new();
+        for ph in [0.0, 0.3, 0.7, 1.0] {
+            a.phase = ph;
+            a.hist_vals(&mut w, 6, 0.0, 1.0, Hist::Tot);
+            assert_eq!(&w[..5], &[0.3, 0.3, 0.3, 0.3, 0.9], "phase {ph}");
+        }
+        a.phase = 0.5;
+        // strips / heatmap cells: means over 2 s
         let thr = a.s.t.groups[0].clone();
         let mut c = Vec::new();
         let have = a.cells_smooth(&mut c, 6, &thr);
