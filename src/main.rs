@@ -9,6 +9,7 @@ mod image;
 mod input;
 mod mem;
 mod menu;
+mod net;
 mod probe;
 mod prof;
 mod screen;
@@ -28,7 +29,8 @@ use ui::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
-memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes)
+memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes) and a
+network & system page (link speeds, ports, connections, containers, services)
 
 usage: cpuview [options]
 
@@ -41,15 +43,16 @@ usage: cpuview [options]
                         smooth (10 samples/s, everything animated at a steady
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
-  --page PAGE           start on: cpu, or memory (RAM, swap, disks, filesystems)
+  --page PAGE           start on: cpu, memory (RAM, swap, disks, filesystems),
+                        network (links, ports, containers, services) or processes
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
   -V, --version         version
 
-keys: arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
-      o sort · c view · g graphs · d/enter detail · r reset peaks · space pause
-      t themes · q quit
+keys: 1 2 3 4 / tab / shift-tab pages · m cpu ⇄ memory · arrows/hjkl/click select
+      s speed (+ faster, - slower) · o sort · c view · g graphs · d/enter detail
+      r reset peaks · space pause · t themes · q quit
 ";
 
 const OUT: i32 = 1;
@@ -421,7 +424,7 @@ impl State {
                 rects.push((S_PANEL, d));
             }
         }
-        for r in self.app.ml.rects() {
+        for r in self.app.ml.rects().into_iter().chain(self.app.nl.rects()) {
             if r.w > 0 && r.h > 0 {
                 rects.push((S_PANEL, r));
             }
@@ -711,11 +714,21 @@ impl State {
                 self.cfg.save();
                 a.fit(a.w, a.h); // CCD divider rows exist only in core order
             }
-            Key::Char('m') => {
-                a.page = 1 - a.page;
+            // pages: 1-4, Tab / Shift-Tab; m toggles CPU ⇄ memory
+            Key::Char('m') | Key::Char('1'..='4') | Key::Tab | Key::BackTab => {
+                a.page = match key {
+                    Key::Char('m') => (a.page != 1) as usize,
+                    Key::Char(c) => c as usize - '1' as usize,
+                    Key::Tab => (a.page + 1) % ui::PAGES.len(),
+                    _ => (a.page + ui::PAGES.len() - 1) % ui::PAGES.len(),
+                };
                 self.cfg.page = a.page;
                 self.cfg.save();
                 a.fit(a.w, a.h);
+                if a.page == 2 {
+                    a.n.enter(term::mono());
+                    a.net_retarget(false);
+                }
                 if a.mem_visible() {
                     // fresh numbers for what just appeared (outside the eco budget:
                     // input handling isn't charged)
@@ -1045,7 +1058,11 @@ fn main() {
                 page_arg = Some(match v.as_str() {
                     "cpu" => 0,
                     "memory" | "mem" | "storage" => 1,
-                    _ => die(&format!("unknown page: {v} (cpu or memory)")),
+                    "network" | "net" | "system" => 2,
+                    "processes" | "proc" => 3,
+                    _ => die(&format!(
+                        "unknown page: {v} (cpu, memory, network or processes)"
+                    )),
                 });
             }
             "--image-mode" => {
@@ -1147,6 +1164,7 @@ fn main() {
     let (t, img) = load_theme(&cfg.theme, &cfg).unwrap_or((theme0, None));
     let mut app = App::new(sampler, t);
     app.m = mem::Mem::new();
+    app.n = net::Net::new();
     app.page = cfg.page;
     app.sort = cfg.sort;
     app.view = cfg.view;
@@ -1168,6 +1186,9 @@ fn main() {
     st.app.first_size(cols as usize, rows as usize);
     if st.app.procs_visible() {
         st.app.m.scan_procs();
+    }
+    if st.app.page == 2 {
+        st.app.n.enter(term::mono());
     }
     st.rebuild(img);
     update_clock(&mut st.app);
@@ -1236,6 +1257,7 @@ fn main() {
     let mut fps = fps0;
     let mut fcount = 0u64;
     let mut resort = false;
+    let (mut cpu_held, mut cpu_skip) = (0u32, false);
     let mut settled = false; // smooth, paused and at rest: no frames
     let (mut sm_cpu, mut sm_avg) = (term::cpu_ns(), 0i64);
     let mut buf = [0u8; 4096];
@@ -1403,7 +1425,15 @@ fn main() {
             }
             // smooth: clocks 5 times a second, numbers / order 2.5 times
             let clocks = !smooth || tick % 2 == 0;
-            prof(0, || st.app.s.sample(push, clocks));
+            // the network page shows no CPU numbers: the CPU sampler runs every other
+            // sample there (eco; other speeds twice a second), its histories get the
+            // seconds in between from the next one
+            cpu_held += push;
+            cpu_skip = st.app.page == 2 && (if eco { !cpu_skip } else { tick % 5 != 0 });
+            if !cpu_skip {
+                let push = std::mem::take(&mut cpu_held);
+                prof(0, || st.app.s.sample(push, clocks));
+            }
             // memory & storage: memory and disks every sample (cheap, their histories
             // keep going); swap rates and pressure, filesystems (every 3 s, eco 10 s),
             // processes (below) and the DIMM / drive temperatures (helper thread, every
@@ -1443,6 +1473,9 @@ fn main() {
                     m.refresh_procs(prows);
                 }
             }
+            // network & system: links every sample while shown (every 10 s hidden, to
+            // keep their history), the rest on its own spread-out schedule (net::tick)
+            st.app.n.tick(now, push, st.app.page == 2, eco);
             if smooth {
                 if tick % 4 == 0 {
                     st.app.s.publish();

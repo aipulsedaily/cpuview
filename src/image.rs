@@ -354,8 +354,21 @@ pub fn median_cut(px: &[[u8; 3]], k: usize, iters: usize) -> (Vec<[f32; 3]>, Vec
             }
         }
         let Some((_, bi, c)) = best else { break };
-        let mut b = boxes.swap_remove(bi);
-        b.sort_unstable_by_key(|p| p[c]);
+        let b = boxes.swap_remove(bi);
+        // counting sort by the channel (linear, and ~4 KB less code than sort_unstable)
+        let mut at = [0usize; 257];
+        for p in &b {
+            at[p[c] as usize + 1] += 1;
+        }
+        for i in 1..257 {
+            at[i] += at[i - 1];
+        }
+        let mut s = vec![[0u8; 3]; b.len()];
+        for p in &b {
+            s[at[p[c] as usize]] = *p;
+            at[p[c] as usize] += 1;
+        }
+        let mut b = s;
         let hi = b.split_off(b.len() / 2);
         boxes.push(b);
         boxes.push(hi);

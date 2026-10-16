@@ -2,8 +2,9 @@
 
 A btop-style terminal monitor that shows **every core's clock speed and load at once**, grouped
 by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds,
-plus a **Memory & Storage** page (`m`): RAM, swap, disk I/O, filesystems and the biggest
-processes, live. Native Rust, one 0.98 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+plus a **Memory & Storage** page (`m` or `2`): RAM, swap, disk I/O, filesystems and the
+biggest processes, and a **Network & System** page (`3`): download / upload per link with a
+rate-over-time chart, listening ports and who owns them, connections, containers and services, live. Native Rust, one 1.03 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -26,6 +27,15 @@ column sits beside the CPU view, so both are visible without switching.
 used/cache history, swap with its in/out rates and memory pressure, DIMM temperatures, the NVMe
 drive's read/write rates, IOPS, busy time, temperature and history, every real filesystem, and
 the processes holding the most memory. Captured during a synthetic CPU and disk load.*
+
+![Network & System page, 128×45](docs/screenshots/rust-network-128x45.webp)
+
+*`3`: the Network & System page at 128×45 — the wired link's download and upload now, its
+speed, address and totals since boot, the links that aren't connected and the virtual ones;
+download and upload over the last 2½ minutes (here a 2.5 MB/s burst about 1–2 minutes ago);
+connection counts, the listening ports with what they listen on and the program or container
+behind them, the busiest remote ends; the Docker containers' CPU, memory and network; what the
+logged-in users run and the busiest / biggest systemd services.*
 
 ![4K, 415x105, CPU view with the memory column](docs/screenshots/rust-4k-memory.webp)
 
@@ -94,6 +104,45 @@ terminal.
 - Same themes, picture backgrounds and smooth animation: bars glide, digits count through the
   values in between, graphs scroll continuously
 
+### Network & System
+
+Everything is detected at run time; what a machine doesn't have simply isn't shown (no Docker,
+no systemd, no Wi-Fi...). No root needed, no extra packages.
+
+- **Links**: each physical link (wired, Wi-Fi), VPN / tunnel (WireGuard, Tailscale, tun, PPP),
+  bond and VLAN: download and upload now in plain words, link speed, address (netlink, global
+  ones first), totals since boot, Wi-Fi signal (`/proc/net/wireless`, "weak" in amber), and
+  errors / drops only when there are any — in amber only while they are growing. Links that
+  are down share one line; bridges and veths (`docker0`, `br-…`, container links) one more.
+  Inside a container or VM without a physical link, its virtual links are the network.
+- **Over time**: download and upload as two column charts (each column a few seconds' mean)
+  with a time axis ("2m ago … 1m ago … now"), round y-axis ticks in B/s · kB/s · MB/s, the
+  value now in each chart's title, and a legend. "Right now" values are horizontal bars and
+  numbers; "over time" is always a chart with a time axis.
+- **Connections & ports**: open connections and those closed in the last minute (TIME_WAIT),
+  from `/proc/net/snmp` and `/proc/net/sockstat` (constant cost); the listening TCP / UDP ports
+  (sock_diag netlink, listening sockets only), merged per port, with where they listen (all
+  addresses, this computer only, one address) and who owns them: the container that publishes
+  the port (Docker / Podman API), else the program (socket inode → `/proc/<pid>/fd`, looked up
+  a few processes per sample and only for sockets you may see; `?` otherwise), else the systemd
+  unit or cgroup the socket was opened in (its cgroup id, readable without root); and the remote
+  ends with the most connections, named when they are a container or a local program.
+- **Containers** (only if there are any): Docker, Podman (rootful and rootless), LXC,
+  systemd-nspawn / libvirt machines and Kubernetes pods, found in the cgroup tree (v2, or v1
+  with the cgroupfs or systemd driver). Per container: CPU (100 % = one core, as `docker stats`),
+  memory (less inactive page cache, as `docker stats`), network in / out from a member process's
+  `/proc/<pid>/net/dev` ("host network" when it shares the host's), sorted by CPU. Names, state
+  and health ("healthy" / "starting" / "unhealthy" in red, "restarting" in amber) from the
+  Docker or Podman API over its unix socket (one `GET /containers/json`, parsed by a small
+  field extractor), else Docker's `config.v2.json` when readable, else the short id.
+- **Services** (only if there are any): systemd services (`system.slice/*.service`) or OpenRC
+  services (`openrc.*` cgroups): the busiest by CPU and the biggest by memory, plus everything the
+  logged-in users run (`user.slice`) on its own line. No failed-unit count: that needs D-Bus.
+- Lists keep their order until an item clearly overtakes the one above it, and rows slide to
+  their new places in smooth mode; numbers count, bars glide and the charts scroll there too.
+- 40×12 shows the link's rates and the container count; from 100 columns the page has two
+  columns, from 240 three.
+
 ## Install
 
 Needs a Rust toolchain (<https://rustup.rs>) on Linux.
@@ -118,7 +167,9 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 |---|---|
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
-| `m` | CPU view ⇄ Memory & Storage page (remembered; `--page cpu\|memory`) |
+| `1` `2` `3` `4` | page: CPU · Memory & Storage · Network & System · Processes (remembered; `--page cpu\|memory\|network\|processes`); the footer's tabs are clickable |
+| `tab` / `shift-tab` | next / previous page |
+| `m` | CPU view ⇄ Memory & Storage page |
 | `+` / `-` | faster / slower (`=` works as `+`) |
 | `o` | sort cores: number → load → clock |
 | `c` | view: auto → full → compact |
@@ -297,7 +348,7 @@ Smooth, 60 s runs with the Memory & Storage page at 128×45 · 172×40: Midnight
 session: 2.3 · 2.5 ms/s, 38 · 44 KB/s; 2.2 · 2.9 ms/s, 44 · 36 KB/s); frames stay on the 60 fps
 grid (consecutive frame intervals p95 / median 1.01–1.03, no picture data after the first paint).
 
-Binary: 981,368 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
+Binary: 1,033,464 bytes with the network page (981,368 before it; `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
 stripped; `"s"` is 13 KB larger and not measurably faster here, `2`/`3` exceed 1 MB). The memory
 page fits in less than before: no float formatting code at all (a non-constant `f32::clamp`
 pulled in ~30 KB of it for its panic message), short lists sorted by one small insertion sort
@@ -314,6 +365,39 @@ process, so eco does a full one every 2 minutes and re-reads only the processes 
 and NVMe temperatures cost 40–65 µs of CPU and 1–20 ms of *wall* time per read, so a helper
 thread reads them every 60 s in eco (5 s otherwise) and only while they're shown: the main loop
 never waits for a sensor, and smooth frames stay on time.
+
+**Network & System data** costs what the machine makes it cost, so it is read as rarely as
+it can be. `/proc/net/dev` (40–55 µs here: the r8169 driver fetches the NIC's hardware
+counters on every read, and sysfs `statistics/*` cost the same per file) once per sample while
+the page is shown, every 10 s while it is hidden (the history keeps going), 5 times a second
+in smooth. Connection counts come from `/proc/net/snmp` and `/proc/net/sockstat` (constant
+cost, every 4 s in eco); listening sockets from a sock_diag dump limited to listening sockets
+(7 µs; every 15 s in eco, 5 s otherwise). Anything that lists *all* connections walks the
+kernel's whole connection hash table — 3.8 ms here through sock_diag, 0.3 ms through
+`/proc/net/tcp` — so the busiest remote ends use `/proc/net/tcp`, only for an address family
+that has non-listening sockets, every 60 s in eco (15 s otherwise). Containers' CPU and network
+every 10 s in eco (once a second otherwise), their memory every other time; services every 30 s
+(2 s); the cgroup walk for containers and services every 20 s (10 s), reading only the branches
+that can hold them; the Docker / Podman API every 60 s (30 s) or when a new container appears;
+links and addresses every 60 s (30 s) or when the interface list changes. In eco at most one of
+these runs per sample (the most overdue), so no wakeup costs much; finding which program owns
+a port looks through `/proc/*/fd` a few dozen processes per sample, and only when a port of
+yours appears that isn't known yet. While the page is shown no CPU numbers are visible, so the
+CPU sampler runs every other sample there (twice a second in smooth). Eco on this page updates
+every ~3–5 s (the NIC read and the cold caches of a busy machine are most of a sample).
+
+| network page, 60 s runs (load 3–7 from other work) | CPU per second | output | RSS |
+|---|---|---|---|
+| eco 128×45 · 415×105 | 68 · 51 µs | 0.2 · 0.8 KB/s | 4.1 · 5.0 MB |
+| smooth 128×45 · 172×40 | 2.9 · 2.9 ms | 12 · 14 KB/s | 4.1 MB |
+
+Smooth frames on the network page stay on the 60 fps grid as on the other pages (consecutive
+frame intervals p95 / median 1.08; the Memory & Storage page measured 1.08 in the same session).
+Download / upload rates match `/proc/net/dev` deltas over the same second within 0.5 % (a
+2.5 MB/s ping flood), container memory matches `docker stats`, listening ports and their
+owners match `ss -ltnup` (run as root). The binary grew by 52 KB for the page; to make room,
+image downloads start `curl` with `posix_spawn` instead of `std::process::Command` (−16 KB with
+its dependencies) and the palette's median cut sorts by one channel with a counting sort.
 
 What makes that possible:
 

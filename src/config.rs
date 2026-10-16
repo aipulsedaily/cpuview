@@ -17,7 +17,7 @@ pub struct Config {
     pub sort: usize,
     pub view: usize,
     pub speed: usize,
-    /// 0 CPU, 1 memory & storage
+    /// index into ui::PAGES (0 CPU, 1 memory & storage, 2 network & system, 3 processes)
     pub page: usize,
     pub imgs: Vec<ImgOpt>,
 }
@@ -150,7 +150,7 @@ impl Config {
                 "sort" => c.sort = crate::ui::SORTS.iter().position(|s| *s == v).unwrap_or(0),
                 "view" => c.view = crate::ui::VIEWS.iter().position(|s| *s == v).unwrap_or(0),
                 "speed" => c.speed = crate::ui::speed_index(v),
-                "page" => c.page = (v == "memory") as usize,
+                "page" => c.page = crate::ui::PAGES.iter().position(|p| *p == v).unwrap_or(0),
                 _ => {
                     // image.<file>.dim / image.<file>.blur
                     if let Some(rest) = k.strip_prefix("image.") {
@@ -200,11 +200,7 @@ impl Config {
         s += &format!("sort = {}\n", crate::ui::SORTS[self.sort]);
         s += &format!("view = {}\n", crate::ui::VIEWS[self.view]);
         s += &format!("speed = {}\n", crate::ui::SPEEDS[self.speed].0);
-        s += if self.page == 1 {
-            "page = memory\n"
-        } else {
-            "page = cpu\n"
-        };
+        s += &format!("page = {}\n", crate::ui::PAGES[self.page.min(3)]);
         for o in &self.imgs {
             s += &format!(
                 "image.{}.dim = {}.{}\nimage.{}.blur = {}\n",
@@ -238,6 +234,59 @@ fn sanitize(name: &str) -> String {
 
 const MAX_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Run a program (found on PATH) with stdin / stdout / stderr on /dev/null and the
+/// signal mask cleared; its exit status (-1: killed). posix_spawn instead of
+/// std::process::Command, which costs ~16 KB of code.
+fn run_quiet(argv: &[&str]) -> Result<i32, String> {
+    use std::ffi::CString;
+    let c: Vec<CString> = argv
+        .iter()
+        .map(|a| CString::new(*a).map_err(|_| "bad argument".to_string()))
+        .collect::<Result<_, _>>()?;
+    let mut p: Vec<*mut libc::c_char> = c.iter().map(|s| s.as_ptr() as *mut _).collect();
+    p.push(std::ptr::null_mut());
+    extern "C" {
+        static environ: *const *mut libc::c_char;
+    }
+    unsafe {
+        let mut fa: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        let mut at: libc::posix_spawnattr_t = std::mem::zeroed();
+        libc::posix_spawn_file_actions_init(&mut fa);
+        for fd in 0..3 {
+            libc::posix_spawn_file_actions_addopen(
+                &mut fa,
+                fd,
+                c"/dev/null".as_ptr(),
+                libc::O_RDWR,
+                0,
+            );
+        }
+        libc::posix_spawnattr_init(&mut at);
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::posix_spawnattr_setsigmask(&mut at, &none);
+        libc::posix_spawnattr_setflags(&mut at, libc::POSIX_SPAWN_SETSIGMASK as _);
+        let mut pid = 0;
+        let r = libc::posix_spawnp(&mut pid, p[0], &fa, &at, p.as_ptr(), environ);
+        libc::posix_spawn_file_actions_destroy(&mut fa);
+        libc::posix_spawnattr_destroy(&mut at);
+        if r != 0 {
+            return Err(std::io::Error::from_raw_os_error(r).to_string());
+        }
+        let mut st = 0;
+        while libc::waitpid(pid, &mut st, 0) < 0 {
+            if *libc::__errno_location() != libc::EINTR {
+                return Err("wait failed".into());
+            }
+        }
+        Ok(if libc::WIFEXITED(st) {
+            libc::WEXITSTATUS(st)
+        } else {
+            -1
+        })
+    }
+}
+
 /// Copy (path) or download (http/https URL, via curl) a picture into the images
 /// folder after checking that it decodes. Returns the stored file name.
 pub fn import_image(src: &str) -> Result<String, String> {
@@ -248,30 +297,27 @@ pub fn import_image(src: &str) -> Result<String, String> {
     let base = if is_url {
         let path = src.split(['?', '#']).next().unwrap_or("");
         let last = path.rsplit('/').next().unwrap_or("");
-        let st = std::process::Command::new("curl")
-            .args([
-                "-fsSL",
-                "--proto",
-                "=http,https",
-                "--proto-redir",
-                "=http,https",
-                "--max-time",
-                "15",
-            ])
-            .args(["--max-filesize", &MAX_BYTES.to_string(), "-o"])
-            .arg(&tmp)
-            .arg(src)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("curl: {e} (is curl installed?)"))?;
-        if !st.success() {
+        let max = MAX_BYTES.to_string();
+        let t = tmp.to_string_lossy();
+        let st = run_quiet(&[
+            "curl",
+            "-fsSL",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            &max,
+            "-o",
+            &t,
+            src,
+        ])
+        .map_err(|e| format!("curl: {e} (is curl installed?)"))?;
+        if st != 0 {
             let _ = std::fs::remove_file(&tmp);
-            return Err(format!(
-                "download failed (curl exit {})",
-                st.code().unwrap_or(-1)
-            ));
+            return Err(format!("download failed (curl exit {st})"));
         }
         last.to_string()
     } else {
