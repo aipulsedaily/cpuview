@@ -13,6 +13,10 @@ pub use memui::*;
 #[path = "procui.rs"]
 mod procui;
 pub use procui::*;
+// view 3: network & system
+#[path = "netui.rs"]
+mod netui;
+pub use netui::*;
 
 const SLOT_TITLE: usize = 0;
 const SLOT_GLOAD: usize = 1;
@@ -152,6 +156,8 @@ pub struct F {
     pub n: usize,
 }
 impl F {
+    // (not inlined: zeroing the buffer at every call site costs ~6 KB of code)
+    #[inline(never)]
     pub fn new() -> F {
         F { b: [0; 120], n: 0 }
     }
@@ -410,6 +416,11 @@ pub struct App {
     pub ml: MemLay,
     ma: MA,
     mcache: Vec<u64>,
+    /// network & system page: data, layout, animation, memo
+    pub n: crate::net::Net,
+    pub nl: NetLay,
+    nv: NA,
+    ncache: Vec<u64>,
     /// view 4: processes (procui.rs)
     pub pv: PV,
     /// colour of the series in `vals2` that `graph` draws under its own (0: none)
@@ -489,6 +500,10 @@ impl App {
             ml: MemLay::default(),
             ma: MA::default(),
             mcache: Vec::new(),
+            n: crate::net::Net::empty(),
+            nl: NetLay::default(),
+            nv: NA::default(),
+            ncache: Vec::new(),
             pv: PV::new(),
             under: std::cell::Cell::new(0),
         }
@@ -545,6 +560,7 @@ impl App {
         self.na.clear();
         self.anim_numbers(1.0);
         self.mem_retarget(false);
+        self.net_retarget(false);
     }
 
     /// Smooth mode, after a sample: the bars' new targets.
@@ -567,6 +583,7 @@ impl App {
             db(&mut self.tu[i], self.s.ur[i].clamp(0.0, 1.0), DEADBAND_U);
         }
         self.mem_retarget(true);
+        self.net_retarget(true);
     }
 
     /// Smooth mode: advance every spring by `dt` s. Returns whether anything moves.
@@ -607,7 +624,7 @@ impl App {
         }
         let ta = &mut self.ta;
         moving |= spring(&mut ta.0, &mut ta.1, self.s.avg_r, dt, W_CLOCK, xf, 1.0);
-        moving | self.mem_step(dt) | self.proc_step(dt)
+        moving | self.mem_step(dt) | self.proc_step(dt) | self.net_step(dt)
     }
 
     /// Smooth mode: the digits follow the moving values (with hysteresis, see
@@ -921,10 +938,14 @@ impl App {
             self.ml = self.mem_layout(area, w >= 100 && area.h >= 20);
             return;
         }
-        // views 3 (network, placeholder) and 4 (processes, procui.rs)
+        // views 3 (network, netui.rs) and 4 (processes, procui.rs)
         self.pv.lay = PLay::default();
+        self.nl = NetLay::default();
         if self.page == PG_NET || self.page == PG_PROC {
             self.fit_cpu(w, h);
+            if self.page == PG_NET {
+                self.nl = self.net_layout(area);
+            }
             if self.page == PG_PROC {
                 self.proc_layout(area);
                 if self.pv.d.is_some() {
@@ -1249,11 +1270,14 @@ impl App {
             if self.page == PG_PROC {
                 self.draw_proc_page(scr, false, true);
             }
+            if self.page == PG_NET {
+                self.draw_net(scr, false, false);
+            }
         }
     }
 
     pub fn draw(&mut self, scr: &mut Screen, full: bool) {
-        let full = full || self.menu.is_some();
+        let full = full || self.menu.is_some() || self.net_refit();
         if !self.paused && !self.anim {
             prof(13, || {
                 self.prev_order.clone_from(&self.order);
@@ -1350,7 +1374,7 @@ impl App {
         if self.page == PG_PROC {
             prof(15, || self.draw_proc_page(scr, full, false));
         } else if self.page == PG_NET {
-            self.draw_net_placeholder(scr, full);
+            prof(15, || self.draw_net(scr, full, true));
         }
         if full {
             self.draw_keys(scr);
@@ -1589,6 +1613,11 @@ impl App {
             0 => F::new(),
             1 => f!(" · 1 disk"),
             n => f!(" · {} disks", n),
+        };
+        let (minfo, dinfo) = if self.page == PG_NET {
+            self.net_info()
+        } else {
+            (minfo, dinfo)
         };
         let mtitle = (
             match self.page {

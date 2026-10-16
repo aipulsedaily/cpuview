@@ -1073,19 +1073,16 @@ impl App {
     }
 
     /// Panels the page draws (kitty glass placements).
-    pub fn page_rects(&self) -> [Rect; 2] {
+    pub fn page_rects(&self) -> [Rect; 4] {
         match self.page {
-            PG_PROC => [self.pv.lay.table, self.pv.lay.detail],
-            PG_NET => [
-                Rect {
-                    x: 0,
-                    y: 1,
-                    w: self.w,
-                    h: self.h.saturating_sub(2),
-                },
+            PG_PROC => [
+                self.pv.lay.table,
+                self.pv.lay.detail,
+                Rect::default(),
                 Rect::default(),
             ],
-            _ => [Rect::default(); 2],
+            PG_NET => self.nl.rects(),
+            _ => [Rect::default(); 4],
         }
     }
 
@@ -2376,25 +2373,6 @@ impl App {
                 ("esc", t.accent | BOLD),
                 (" cancel", t.dim),
             ],
-        );
-    }
-
-    /// Page 3 until the network view exists.
-    pub fn draw_net_placeholder(&mut self, scr: &mut Screen, full: bool) {
-        if !full {
-            return;
-        }
-        let r = self.page_rects()[0];
-        self.panel(scr, r, &[("network & system", self.t.title | BOLD)], "");
-        let s = "Network — coming soon";
-        let x = r.x + r.w.saturating_sub(s.chars().count()) / 2;
-        scr.text(
-            x,
-            r.y + r.h / 2,
-            s,
-            self.t.mid,
-            surf(S_PANEL),
-            r.x + r.w - 1,
         );
     }
 }

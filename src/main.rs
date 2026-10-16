@@ -9,6 +9,7 @@ mod image;
 mod input;
 mod mem;
 mod menu;
+mod net;
 mod probe;
 mod procs;
 mod prof;
@@ -29,7 +30,8 @@ use ui::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
-memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes) and a
+memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes), a
+network & system page (link speeds, ports, connections, containers, services) and a
 processes page (every process: CPU, memory, disk, tree, groups, signals)
 
 usage: cpuview [options]
@@ -44,7 +46,7 @@ usage: cpuview [options]
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
   --page PAGE           start on: cpu, memory (RAM, swap, disks, filesystems),
-                        network, or processes
+                        network (links, ports, containers, services), or processes
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
@@ -684,6 +686,10 @@ impl State {
         if p == ui::PG_PROC {
             a.procs_enter();
         }
+        if p == ui::PG_NET {
+            a.n.enter(term::mono());
+            a.net_retarget(false);
+        }
         true
     }
 
@@ -1187,6 +1193,7 @@ fn main() {
     let (t, img) = load_theme(&cfg.theme, &cfg).unwrap_or((theme0, None));
     let mut app = App::new(sampler, t);
     app.m = mem::Mem::new();
+    app.n = net::Net::new();
     app.page = cfg.page;
     app.sort = cfg.sort;
     app.view = cfg.view;
@@ -1211,6 +1218,9 @@ fn main() {
     }
     if st.app.page == ui::PG_PROC {
         st.app.procs_enter();
+    }
+    if st.app.page == ui::PG_NET {
+        st.app.n.enter(term::mono());
     }
     st.rebuild(img);
     update_clock(&mut st.app);
@@ -1279,6 +1289,7 @@ fn main() {
     let mut fps = fps0;
     let mut fcount = 0u64;
     let mut resort = false;
+    let (mut cpu_held, mut cpu_skip) = (0u32, false);
     let mut settled = false; // smooth, paused and at rest: no frames
     let (mut sm_cpu, mut sm_avg) = (term::cpu_ns(), 0i64);
     let mut buf = [0u8; 4096];
@@ -1446,7 +1457,15 @@ fn main() {
             }
             // smooth: clocks 5 times a second, numbers / order 2.5 times
             let clocks = !smooth || tick % 2 == 0;
-            prof(0, || st.app.s.sample(push, clocks));
+            // the network page shows no CPU numbers: the CPU sampler runs every other
+            // sample there (eco; other speeds twice a second), its histories get the
+            // seconds in between from the next one
+            cpu_held += push;
+            cpu_skip = st.app.page == ui::PG_NET && (if eco { !cpu_skip } else { tick % 5 != 0 });
+            if !cpu_skip {
+                let push = std::mem::take(&mut cpu_held);
+                prof(0, || st.app.s.sample(push, clocks));
+            }
             // memory & storage: memory and disks every sample (cheap, their histories
             // keep going); swap rates and pressure, filesystems (every 3 s, eco 10 s),
             // processes (below) and the DIMM / drive temperatures (helper thread, every
@@ -1492,6 +1511,9 @@ fn main() {
                     }
                 }
             }
+            // network & system: links every sample while shown (every 10 s hidden, to
+            // keep their history), the rest on its own spread-out schedule (net::tick)
+            st.app.n.tick(now, push, st.app.page == ui::PG_NET, eco);
             // processes page (view 4): only while shown, see App::procs_sample
             if st.app.page == ui::PG_PROC {
                 prof(16, || st.app.procs_sample(now, eco, smooth, tick, push));
