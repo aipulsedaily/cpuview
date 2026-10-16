@@ -13,6 +13,9 @@ pub enum Key {
     Esc,
     Backspace,
     Tab,
+    /// Shift-Tab
+    BackTab,
+    F9,
     Home,
     End,
     PgUp,
@@ -242,13 +245,14 @@ impl Parser {
                 b'D' => out.push(k(Key::Left)),
                 b'H' => out.push(k(Key::Home)),
                 b'F' => out.push(k(Key::End)),
-                b'Z' => out.push(k(Key::Tab)),
+                b'Z' => out.push(k(Key::BackTab)),
                 b'~' => match num(params.split(|&c| c == b';').next().unwrap_or(b"")) {
                     1 | 7 => out.push(k(Key::Home)),
                     4 | 8 => out.push(k(Key::End)),
                     3 => out.push(k(Key::Delete)),
                     5 => out.push(k(Key::PgUp)),
                     6 => out.push(k(Key::PgDn)),
+                    20 => out.push(k(Key::F9)),
                     _ => {}
                 },
                 _ => {} // replies (…t, …c, …R) and anything unknown

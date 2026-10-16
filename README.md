@@ -2,9 +2,11 @@
 
 A btop-style terminal monitor that shows **every core's clock speed and load at once**, grouped
 by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds,
-plus a **Memory & Storage** page (`m`) written for people who aren't Linux experts: how much
+plus a **Memory & Storage** page (`m` or `2`) written for people who aren't Linux experts: how much
 RAM is in use and whether that's fine, what the disk is doing now and did a minute ago, how full
-each drive is, and which programs use the most memory, live. Native Rust, one 0.98 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+each drive is, and which programs use the most memory, live; and a **Processes** page (`4`):
+every process with its CPU, memory and disk use, as a list, grouped by program or as a tree, with
+signals and nice. Native Rust, one 1.05 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -32,6 +34,14 @@ in use (with "rising: 18% 1 min ago, 31% now"), and disk activity as stacked col
 below, writing on top, each column a 2–5 s average) with totals and the peak in words. Then every
 real filesystem, and the programs using the most memory, live. Captured during a synthetic CPU
 and disk load.*
+
+![Processes page, 128×45](docs/screenshots/rust-processes-128x45.webp)
+
+*`4`: the Processes page at 128×45, smooth, grouped by program (`G`) and sorted by CPU (`o`). CPU %
+is of one CPU thread (`I`: of the whole machine), memory is resident, disk is bytes read and
+written per second (`?` where another user's process doesn't let us read it). The selected
+process gets its whole command line, working directory, cgroup, and CPU and memory over the last
+minute. The busy process is a test load (`videoenc`) running on this machine.*
 
 ![4K, 415x105, CPU view with the memory column](docs/screenshots/rust-4k-memory.webp)
 
@@ -127,6 +137,37 @@ every rate is in MB/s, so all of them compare directly.
   no sensors (no temperature rows), no PSI (no "waiting" row), NVMe / SATA / HDD / eMMC / virtio,
   any number of disks and filesystems, long mount paths.
 
+### Processes
+
+- **Every process**: PID, user, CPU % (from `utime + stime` over the last second, of one CPU
+  thread or, with `I`, of the whole machine), resident memory and % of RAM, disk read / write
+  per second (`/proc/<pid>/io`), threads, state and age; the command line after the name.
+  Columns drop out as the window narrows (age, disk, threads, state, % RAM, bar, user, PID)
+- **Sort** by CPU, memory, disk, PID or name (`o`, `r` reverses, or click the column titles);
+  near-ties don't flip-flop: a new value counts at once past a margin (CPU: 2.5 points or 20 %,
+  memory 2 %), otherwise only once it has lasted 4 s
+- **Group by program** (`G`, on by default): `postgres ×31` with summed CPU, memory, disk and
+  threads; `enter` / `→` expands a group, `←` folds it. **Tree** (`T`): children under their
+  parents, foldable the same way. **Filter** (`/`): name, command line, user or PID; `esc`
+  clears it
+- **Detail strip** for the selected process (or group): whole command line, parent, user, state,
+  threads, nice, age, swap, the PID inside its container, working directory, cgroup, and CPU and
+  memory charts for the last 60 s
+- **Signals** (`k` or `F9`: TERM, KILL, HUP, INT, STOP, CONT) and **nice** (`n`) go through a
+  dialog and never happen without `enter`; a process is identified by PID *and* start time (and
+  signalled through a pidfd), so a reused PID is never hit; refusals are spelled out
+  (another user's process, raising priority without root, already exited)
+- **Any Linux, any user**: with `/proc` mounted `hidepid=2` you see your own processes and a note
+  says why; unreadable files show `?`; kernel threads are counted and hidden (`K` shows them);
+  zombies show `<defunct>`; long command lines are cut with `…`; names with spaces and
+  parentheses parse; thousands of processes are fine (~150 bytes each: under 5 MB of RAM with
+  5,400 processes); user names from `/etc/passwd`, LDAP / sssd users through the system's user
+  database; no systemd needed
+- **Live and smooth**: in smooth mode the rows on screen are re-read 2.5 times a second (their
+  `stat` and `statm` stay open), CPU % is over the last second, digits count and bars glide,
+  rows *slide* to a new place over ~0.3 s instead of jumping, new processes fade in and exited
+  ones fade out. In eco the rows shown are re-read every 4 s and the whole list every 30 s
+
 ## Install
 
 Needs a Rust toolchain (<https://rustup.rs>) on Linux.
@@ -151,7 +192,8 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 |---|---|
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
-| `m` | CPU view ⇄ Memory & Storage page (remembered; `--page cpu\|memory`) |
+| `1` `2` `3` `4` / `tab` / `shift-tab` | pages: CPU, Memory & Storage, Network, Processes (remembered; `--page cpu\|memory\|network\|processes`) |
+| `m` | CPU view ⇄ Memory & Storage page |
 | `p` | Memory & Storage: top programs by memory ⇄ each process |
 | `+` / `-` | faster / slower (`=` works as `+`) |
 | `o` | sort cores: number → load → clock |
@@ -163,6 +205,24 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 | `space` | pause (stops sampling entirely) |
 | `t` | theme menu |
 | `q` / `ctrl-c` | quit (`ctrl-z` suspends) |
+
+On the Processes page (`4`) the arrows, `pgup` / `pgdn` / `home` / `end`, the mouse wheel
+and clicks move the selection, and these keys change meaning (the global ones — `q`, `space`,
+`s`, `+` `-`, `t`, `1`–`4`, `tab` — still work):
+
+| Key | Processes page |
+|---|---|
+| `o` / `r` | sort column: CPU → memory → disk → PID → name / reverse |
+| `/` | filter by name, command, user or PID (`enter` keeps it, `esc` clears it) |
+| `G` / `T` | group by program (default) / tree |
+| `enter` / `→` / `←` | expand / fold the selected group or branch |
+| `k` or `F9` | send a signal (TERM, KILL, HUP, INT, STOP, CONT): choose with `←→`, `enter` sends, `esc` cancels |
+| `n` | change nice (`←→` or `-` `+`, `enter` applies) |
+| `I` | CPU % of one CPU thread ⇄ of the whole machine |
+| `K` | show / hide kernel threads |
+
+`k` is "up" on the CPU page (vim keys); on the Processes page it opens the signal dialog, as in
+`top` and `htop`, which is safe because nothing happens before `enter`.
 
 Theme menu: `↑↓` preview live, `enter` apply, `esc` cancel, `←→` picture brightness,
 `b` blur, `m` image mode, `a` add a picture (path or URL).
@@ -330,6 +390,14 @@ field 1 in nanoseconds), while another workload kept the load average at 1.4–3
 | Midnight (default), 172×40, earlier builds | 68.6 · 71.3 · 82.1 µs | ≤ 0.0082 % | 3.9 MB |
 | Space · ISS aurora picture (sixel) · Midnight 120×30, earlier build | 73.4 · 63.8 · 73.3 µs | ≤ 0.0073 % | 4.0 · 7.2 · 3.8 MB |
 
+| Midnight, Processes page (~130 processes, load 6–7): 128×45 · 415×105 | 68.3 · 68.6 µs | ≤ 0.0069 % | 4.0 · 5.0 MB |
+
+Processes page, smooth, 60 s at 128×45 · 172×40 with a load average of 7: 2.8 · 2.8 ms/s, 18 · 22
+KB/s, frames on the 60 fps grid (the base Memory & Storage page under the same load: 3.2 ms/s).
+With 5,400 processes it stays at 4.7 MB of RAM (128×45). A full scan of every process's `stat`
+costs ~1–1.5 ms here, so smooth does one about every 1–4 s (spaced by its measured cost), eco
+every 30 s or more; nothing is read for the page while it isn't shown.
+
 (The rows above were measured while other monitors and builds kept the load average at 3.6–3.8.)
 
 Smooth, 40 s runs at 128×45 · 172×40 under the same load: Memory & Storage page Midnight 3.4 ·
@@ -345,6 +413,9 @@ pulled in ~30 KB of it for its panic message), short lists sorted by one small i
 instead of std's ~4 KB sort per element type, ASCII lower-casing instead of Unicode tables, and
 the picture download runs `curl` through `posix_spawnp` instead of `std::process::Command`
 (~33 KB less).
+The Processes page adds about 68 KB the same way, plus: one non-generic heap sort, string
+tables kept out of the binary's relocations (every `&str` in a constant table costs 40 bytes in a
+position-independent binary; a `match` costs none), and no `core::fmt` for numbers.
 
 **Memory & Storage data** is read the same way, with every reading's cost in mind (cold cache,
 this machine): `/proc/meminfo` and each disk's sysfs `stat` (the `/proc/diskstats` counters for

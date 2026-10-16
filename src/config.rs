@@ -17,7 +17,7 @@ pub struct Config {
     pub sort: usize,
     pub view: usize,
     pub speed: usize,
-    /// 0 CPU, 1 memory & storage
+    /// 0 CPU, 1 memory & storage, 2 network & system, 3 processes (ui::page_name)
     pub page: usize,
     pub imgs: Vec<ImgOpt>,
 }
@@ -150,7 +150,7 @@ impl Config {
                 "sort" => c.sort = crate::ui::SORTS.iter().position(|s| *s == v).unwrap_or(0),
                 "view" => c.view = crate::ui::VIEWS.iter().position(|s| *s == v).unwrap_or(0),
                 "speed" => c.speed = crate::ui::speed_index(v),
-                "page" => c.page = (v == "memory") as usize,
+                "page" => c.page = crate::ui::page_index(v).unwrap_or(0),
                 _ => {
                     // image.<file>.dim / image.<file>.blur
                     if let Some(rest) = k.strip_prefix("image.") {
@@ -200,11 +200,7 @@ impl Config {
         s += &format!("sort = {}\n", crate::ui::SORTS[self.sort]);
         s += &format!("view = {}\n", crate::ui::VIEWS[self.view]);
         s += &format!("speed = {}\n", crate::ui::SPEEDS[self.speed].0);
-        s += if self.page == 1 {
-            "page = memory\n"
-        } else {
-            "page = cpu\n"
-        };
+        s += &format!("page = {}\n", crate::ui::page_name(self.page).1);
         for o in &self.imgs {
             s += &format!(
                 "image.{}.dim = {}.{}\nimage.{}.blur = {}\n",
