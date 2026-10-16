@@ -1,0 +1,49 @@
+# cpuview theme — schema: themes/README.md
+name = "mono"
+label = "Mono"
+description = "Minimal graphite: greyscale with a dot grid; red only for critical"
+schema = 1
+
+[palette]
+bg        = "#0e0e0e"
+panel     = "#121212"
+bar       = "#0b0b0b"
+select    = "#262626"
+chip      = "#262626"
+track     = "#1f1f1f"
+border    = "#2e2e2e"
+border_hi = "#8a8a8a"
+title     = "#f5f5f5"
+accent    = "#e6e6e6"
+accent2   = "#a0a0a0"
+fg        = "#e8e8e8"
+text      = "#bdbdbd"
+mid       = "#8c8c8c"
+dim       = "#5f5f5f"
+good      = "#d0d0d0"
+warn      = "#f0f0f0"
+crit      = "#ff5555"
+freq = ["#3a3a3a", "#6e6e6e", "#b0b0b0", "#f5f5f5"]
+load = ["#5a5a5a", "#949494", "#d6d6d6", "#ff5555"]
+temp = ["#5a5a5a", "#949494", "#d6d6d6", "#ff5555"]
+
+[blend]
+brightness = 1.0
+screen = { tint = "#0e0e0e", alpha = 0.0,  text_alpha = 0.2 }
+bar    = { tint = "#0a0a0a", alpha = 0.5,  text_alpha = 0.6 }
+panel  = { tint = "#101010", alpha = 0.3,  text_alpha = 0.5 }
+select = { tint = "#2c2c2c", alpha = 0.7,  text_alpha = 0.75 }
+chip   = { tint = "#2a2a2a", alpha = 0.9,  text_alpha = 0.9 }
+track  = { tint = "#262626", alpha = 0.7 }
+dialog = { tint = "#0c0c0c", alpha = 0.85, text_alpha = 0.9 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = ["#141414", "#0c0c0c"]
+
+[[background]]
+type = "dotgrid"
+every = [4, 2]
+glyph = "·"
+color = "#2a2a2a"

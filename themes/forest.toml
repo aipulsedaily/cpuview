@@ -1,0 +1,110 @@
+# cpuview theme — schema: themes/README.md
+name = "forest"
+label = "Night Forest"
+description = "Layered pine ridges in drifting fog, with fireflies"
+schema = 1
+
+[palette]
+bg        = "#050d09"
+panel     = "#08130d"
+bar       = "#040a07"
+select    = "#163222"
+chip      = "#183424"
+track     = "#14261b"
+border    = "#1c3627"
+border_hi = "#4f8f55"
+title     = "#f0ffe6"
+accent    = "#8fd16a"
+accent2   = "#e0c36a"
+fg        = "#e4f2dc"
+text      = "#b4ccaa"
+mid       = "#80997a"
+dim       = "#566b52"
+good      = "#8fd16a"
+warn      = "#e0c36a"
+crit      = "#e5534b"
+freq = ["#2d5a3a", "#4f9a55", "#8fd16a", "#e8ffd0"]
+load = ["#8fd16a", "#e0c36a", "#e58f4d", "#e5534b"]
+temp = ["#7ec8c0", "#8fd16a", "#e0c36a", "#e5534b"]
+
+[blend]
+brightness = 1.0
+screen = { tint = "#050d09", alpha = 0.0,  text_alpha = 0.35 }
+bar    = { tint = "#030806", alpha = 0.5,  text_alpha = 0.66 }
+panel  = { tint = "#040a07", alpha = 0.38, text_alpha = 0.66 }
+select = { tint = "#1a3a26", alpha = 0.6,  text_alpha = 0.75 }
+chip   = { tint = "#1a3826", alpha = 0.85, text_alpha = 0.9 }
+track  = { tint = "#1f3a29", alpha = 0.6 }
+dialog = { tint = "#040a07", alpha = 0.8,  text_alpha = 0.9 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = [[0.0, "#0a1820"], [0.5, "#10261f"], [1.0, "#040b08"]]
+
+[[background]]
+type = "radial"                      # moonlight
+center = [0.78, 0.12]
+radius = 0.55
+stops = ["#4a6a64", "#0c1a1a"]
+blend = "screen"
+opacity = 0.5
+
+[[background]]
+type = "silhouette"
+kind = "trees"
+seed = 3
+base = 0.62
+height = 0.12
+roughness = 2.0
+tree_width = 7
+tree_height = 0.16
+color = "#123026"
+
+[[background]]
+type = "noise"                       # fog between the ridges
+seed = 8
+scale = 2.5
+octaves = 4
+stretch = [0.35, 1.0]
+colors = ["#1a3a33", "#6f9a8c"]
+threshold = 0.4
+band = { center = 0.66, slope = 0.0, width = 0.12 }
+blend = "screen"
+opacity = 0.45
+
+[[background]]
+type = "silhouette"
+kind = "trees"
+seed = 12
+base = 0.8
+height = 0.1
+roughness = 3.0
+tree_width = 9
+tree_height = 0.22
+color = "#0a1d14"
+
+[[background]]
+type = "silhouette"
+kind = "trees"
+seed = 21
+base = 1.0
+height = 0.08
+roughness = 3.0
+tree_width = 12
+tree_height = 0.3
+color = "#030805"
+
+[[background]]
+type = "stars"                       # fireflies
+seed = 17
+density = 0.0015
+min_brightness = 0.4
+density_gradient = 1.2
+colors = ["#e8ff7a", "#ffd86a"]
+glyph_density = 0.008
+glyphs = ["·", "∙", "•"]
+
+[[background]]
+type = "vignette"
+strength = 0.35

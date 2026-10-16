@@ -1,0 +1,78 @@
+# cpuview theme — schema: themes/README.md
+name = "ember"
+label = "Ember"
+description = "Smouldering dark red with smoke and rising sparks"
+schema = 1
+
+[palette]
+bg        = "#0c0605"
+panel     = "#120907"
+bar       = "#090403"
+select    = "#3a160c"
+chip      = "#3a180e"
+track     = "#2c140d"
+border    = "#3e1d12"
+border_hi = "#c2410c"
+title     = "#fff1e6"
+accent    = "#ff8a3d"
+accent2   = "#ffcf5c"
+fg        = "#fbe9dc"
+text      = "#dcbfae"
+mid       = "#a88a7a"
+dim       = "#7a5f52"
+good      = "#ffcf5c"
+warn      = "#ff9a3d"
+crit      = "#ff2d55"
+freq = ["#6b1d0f", "#c2410c", "#ff8a3d", "#ffe0a3"]
+load = ["#d8c46a", "#ffb04a", "#ff6a36", "#ff2d55"]
+temp = ["#e8d48a", "#ffb04a", "#ff6a36", "#ff2d55"]
+
+[blend]
+brightness = 1.0
+screen = { tint = "#0c0605", alpha = 0.0,  text_alpha = 0.35 }
+bar    = { tint = "#080302", alpha = 0.5,  text_alpha = 0.66 }
+panel  = { tint = "#0a0504", alpha = 0.4,  text_alpha = 0.68 }
+select = { tint = "#45190c", alpha = 0.6,  text_alpha = 0.75 }
+chip   = { tint = "#40190e", alpha = 0.85, text_alpha = 0.9 }
+track  = { tint = "#3a1c12", alpha = 0.6 }
+dialog = { tint = "#0a0403", alpha = 0.8,  text_alpha = 0.9 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = [[0.0, "#060202"], [0.6, "#120504"], [1.0, "#2a0a04"]]
+
+[[background]]
+type = "radial"                      # heat glow from below
+center = [0.5, 1.25]
+radius = 1.0
+stops = ["#ff4d00", "#3a0a00"]
+blend = "screen"
+opacity = 0.5
+
+[[background]]
+type = "noise"                       # smoke
+seed = 4
+scale = 2.8
+octaves = 5
+warp = 1.2
+stretch = [0.6, 1.0]
+colors = ["#1a0c0a", "#4a2a24"]
+threshold = 0.42
+power = 1.2
+blend = "screen"
+opacity = 0.5
+
+[[background]]
+type = "stars"                       # sparks, denser near the bottom
+seed = 23
+density = 0.004
+min_brightness = 0.35
+density_gradient = 1.5
+colors = ["#ffb347", "#ff7a1a", "#ffe08a"]
+glyph_density = 0.01
+glyphs = ["·", "∙", "•", "°"]
+
+[[background]]
+type = "vignette"
+strength = 0.4

@@ -1,0 +1,66 @@
+# cpuview theme — schema: themes/README.md
+name = "default"
+label = "Midnight"
+description = "Clean default: deep ink-blue with a soft top light, no clutter"
+schema = 1
+
+[palette]
+bg        = "#0a0d14"
+panel     = "#0e121b"
+bar       = "#0c0f17"
+select    = "#18213a"
+chip      = "#1b2440"
+track     = "#1a2030"
+border    = "#28304a"
+border_hi = "#4a5b8c"
+title     = "#dfe5ff"
+accent    = "#7aa2f7"
+accent2   = "#bb9af7"
+fg        = "#d6dcf5"
+text      = "#aeb6da"
+mid       = "#7d86ad"
+dim       = "#525a7c"
+good      = "#9ece6a"
+warn      = "#e0af68"
+crit      = "#f7768e"
+freq = ["#3d59a1", "#7aa2f7", "#bb9af7", "#ff7ac6"]
+load = ["#9ece6a", "#e0c068", "#ff9e64", "#f7768e"]
+temp = ["#7dcfff", "#9ece6a", "#e0af68", "#f7768e"]
+
+[blend]
+brightness = 1.0
+screen = { tint = "#0a0d14", alpha = 0.0,  text_alpha = 0.3 }
+bar    = { tint = "#080a10", alpha = 0.45, text_alpha = 0.6 }
+panel  = { tint = "#0b0e16", alpha = 0.35, text_alpha = 0.55 }
+select = { tint = "#1d2a4f", alpha = 0.6,  text_alpha = 0.7 }
+chip   = { tint = "#1f2a4c", alpha = 0.85, text_alpha = 0.9 }
+track  = { tint = "#2a3352", alpha = 0.55 }
+dialog = { tint = "#0a0d15", alpha = 0.75, text_alpha = 0.85 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = [[0.0, "#121829"], [0.45, "#0b0f19"], [1.0, "#080a10"]]
+
+[[background]]
+type = "radial"
+center = [0.18, -0.15]
+radius = 1.1
+stops = ["#25345e", "#0c1222"]
+blend = "screen"
+opacity = 0.55
+
+[[background]]
+type = "noise"
+seed = 11
+scale = 2.2
+octaves = 4
+colors = ["#0b0f1a", "#1a2440"]
+threshold = 0.45
+power = 1.5
+blend = "screen"
+opacity = 0.35
+
+[[background]]
+type = "vignette"
+strength = 0.35

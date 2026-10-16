@@ -1,0 +1,32 @@
+# cpuview theme — schema: themes/README.md
+# Special theme: draws no background. Every surface uses the terminal's *default*
+# background colour (no SGR 48), so the terminal's own background image or
+# transparency shows through (e.g. Windows Terminal "backgroundImage").
+name = "transparent"
+label = "Terminal background"
+description = "Leave cell backgrounds at the terminal default so its own wallpaper shows"
+schema = 1
+transparent = true
+
+[palette]
+bg        = "#000000"
+panel     = "#000000"
+bar       = "#000000"
+select    = "#1e2a44"
+chip      = "#2a3550"
+track     = "#3a4258"
+border    = "#5a6688"
+border_hi = "#8fb0ff"
+title     = "#ffffff"
+accent    = "#8fb0ff"
+accent2   = "#d0a8ff"
+fg        = "#f2f4ff"
+text      = "#d8dcf0"
+mid       = "#aab0cc"
+dim       = "#8088a8"
+good      = "#8fe07a"
+warn      = "#ffd166"
+crit      = "#ff6b81"
+freq = ["#5a78d0", "#8fb0ff", "#d0a8ff", "#ff8ad8"]
+load = ["#8fe07a", "#ffd166", "#ffa25c", "#ff6b81"]
+temp = ["#7fd0ff", "#8fe07a", "#ffd166", "#ff6b81"]

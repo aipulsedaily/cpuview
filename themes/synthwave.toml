@@ -1,0 +1,85 @@
+# cpuview theme — schema: themes/README.md
+name = "synthwave"
+label = "Synthwave Sunset"
+description = "Striped retro sun sinking into a neon perspective grid"
+schema = 1
+
+[palette]
+bg        = "#0d0619"
+panel     = "#120822"
+bar       = "#0a0414"
+select    = "#3a1450"
+chip      = "#3a1450"
+track     = "#2c1440"
+border    = "#4a1f62"
+border_hi = "#ff4fd8"
+title     = "#fff0fb"
+accent    = "#ff4fd8"
+accent2   = "#36e3ff"
+fg        = "#fbe8ff"
+text      = "#d9bde6"
+mid       = "#a787bd"
+dim       = "#77598e"
+good      = "#36e3ff"
+warn      = "#ffe66d"
+crit      = "#ff3e6c"
+freq = ["#5a2ca0", "#b24bf3", "#ff4fd8", "#ffd0f4"]
+load = ["#36e3ff", "#ffe66d", "#ff9f43", "#ff3e6c"]
+temp = ["#36e3ff", "#a0f0a0", "#ffe66d", "#ff3e6c"]
+
+[blend]
+brightness = 0.75
+screen = { tint = "#0d0619", alpha = 0.0,  text_alpha = 0.4 }
+bar    = { tint = "#08030f", alpha = 0.6,  text_alpha = 0.74 }
+panel  = { tint = "#0c0516", alpha = 0.5, text_alpha = 0.85 }
+select = { tint = "#40165a", alpha = 0.68, text_alpha = 0.8 }
+chip   = { tint = "#3a1450", alpha = 0.88, text_alpha = 0.92 }
+track  = { tint = "#3a1a52", alpha = 0.66 }
+dialog = { tint = "#0b0414", alpha = 0.84, text_alpha = 0.92 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = [[0.0, "#0a0320"], [0.22, "#2a0b4a"], [0.38, "#8a1f6b"], [0.46, "#ff7a45"], [0.4601, "#12051f"], [1.0, "#05020a"]]
+
+[[background]]
+type = "stars"
+seed = 2
+density = 0.004
+min_brightness = 0.3
+density_gradient = -1.6
+colors = ["#ffffff", "#ffd0f4"]
+
+[[background]]
+type = "sun"
+center = [0.62, 0.3]
+radius = 0.17
+stops = ["#ffe66d", "#ff9f43", "#ff4f8b", "#d0217a"]
+stripes = 7
+glow = "#ff4f8b"
+glow_size = 1.4
+glow_opacity = 0.45
+clip_below = 0.46
+
+[[background]]
+type = "grid"
+horizon = 0.46
+color = "#ff3ec8"
+density = 1.2
+columns = 14
+line = 0.07
+depth_scale = 0.08
+fade_distance = 0.3
+opacity = 0.9
+
+[[background]]
+type = "radial"                      # horizon haze
+center = [0.62, 0.46]
+radius = 0.5
+stops = ["#ff4fd8", "#2a0b4a"]
+blend = "screen"
+opacity = 0.35
+
+[[background]]
+type = "vignette"
+strength = 0.4

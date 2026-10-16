@@ -1,0 +1,105 @@
+# cpuview theme — schema: themes/README.md
+name = "nebula"
+label = "Nebula"
+description = "Purple, magenta and teal gas clouds with dust lanes and stars"
+schema = 1
+
+[palette]
+bg        = "#08050f"
+panel     = "#0d0818"
+bar       = "#07040d"
+select    = "#2a1442"
+chip      = "#2a1640"
+track     = "#24163a"
+border    = "#3a2352"
+border_hi = "#8a3fb8"
+title     = "#ffe8fb"
+accent    = "#ff6ad5"
+accent2   = "#3ee8d0"
+fg        = "#f3e6ff"
+text      = "#cdb8e6"
+mid       = "#9a86b8"
+dim       = "#6a5a86"
+good      = "#3ee8d0"
+warn      = "#ffd166"
+crit      = "#ff3d7f"
+freq = ["#4b1d8f", "#9b3cf0", "#ff5fc8", "#ffd1f0"]
+load = ["#3ee8d0", "#ffd166", "#ff8a5c", "#ff3d7f"]
+temp = ["#58c4ff", "#3ee8d0", "#ffd166", "#ff3d7f"]
+
+[blend]
+brightness = 0.95
+screen = { tint = "#08050f", alpha = 0.0,  text_alpha = 0.35 }
+bar    = { tint = "#06030c", alpha = 0.5,  text_alpha = 0.66 }
+panel  = { tint = "#0a0614", alpha = 0.42, text_alpha = 0.68 }
+select = { tint = "#341a52", alpha = 0.6,  text_alpha = 0.75 }
+chip   = { tint = "#30184a", alpha = 0.85, text_alpha = 0.9 }
+track  = { tint = "#3a2456", alpha = 0.6 }
+dialog = { tint = "#0a0612", alpha = 0.8,  text_alpha = 0.9 }
+
+[[background]]
+type = "gradient"
+angle = 30
+stops = [[0.0, "#05030b"], [1.0, "#0c0618"]]
+
+[[background]]
+type = "noise"                       # violet body of the cloud
+seed = 3
+scale = 2.4
+octaves = 6
+warp = 0.9
+colors = ["#2a0f52", "#8a3ad0", "#e070f0"]
+threshold = 0.3
+power = 1.1
+blend = "screen"
+opacity = 1.0
+
+[[background]]
+type = "noise"                       # magenta-pink hot core
+seed = 9
+scale = 3.2
+octaves = 5
+warp = 1.0
+colors = ["#5a0f40", "#ff3a9a", "#ffc0e8"]
+threshold = 0.5
+power = 1.3
+blend = "screen"
+opacity = 0.75
+
+[[background]]
+type = "noise"                       # teal wisps
+seed = 14
+scale = 2.0
+octaves = 5
+warp = 1.6
+colors = ["#06363c", "#18b8a8", "#a8fff0"]
+threshold = 0.5
+power = 1.3
+blend = "screen"
+opacity = 0.8
+
+[[background]]
+type = "noise"                       # dark dust lanes
+seed = 27
+scale = 4.0
+octaves = 5
+ridged = true
+warp = 0.6
+colors = ["#000000", "#000000"]
+threshold = 0.74
+power = 0.8
+blend = "over"
+opacity = 0.55
+
+[[background]]
+type = "stars"
+seed = 5
+density = 0.004
+min_brightness = 0.3
+colors = ["#ffffff", "#ffd6f5", "#cdf7ff"]
+glyph_density = 0.012
+glyphs = ["·", "·", "∙", "•"]
+
+[[background]]
+type = "vignette"
+strength = 0.45

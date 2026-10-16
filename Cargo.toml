@@ -1,0 +1,26 @@
+[package]
+name = "cpuview"
+version = "2.0.0"
+edition = "2021"
+description = "btop-style per-core CPU clock / load / temperature monitor with themes and image backgrounds"
+license = "MIT"
+build = "build.rs"
+rust-version = "1.82"
+
+[features]
+default = ["images"]
+# JPEG + PNG wallpapers (zune-jpeg / zune-png). Without it, procedural themes still work.
+images = ["dep:zune-jpeg", "dep:zune-png", "dep:zune-core"]
+
+[dependencies]
+libc = "0.2"
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"], optional = true }
+zune-png = { version = "0.5", default-features = false, features = ["std"], optional = true }
+zune-core = { version = "0.5", default-features = false, features = ["std"], optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

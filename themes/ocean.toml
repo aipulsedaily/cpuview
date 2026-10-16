@@ -1,0 +1,80 @@
+# cpuview theme — schema: themes/README.md
+name = "ocean"
+label = "Deep Ocean"
+description = "Sunlight rays and caustics fading into the abyss"
+schema = 1
+
+[palette]
+bg        = "#021018"
+panel     = "#04151f"
+bar       = "#020b11"
+select    = "#0c3346"
+chip      = "#0c3344"
+track     = "#0b2a38"
+border    = "#123649"
+border_hi = "#2c8fb0"
+title     = "#e6fbff"
+accent    = "#4fd6e8"
+accent2   = "#7aa8ff"
+fg        = "#dff5fa"
+text      = "#a9cfd9"
+mid       = "#749fac"
+dim       = "#4a7380"
+good      = "#4fe0b5"
+warn      = "#e8e26a"
+crit      = "#ff5f6d"
+freq = ["#0f4c6b", "#1f8fb3", "#4fd6e8", "#d4fbff"]
+load = ["#4fe0b5", "#e8e26a", "#ffa45c", "#ff5f6d"]
+temp = ["#7aa8ff", "#4fe0b5", "#e8e26a", "#ff5f6d"]
+
+[blend]
+brightness = 0.95
+screen = { tint = "#021018", alpha = 0.0,  text_alpha = 0.35 }
+bar    = { tint = "#010a10", alpha = 0.5,  text_alpha = 0.66 }
+panel  = { tint = "#020d14", alpha = 0.4,  text_alpha = 0.66 }
+select = { tint = "#0e3b52", alpha = 0.6,  text_alpha = 0.75 }
+chip   = { tint = "#0e3a4e", alpha = 0.85, text_alpha = 0.9 }
+track  = { tint = "#14384a", alpha = 0.6 }
+dialog = { tint = "#020c12", alpha = 0.8,  text_alpha = 0.9 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = [[0.0, "#0a4560"], [0.35, "#05263a"], [0.75, "#021320"], [1.0, "#01070c"]]
+
+[[background]]
+type = "rays"
+center = [0.35, -0.35]
+color = "#8fe9ff"
+count = 16
+sharpness = 3.5
+reach = 0.8
+seed = 4
+opacity = 0.35
+
+[[background]]
+type = "noise"                       # caustic network near the surface
+seed = 6
+scale = 5.0
+octaves = 3
+ridged = true
+warp = 0.5
+colors = ["#0a4a60", "#7ee6ff"]
+threshold = 0.78
+power = 1.2
+band = { center = 0.0, slope = 0.0, width = 0.35 }
+blend = "add"
+opacity = 0.45
+
+[[background]]
+type = "stars"                       # drifting particles / plankton
+seed = 31
+density = 0.002
+min_brightness = 0.15
+colors = ["#7ee6ff", "#b8f4ff"]
+glyph_density = 0.01
+glyphs = ["·", "·", "∙", "°"]
+
+[[background]]
+type = "vignette"
+strength = 0.4

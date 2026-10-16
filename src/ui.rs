@@ -1,0 +1,3447 @@
+//! Dashboard layout and drawing (port of the Python/Textual widgets).
+
+use crate::prof::prof;
+use crate::screen::*;
+use crate::sys::Sampler;
+use crate::theme::*;
+use std::fmt::Write as _;
+
+const SLOT_TITLE: usize = 0;
+const SLOT_GLOAD: usize = 1;
+const SLOT_GFREQ: usize = 2;
+const SLOT_SENSORS: usize = 3;
+const SLOT_HEADER: usize = 4;
+const SLOT_DETAIL: usize = 5;
+const SLOT_GBODY: usize = 6;
+const SLOT_DBODY: usize = 7;
+const SLOT_CARDS: usize = 8;
+
+/// Memo key: a small mixing hash of display-relevant values.
+pub fn mixk(v: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in v {
+        h = (h ^ x).wrapping_mul(0x100_0000_01b3);
+        h ^= h >> 29;
+    }
+    h
+}
+
+/// Per CCD: (mean load of its threads, mean core clock in MHz, threads ≥ 50 %).
+pub fn ccd_stats(s: &Sampler, d: usize) -> (f32, f32, usize) {
+    let (mut u, mut f, mut nt, mut nc, mut busy) = (0.0f32, 0.0f32, 0usize, 0usize, 0usize);
+    for (g, thr) in s.t.groups.iter().enumerate() {
+        if s.t.ccd[g] != d {
+            continue;
+        }
+        nc += 1;
+        f += thr.iter().map(|&c| s.f[c]).fold(0.0, f32::max);
+        for &c in thr {
+            u += s.u[c];
+            nt += 1;
+            busy += (s.u[c] >= 0.5) as usize;
+        }
+    }
+    (u / nt.max(1) as f32, f / nc.max(1) as f32, busy)
+}
+
+fn sensors_key(s: &Sampler) -> u64 {
+    let mut k = 0u64;
+    for d in 0..s.t.ndom {
+        let (u, f, _) = ccd_stats(s, d);
+        k = mixk(&[k, (u * 100.0) as u64, (f / 10.0) as u64]);
+    }
+    for t in &s.temps {
+        k = mixk(&[k, (t.val * 10.0) as u64]);
+    }
+    let busy = s.u.iter().filter(|&&u| u >= 0.5).count() as u64;
+    let boost = s.f.iter().filter(|&&f| f >= s.t.boost).count() as u64;
+    let peak = s.peak.iter().copied().fold(0.0, f32::max);
+    let strs = s
+        .gov
+        .bytes()
+        .chain(s.epp.bytes())
+        .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+    mixk(&[
+        k,
+        (s.loadavg[0] * 100.0) as u64,
+        (s.loadavg[1] * 100.0) as u64,
+        (s.loadavg[2] * 100.0) as u64,
+        busy,
+        boost,
+        (peak / 10.0) as u64,
+        strs,
+    ])
+}
+
+pub const SORTS: [&str; 3] = ["core", "load", "freq"];
+pub const VIEWS: [&str; 3] = ["auto", "full", "compact"];
+/// Update speeds: (label, samples per second). 0 = eco: adaptive 1–2 s, held under
+/// 0.01 % of one thread by the CPU-time budget in the main loop. Smooth samples at
+/// 5/s and animates the bars (eased, up to 60 frames/s) between samples.
+pub const SPEEDS: [(&str, i64); 9] = [
+    ("eco", 0),
+    ("smooth", 5),
+    ("1/s", 1),
+    ("2/s", 2),
+    ("4/s", 4),
+    ("10/s", 10),
+    ("20/s", 20),
+    ("30/s", 30),
+    ("60/s", 60),
+];
+
+pub const SMOOTH: usize = 1;
+/// Smooth-mode bar spring: critically damped, angular frequency in rad/s
+/// (a step settles to 90 % in ~3.9 / ω ≈ 0.24 s).
+pub const SPRING_W: f32 = 16.0;
+/// Smooth-mode target deadbands (fractions of the bar)
+pub const DEADBAND_U: f32 = 0.012;
+pub const DEADBAND_F: f32 = 0.02;
+
+/// One critically damped spring step of `dt` s toward `target` (exact for a fixed
+/// target; `ex` = exp(-ω·dt)). Snaps and returns false once within `eps` and slow.
+#[inline]
+pub fn spring(x: &mut f32, v: &mut f32, target: f32, dt: f32, ex: f32, eps: f32) -> bool {
+    let e = *x - target;
+    if e.abs() < eps && v.abs() < eps * SPRING_W {
+        *x = target;
+        *v = 0.0;
+        return false;
+    }
+    let k = (*v + SPRING_W * e) * dt;
+    *x = target + (e + k) * ex;
+    *v = (*v - SPRING_W * k) * ex;
+    true
+}
+
+/// Bar fill in eighths of a cell.
+#[inline]
+pub fn eighths(frac: f32, w: usize) -> usize {
+    (frac.clamp(0.0, 1.0) * (w * 8) as f32 + 0.5) as usize
+}
+
+/// "eco", "10/s", "10" (and "auto" for eco) → index into SPEEDS; unknown → eco.
+pub fn speed_index(v: &str) -> usize {
+    let v = v.trim().trim_end_matches("/s");
+    if v == "auto" {
+        return 0;
+    }
+    SPEEDS
+        .iter()
+        .position(|s| s.0.trim_end_matches("/s") == v)
+        .unwrap_or(0)
+}
+const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const BRAILLE: [(u32, u32); 4] = [(0x40, 0x80), (0x04, 0x20), (0x02, 0x10), (0x01, 0x08)];
+
+/// Stack-allocated formatter (no heap allocation on the render path).
+pub struct F {
+    b: [u8; 120],
+    pub n: usize,
+}
+impl F {
+    pub fn new() -> F {
+        F { b: [0; 120], n: 0 }
+    }
+    pub fn s(&self) -> &str {
+        std::str::from_utf8(&self.b[..self.n]).unwrap_or("")
+    }
+}
+impl std::fmt::Write for F {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let mut take = s.len().min(self.b.len() - self.n);
+        while !s.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.b[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.n += take;
+        Ok(())
+    }
+}
+#[macro_export]
+macro_rules! f {
+    ($($t:tt)*) => {{ let mut b = $crate::ui::F::new(); let _ = write!(b, $($t)*); b }};
+}
+
+impl F {
+    pub fn push(&mut self, b: u8) {
+        if self.n < self.b.len() {
+            self.b[self.n] = b;
+            self.n += 1;
+        }
+    }
+    pub fn str(&mut self, s: &str) {
+        let _ = std::fmt::Write::write_str(self, s);
+    }
+    /// Unsigned integer, right-aligned to `width` (no core::fmt).
+    pub fn int(&mut self, v: u32, width: usize) {
+        let mut d = [0u8; 10];
+        let (mut i, mut v) = (10, v);
+        loop {
+            i -= 1;
+            d[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        for _ in (10 - i)..width {
+            self.push(b' ');
+        }
+        for &c in &d[i..] {
+            self.push(c);
+        }
+    }
+}
+
+/// "5.53": MHz as GHz with two decimals (fixed point, no float formatting).
+pub fn ghz(mhz: f32) -> F {
+    let c = (mhz.max(0.0) / 10.0).round() as u32;
+    let mut f = F::new();
+    f.int(c / 100, 1);
+    f.push(b'.');
+    f.push(b'0' + (c / 10 % 10) as u8);
+    f.push(b'0' + (c % 10) as u8);
+    f
+}
+
+/// Rounded integer with optional prefix/suffix, right-aligned to `width`.
+pub fn num(pre: &str, v: f32, width: usize, suf: &str) -> F {
+    let mut f = F::new();
+    f.str(pre);
+    f.int(v.max(0.0).round() as u32, width);
+    f.str(suf);
+    f
+}
+
+pub fn span(secs: usize) -> F {
+    let (m, s) = (secs / 60, secs % 60);
+    if m > 0 {
+        f!("{m}m {s:02}s")
+    } else {
+        f!("{s}s")
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+impl Rect {
+    pub fn contains(&self, x: usize, y: usize) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+    pub fn inner(&self) -> Rect {
+        Rect {
+            x: self.x + 2,
+            y: self.y + 1,
+            w: self.w.saturating_sub(4),
+            h: self.h.saturating_sub(2),
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct Layout {
+    pub top: Option<Rect>,
+    pub g_load: Rect,
+    pub g_freq: Rect,
+    pub sensors: Rect,
+    pub cores: Rect,
+    pub det: Option<Rect>,
+    pub compact: bool,
+    /// M_FULL / M_COMPACT / M_MICRO
+    pub mode: u8,
+    pub cols: usize,
+    pub nrows: usize,
+    pub rh: usize,
+    pub header: bool,
+    pub gap: bool,
+    #[allow(dead_code)]
+    pub fits: bool,
+    /// x offset (relative to the cores' inner rect) and width of each card column
+    pub card_x: Vec<(usize, usize)>,
+    pub vis_rows: usize,
+    /// the detail area shows every core's history (small multiples)
+    pub grid: bool,
+    /// a column holding two CCDs gets a divider row at the boundary ("── CCD1 61° ──")
+    pub div: bool,
+}
+
+pub const M_FULL: u8 = 0;
+pub const M_COMPACT: u8 = 1;
+pub const M_MICRO: u8 = 2;
+/// minimum card width and column gutter per card mode
+const MINW: [usize; 3] = [46, 36, 15];
+const GUT: [usize; 3] = [3, 3, 3];
+/// smallest graph band / detail panel worth showing
+const TOP_MIN: usize = 7;
+/// a graph band this short (one graph row) only when nothing else fits
+const TOP_MINI: usize = 3;
+const DET_MIN: usize = 7;
+/// seconds of history per cell of a core's load strip (same as the graphs)
+pub const STRIP_SECS: usize = 2;
+/// width of the selected core's statistics beside the history grid
+const GRID_STATS: usize = 30;
+/// bar glyphs: clock bars are thinner than load bars (load is what changes)
+pub const CLK: char = '▂';
+pub const LOAD: char = '▄';
+
+#[derive(Clone, Copy, Debug)]
+struct Plan {
+    mode: u8,
+    cols: usize,
+    nrows: usize,
+    rh: usize,
+    header: bool,
+    top: bool,
+    det: bool,
+    /// rows left after the cores and their header
+    rest: usize,
+}
+
+/// Field positions inside a core card (offsets from the card's left edge) and widths.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Geo {
+    /// clock bar, load bar and load-history strip widths
+    pub fw: usize,
+    pub lw: usize,
+    pub sw: usize,
+    /// clock bar, clock digits, load bar, load digits, strip
+    pub xb: usize,
+    pub xn: usize,
+    pub xl: usize,
+    pub xp: usize,
+    pub xs: usize,
+    /// micro cards: room for a one-decimal clock
+    pub ghz: bool,
+}
+
+pub struct App {
+    pub s: Sampler,
+    pub t: Theme,
+    pub sort: usize,
+    pub view: usize,
+    /// index into SPEEDS
+    pub speed: usize,
+    pub paused: bool,
+    pub show_top: bool,
+    pub show_det: bool,
+    /// detail area shows the selected core's graphs instead of the all-core overview
+    pub det_core: bool,
+    pub selected: usize,
+    pub order: Vec<usize>,
+    pub lay: Layout,
+    pub w: usize,
+    pub h: usize,
+    pub zones: Vec<(usize, usize, char)>,
+    pub scroll: usize,
+    pub clock: (i32, i32, i32),
+    pub uptime: u64,
+    pub vals: Vec<f32>,
+    pub tmp16: Vec<u16>,
+    pub tmp8: Vec<u8>,
+    pub idw: usize,
+    pub rh_full: usize,
+    pub menu: Option<crate::menu::Menu>,
+    pub cache: Vec<u64>,
+    pub prev_order: Vec<usize>,
+    /// per thread: last drawn field keys (freq bar, clock, load bar, %, trend, name)
+    pub row_memo: Vec<[u32; 6]>,
+    pub title_short: std::cell::Cell<bool>,
+    pub mode_line: String,
+    pub depth_name: &'static str,
+    /// bar positions per CPU (fractions 0..1: clock of maxf, load) and, in smooth
+    /// mode, their spring velocities (per second)
+    pub bf: Vec<f32>,
+    pub bu: Vec<f32>,
+    vf: Vec<f32>,
+    vu: Vec<f32>,
+    /// smooth mode: where the bars are heading (the latest sample, through a deadband)
+    tf: Vec<f32>,
+    tu: Vec<f32>,
+    /// smooth mode: the numbers shown (see `shown`)
+    nf: Vec<f32>,
+    nu: Vec<f32>,
+    /// widest clock / load bar in cells (sets the animation's resolution)
+    bar_cells: (usize, usize),
+}
+
+impl App {
+    pub fn new(s: Sampler, t: Theme) -> App {
+        let n = s.t.groups.len();
+        let maxid =
+            s.t.cpus
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(n.saturating_sub(1));
+        let idw = maxid.to_string().len().max(2);
+        let rh_full =
+            s.t.groups
+                .iter()
+                .map(|g| g.len())
+                .max()
+                .unwrap_or(1)
+                .clamp(1, 4);
+        App {
+            s,
+            t,
+            sort: 0,
+            view: 0,
+            speed: 0,
+            paused: false,
+            show_top: true,
+            show_det: true,
+            det_core: false,
+            selected: 0,
+            order: (0..n).collect(),
+            lay: Layout::default(),
+            w: 0,
+            h: 0,
+            zones: Vec::new(),
+            scroll: 0,
+            clock: (0, 0, 0),
+            uptime: 0,
+            vals: Vec::with_capacity(2048),
+            tmp16: Vec::with_capacity(2048),
+            tmp8: Vec::with_capacity(2048),
+            idw,
+            rh_full,
+            menu: None,
+            cache: vec![u64::MAX; SLOT_CARDS + n],
+            prev_order: Vec::with_capacity(n),
+            row_memo: Vec::new(),
+            title_short: std::cell::Cell::new(false),
+            mode_line: String::new(),
+            depth_name: "truecolor",
+            bf: Vec::new(),
+            bu: Vec::new(),
+            vf: Vec::new(),
+            vu: Vec::new(),
+            tf: Vec::new(),
+            tu: Vec::new(),
+            nf: Vec::new(),
+            nu: Vec::new(),
+            bar_cells: (8, 8),
+        }
+        .with_bars()
+    }
+
+    fn with_bars(mut self) -> App {
+        let n = self.s.f.len();
+        self.bf = vec![0.0; n];
+        self.bu = vec![0.0; n];
+        self.vf = vec![0.0; n];
+        self.vu = vec![0.0; n];
+        let m = self.s.t.maxf;
+        for i in 0..n {
+            self.bf[i] = (self.s.f[i] / m).clamp(0.0, 1.0);
+            self.bu[i] = self.s.u[i].clamp(0.0, 1.0);
+        }
+        self.tf = self.bf.clone();
+        self.tu = self.bu.clone();
+        self.nf = self.s.f.clone();
+        self.nu = self.s.u.clone();
+        self
+    }
+
+    pub fn smooth(&self) -> bool {
+        self.speed == SMOOTH
+    }
+
+    /// Clock (MHz) and load a CPU's numbers show: the published sample, or in smooth
+    /// mode where its bars were at the last sample (`snap_numbers`), so digits agree
+    /// with their bar but change at most 5 times a second.
+    #[inline]
+    pub fn shown(&self, c: usize) -> (f32, f32) {
+        if self.smooth() {
+            (self.nf[c], self.nu[c])
+        } else {
+            (self.s.f[c], self.s.u[c])
+        }
+    }
+
+    pub fn snap_numbers(&mut self) {
+        let m = self.s.t.maxf;
+        for i in 0..self.bf.len() {
+            self.nf[i] = self.bf[i] * m;
+            self.nu[i] = self.bu[i];
+        }
+    }
+
+    /// Bars jump to the latest sample (every speed but smooth).
+    pub fn bars_snap(&mut self) {
+        let m = self.s.t.maxf;
+        for i in 0..self.bf.len() {
+            self.bf[i] = (self.s.fe[i] / m).clamp(0.0, 1.0);
+            self.bu[i] = self.s.ur[i].clamp(0.0, 1.0);
+            self.vf[i] = 0.0;
+            self.vu[i] = 0.0;
+        }
+        self.tf.copy_from_slice(&self.bf);
+        self.tu.copy_from_slice(&self.bu);
+    }
+
+    /// Smooth mode, after a sample: new bar targets. Changes smaller than the
+    /// measurement noise (load ±2 % over the window, clock jitter) are ignored so
+    /// steady bars come to rest instead of wobbling; 0 and 100 % are always exact.
+    pub fn retarget(&mut self) {
+        let m = self.s.t.maxf;
+        let db = |t: &mut f32, n: f32, d: f32| {
+            if (n - *t).abs() >= d || (n <= 0.0 || n >= 1.0) {
+                *t = n;
+            }
+        };
+        for i in 0..self.tf.len() {
+            db(
+                &mut self.tf[i],
+                (self.s.fe[i] / m).clamp(0.0, 1.0),
+                DEADBAND_F,
+            );
+            db(&mut self.tu[i], self.s.ur[i].clamp(0.0, 1.0), DEADBAND_U);
+        }
+    }
+
+    /// Smooth mode: move every bar `dt` seconds along its spring toward the latest
+    /// sample. Returns the fastest bar's speed in eighth-cells per second, 0 once
+    /// all have settled (each snaps when within half an eighth of its target).
+    pub fn bars_step(&mut self, dt: f32) -> f32 {
+        let ex = (-SPRING_W * dt).exp();
+        let (cf, cu) = (
+            self.bar_cells.0.max(1) as f32 * 8.0,
+            self.bar_cells.1.max(1) as f32 * 8.0,
+        );
+        let (ef, eu) = (0.5 / cf, 0.5 / cu);
+        let mut fast = 0.0f32;
+        for i in 0..self.bf.len() {
+            if spring(&mut self.bf[i], &mut self.vf[i], self.tf[i], dt, ex, ef) {
+                fast = fast.max(self.vf[i].abs() * cf).max(1.0);
+            }
+            if spring(&mut self.bu[i], &mut self.vu[i], self.tu[i], dt, ex, eu) {
+                fast = fast.max(self.vu[i].abs() * cu).max(1.0);
+            }
+        }
+        fast
+    }
+
+    /// History points between redraws of graphs and strips: 2 (one braille column),
+    /// more on very large screens, where redrawing ~20k graph cells is the bulk of a
+    /// frame's cost; the frames in between then update only bars and numbers, so the
+    /// eco budget affords more of them.
+    pub fn hist_step(&self) -> u64 {
+        match self.w * self.h {
+            0..12_000 => 2,
+            12_000..20_000 => 4,
+            _ => 6,
+        }
+    }
+
+    pub fn ngroups(&self) -> usize {
+        self.s.t.groups.len()
+    }
+
+    // ── layout ─────────────────────────────────────────────────────────────
+
+    /// Choose the card mode, columns and which panels fit (hero first: all cores
+    /// visible, then the graphs, then the detail panel; breathing room last).
+    fn plan(&self, w: usize, h: usize) -> Option<Plan> {
+        let n = self.ngroups();
+        let avail = h.saturating_sub(2);
+        let iw = w.saturating_sub(4);
+        let ndom = self.s.t.ndom.max(1);
+        let modes: &[u8] = match self.view {
+            1 => &[M_FULL],
+            2 => &[M_COMPACT, M_MICRO],
+            _ => &[M_FULL, M_COMPACT, M_MICRO],
+        };
+        for &m in modes {
+            let rh = if m == M_FULL { self.rh_full } else { 1 };
+            let (mw, g) = (MINW[m as usize], GUT[m as usize]);
+            let mut best: Option<(usize, Plan)> = None;
+            for cols in 1..=n.max(1) {
+                if cols * (mw + g) > iw + g {
+                    break;
+                }
+                let nrows = n.div_ceil(cols);
+                let core = nrows * rh + 2;
+                if core > avail {
+                    continue;
+                }
+                let rest = avail - core;
+                let header = rest >= 1;
+                let rest = rest - header as usize;
+                let top = self.show_top && rest >= TOP_MINI;
+                let det = self.show_det && rest >= if top { TOP_MIN } else { 0 } + DET_MIN;
+                let score = (top as usize) * 64
+                    + (cols == ndom && n % cols == 0) as usize * 32
+                    + (det as usize) * 16
+                    + (n % cols == 0) as usize * 8
+                    + (8usize.saturating_sub(cols));
+                if best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((
+                        score,
+                        Plan {
+                            mode: m,
+                            cols,
+                            nrows,
+                            rh,
+                            header,
+                            top,
+                            det,
+                            rest,
+                        },
+                    ));
+                }
+            }
+            if let Some((_, p)) = best {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    pub fn first_size(&mut self, w: usize, h: usize) {
+        self.show_top = true;
+        self.show_det = true;
+        self.fit(w, h);
+    }
+
+    pub fn fit(&mut self, w: usize, h: usize) {
+        self.w = w;
+        self.h = h;
+        let n = self.ngroups();
+        let avail = h.saturating_sub(2);
+        let plan = self.plan(w, h);
+        let mut l = Layout {
+            fits: plan.is_some(),
+            ..Default::default()
+        };
+        let (used, mut th, dh);
+        if let Some(p) = plan {
+            l.mode = p.mode;
+            l.compact = p.mode != M_FULL;
+            l.cols = p.cols;
+            l.nrows = p.nrows;
+            l.rh = p.rh;
+            l.header = p.header;
+            let mut r = p.rest
+                - match (p.top, p.det) {
+                    (true, true) => TOP_MIN + DET_MIN,
+                    (true, false) => TOP_MIN.min(p.rest),
+                    (false, true) => DET_MIN,
+                    _ => 0,
+                };
+            // breathing room between cores once the panels have grown a little
+            let gaps = p.nrows.saturating_sub(1);
+            l.gap = p.mode != M_MICRO && gaps > 0 && r >= gaps + 6;
+            if l.gap {
+                r -= gaps;
+            }
+            // CCD divider rows: free in the gap row, else one spare row
+            let mixed = self.sort == 0 && (0..p.cols).any(|c| self.split_in(c, p.nrows).is_some());
+            if mixed && p.mode != M_MICRO && (l.gap || r >= 1) {
+                l.div = true;
+                if !l.gap {
+                    r -= 1;
+                }
+            }
+            let core = p.nrows * p.rh
+                + 2
+                + p.header as usize
+                + if l.gap { gaps } else { 0 }
+                + (l.div && !l.gap) as usize;
+            match (p.top, p.det) {
+                (true, true) => {
+                    // the graph band stops growing on tall screens; the rest goes to the
+                    // detail area (which becomes the per-core history grid)
+                    th = (TOP_MIN + (r * 55 + 50) / 100).min(10 + h / 10);
+                    // the all-core heatmap wants a row per two cores (+ borders): borrow
+                    // a row or two from the graph band when that makes it fit
+                    let want = n.div_ceil(2) + 2;
+                    let short = want.saturating_sub(avail - core - th);
+                    if !self.det_core && short > 0 && short <= 2 && th >= TOP_MIN + 1 + short {
+                        th -= short;
+                    }
+                    dh = avail - core - th;
+                }
+                (true, false) => {
+                    th = avail - core;
+                    dh = 0;
+                }
+                (false, true) => {
+                    th = 0;
+                    dh = avail - core;
+                }
+                _ => {
+                    th = 0;
+                    dh = 0;
+                }
+            }
+            used = avail - th - dh;
+        } else {
+            // nothing fits: densest layout, scroll the rest
+            l.mode = M_MICRO;
+            l.compact = true;
+            let iw = w.saturating_sub(4);
+            l.cols = ((iw + GUT[2]) / (MINW[2] + GUT[2])).clamp(1, n.max(1));
+            l.nrows = n.div_ceil(l.cols);
+            l.rh = 1;
+            l.header = false;
+            th = 0;
+            dh = 0;
+            used = avail;
+        }
+        let mut y = 1;
+        if th > 0 {
+            let top = Rect { x: 0, y, w, h: th };
+            let sw = if w >= 120 {
+                46
+            } else {
+                (w * 36 / 100).max(24).min(w)
+            };
+            let gw = w - sw;
+            let gl = gw / 2;
+            l.g_load = Rect {
+                x: 0,
+                y,
+                w: gl,
+                h: th,
+            };
+            l.g_freq = Rect {
+                x: gl,
+                y,
+                w: gw - gl,
+                h: th,
+            };
+            l.sensors = Rect {
+                x: gw,
+                y,
+                w: sw,
+                h: th,
+            };
+            l.top = Some(top);
+            y += th;
+        }
+        l.cores = Rect {
+            x: 0,
+            y,
+            w,
+            h: used,
+        };
+        y += used;
+        if dh > 0 {
+            l.det = Some(Rect { x: 0, y, w, h: dh });
+            l.grid = !self.det_core
+                && dh >= 18
+                && w >= 150
+                && n >= 4
+                && self.grid_geo(l.det.unwrap()).is_some();
+        }
+        let inner = l.cores.inner();
+        let cols = l.cols.max(1);
+        let g = GUT[l.mode as usize];
+        let total = inner.w.saturating_sub(g * (cols - 1));
+        let (base, extra) = (total / cols, total % cols);
+        let mut x = 0;
+        // equal columns: the leftover cells go to the gutters' right side
+        for c in 0..cols {
+            l.card_x.push((x, base));
+            x += base + g + (c < extra) as usize;
+        }
+        let step = l.rh + l.gap as usize;
+        l.vis_rows = (inner.h.saturating_sub(l.header as usize) + l.gap as usize) / step.max(1);
+        self.bar_cells = l.card_x.iter().fold((1, 1), |a, &(_, cw)| {
+            let geo = self.geo(cw, l.mode);
+            (a.0.max(geo.fw), a.1.max(geo.lw))
+        });
+        self.lay = l;
+        self.fix_scroll();
+    }
+
+    fn fix_scroll(&mut self) {
+        let l = &self.lay;
+        if l.nrows <= l.vis_rows || l.nrows == 0 {
+            self.scroll = 0;
+            return;
+        }
+        let k = self
+            .order
+            .iter()
+            .position(|&g| g == self.selected)
+            .unwrap_or(0);
+        let r = k % l.nrows;
+        if r < self.scroll {
+            self.scroll = r;
+        } else if r >= self.scroll + l.vis_rows {
+            self.scroll = r + 1 - l.vis_rows;
+        }
+        self.scroll = self.scroll.min(l.nrows - l.vis_rows);
+    }
+
+    pub fn resort(&mut self) {
+        let s = &self.s;
+        let key = |g: usize, f: &dyn Fn(usize) -> f32| -> f32 {
+            s.t.groups[g].iter().map(|&c| f(c)).fold(0.0, f32::max)
+        };
+        let n = self.ngroups();
+        self.order.clear();
+        self.order.extend(0..n);
+        match self.sort {
+            1 => self
+                .order
+                .sort_by(|&a, &b| key(b, &|c| s.u[c]).total_cmp(&key(a, &|c| s.u[c]))),
+            2 => self
+                .order
+                .sort_by(|&a, &b| key(b, &|c| s.f[c]).total_cmp(&key(a, &|c| s.f[c]))),
+            _ => {}
+        }
+    }
+
+    // ── actions ────────────────────────────────────────────────────────────
+
+    pub fn move_sel(&mut self, dx: isize, dy: isize) {
+        let nr = self.lay.nrows.max(1);
+        let k = self
+            .order
+            .iter()
+            .position(|&g| g == self.selected)
+            .unwrap_or(0);
+        let (c, r) = ((k / nr) as isize + dx, (k % nr) as isize + dy);
+        let j = c * nr as isize + r;
+        if c >= 0
+            && (c as usize) < self.lay.cols
+            && r >= 0
+            && (r as usize) < nr
+            && (j as usize) < self.order.len()
+        {
+            self.selected = self.order[j as usize];
+            self.fix_scroll();
+        }
+    }
+
+    /// Which group's card is at screen cell (x, y)?
+    /// First row (within column `c`, `nrows` rows a column) of a second CCD, if any.
+    fn split_in(&self, c: usize, nrows: usize) -> Option<usize> {
+        // only in core order (identity), where a CCD is a contiguous run
+        if self.sort != 0 {
+            return None;
+        }
+        let d = |r: usize| self.s.t.ccd.get(c * nrows + r).copied();
+        (1..nrows).find(|&r| d(r).is_some() && d(r) != d(r - 1))
+    }
+
+    /// Screen row of visible row `vr` in column `c` (divider rows push later rows down).
+    fn row_y(&self, c: usize, vr: usize) -> usize {
+        let l = &self.lay;
+        let y0 = l.cores.inner().y + l.header as usize;
+        let step = l.rh + l.gap as usize;
+        let past = l.div
+            && !l.gap
+            && self
+                .split_in(c, l.nrows)
+                .is_some_and(|s| vr + self.scroll >= s);
+        y0 + vr * step + past as usize
+    }
+
+    pub fn card_at(&self, x: usize, y: usize) -> Option<usize> {
+        if let Some(g) = self.grid_at(x, y) {
+            return Some(g);
+        }
+        let l = &self.lay;
+        let inner = l.cores.inner();
+        if !inner.contains(x, y) {
+            return None;
+        }
+        for (c, &(cx, cw)) in l.card_x.iter().enumerate() {
+            if x >= inner.x + cx && x < inner.x + cx + cw {
+                for vr in 0..l.vis_rows.min(l.nrows.saturating_sub(self.scroll)) {
+                    let ry = self.row_y(c, vr);
+                    if y >= ry && y < ry + l.rh {
+                        return self.order.get(c * l.nrows + vr + self.scroll).copied();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn key_at(&self, x: usize, y: usize) -> Option<char> {
+        if y + 1 != self.h {
+            return None;
+        }
+        self.zones.iter().find(|z| x >= z.0 && x < z.1).map(|z| z.2)
+    }
+
+    // ── drawing ────────────────────────────────────────────────────────────
+    //
+    // Retained mode: `full` frames (input, resize, theme) redraw everything; live
+    // frames (ticks) redraw only elements whose memo key changed, and write every row
+    // of an element exactly once (padding instead of clearing) so unchanged cells stay
+    // unchanged and cost nothing in the flush.
+
+    fn memo(&mut self, slot: usize, key: u64) -> bool {
+        if self.cache.len() <= slot {
+            self.cache.resize(slot + 1, u64::MAX);
+        }
+        if self.cache[slot] == key {
+            return false;
+        }
+        self.cache[slot] = key;
+        true
+    }
+
+    /// Smooth-mode animation frame: only the core bars move (numbers, graphs and
+    /// order change with samples, in `draw`).
+    pub fn draw_bars(&mut self, scr: &mut Screen) {
+        if self.menu.is_some() {
+            return;
+        }
+        if self.lay.compact {
+            self.draw_cores(scr, false);
+            return;
+        }
+        // full cards: touch only the bar cells whose fill changed (same geometry and
+        // row memo as draw_card, which drew every row at the last sample)
+        let l = &self.lay;
+        let ir = l.cores.inner();
+        let mut rm = std::mem::take(&mut self.row_memo);
+        for c in 0..l.cols {
+            let (cx, cw) = l.card_x[c];
+            let geo = self.geo(cw, M_FULL);
+            let (fw, lw) = (geo.fw, geo.lw);
+            let xb = ir.x + cx + geo.xb;
+            let xl = ir.x + cx + geo.xl;
+            for vr in 0..l.vis_rows {
+                let r = vr + self.scroll;
+                let y = self.row_y(c, vr);
+                if r >= l.nrows || y + l.rh > ir.y + ir.h {
+                    break;
+                }
+                let Some(&g) = self.order.get(c * l.nrows + r) else {
+                    continue;
+                };
+                let bg = if g == self.selected {
+                    surf(S_SELECT)
+                } else {
+                    surf(S_PANEL)
+                };
+                for (j, &t) in self.s.t.groups[g].iter().take(l.rh).enumerate() {
+                    let Some(m) = rm.get_mut(t) else { continue };
+                    if m[0] == u32::MAX || m[2] == u32::MAX {
+                        continue;
+                    }
+                    let f8 = eighths(self.bf[t], fw) as u32;
+                    if m[0] & 0xffff != f8 {
+                        let ramp = if m[0] >> 16 != 0 {
+                            &self.t.freq_idle
+                        } else {
+                            &self.t.freq
+                        };
+                        let old = (m[0] & 0xffff) as usize;
+                        self.meter_to(scr, xb, y + j, old, f8 as usize, fw, ramp, bg, CLK);
+                        m[0] = (m[0] & !0xffff) | f8;
+                    }
+                    let u8v = eighths(self.bu[t], lw) as u32;
+                    if m[2] != u8v {
+                        let old = m[2] as usize;
+                        self.meter_to(
+                            scr,
+                            xl,
+                            y + j,
+                            old,
+                            u8v as usize,
+                            lw,
+                            &self.t.load,
+                            bg,
+                            LOAD,
+                        );
+                        m[2] = u8v;
+                    }
+                }
+            }
+        }
+        self.row_memo = rm;
+    }
+
+    pub fn draw(&mut self, scr: &mut Screen, full: bool) {
+        let full = full || self.menu.is_some();
+        if !self.paused {
+            prof(13, || {
+                self.prev_order.clone_from(&self.order);
+                self.resort();
+            });
+        }
+        if full {
+            self.cache.iter_mut().for_each(|c| *c = u64::MAX);
+            self.row_memo.clear();
+            scr.clear(BLANK);
+        } else if self.order != self.prev_order {
+            for c in self.cache.iter_mut().skip(SLOT_CARDS) {
+                *c = u64::MAX;
+            }
+        }
+        let hn = self.s.hist_n;
+        let (h, m, sec) = self.clock;
+        let sec = if self.speed > 0 { sec } else { 0 };
+        // without the graph band the title carries a live summary (load, clock, temp)
+        let summary = if self.lay.top.is_none() {
+            let (u, f, t) = self.summary();
+            mixk(&[
+                (u * 100.0).round() as u64,
+                (f / 10.0) as u64,
+                t.round() as u64,
+            ])
+        } else {
+            0
+        };
+        if self.memo(
+            SLOT_TITLE,
+            mixk(&[
+                (h * 3600 + m * 60 + sec) as u64,
+                self.uptime / 60,
+                self.paused as u64,
+                self.speed as u64,
+                summary,
+            ]),
+        ) {
+            let full = full || self.lay.top.is_none();
+            prof(8, || self.draw_title(scr, full));
+        }
+        if self.lay.top.is_some() {
+            let s = &self.s;
+            let ku = (s.tot_u * 100.0).round() as u64;
+            let topf = s.f.iter().copied().fold(0.0, f32::max);
+            let kf = mixk(&[(s.avg_f / 10.0) as u64, (topf / 10.0) as u64]);
+            let ks = mixk(&[sensors_key(s), hn / 2]);
+            let body = self.memo(SLOT_GBODY, hn / self.hist_step());
+            if self.memo(SLOT_GLOAD, ku) || body {
+                prof(9, || self.draw_gload(scr, full, body));
+            }
+            if self.memo(SLOT_GFREQ, kf) || body {
+                prof(9, || self.draw_gfreq(scr, full, body));
+            }
+            if self.memo(SLOT_SENSORS, ks) {
+                prof(10, || self.draw_sensors(scr, full));
+            }
+        }
+        prof(11, || self.draw_cores(scr, full));
+        if self.lay.det.is_some() {
+            let g = self.selected;
+            let s = &self.s;
+            let mut k = g as u64;
+            let all = if self.lay.grid { s.f.len() } else { 0 };
+            for c in s.t.groups[g].iter().copied().chain(0..all) {
+                let (f, u) = self.shown(c);
+                k = mixk(&[
+                    k,
+                    (f / 10.0) as u64,
+                    (u * 100.0).round() as u64,
+                    (s.peak[c] / 10.0) as u64,
+                ]);
+            }
+            let body = self.memo(SLOT_DBODY, hn / self.hist_step());
+            if self.memo(SLOT_DETAIL, k) || body {
+                prof(12, || self.draw_detail(scr, full, body));
+            }
+        }
+        if full {
+            self.draw_keys(scr);
+            if self.menu.is_some() {
+                self.draw_menu(scr);
+            }
+        }
+    }
+
+    pub fn spans(
+        scr: &mut Screen,
+        mut x: usize,
+        y: usize,
+        maxx: usize,
+        bg: u32,
+        sp: &[(&str, u32)],
+    ) -> usize {
+        for (s, fg) in sp {
+            x = scr.text(x, y, s, *fg, bg, maxx);
+        }
+        x
+    }
+
+    /// Spans, then blanks up to `maxx` (a row written once, no clearing).
+    pub fn line(scr: &mut Screen, x: usize, y: usize, maxx: usize, bg: u32, sp: &[(&str, u32)]) {
+        let mut x = Self::spans(scr, x, y, maxx, bg, sp);
+        while x < maxx {
+            scr.put(x, y, ' ', 0, bg);
+            x += 1;
+        }
+    }
+
+    fn spans_len(sp: &[(&str, u32)]) -> usize {
+        sp.iter().map(|(s, _)| s.chars().count()).sum()
+    }
+
+    /// The first title variant that fits a panel `w` cells wide (else the last).
+    fn pick<'a>(w: usize, vs: &'a [&'a [(&'a str, u32)]]) -> &'a [(&'a str, u32)] {
+        vs.iter()
+            .find(|v| Self::spans_len(v) + 4 <= w)
+            .unwrap_or(&vs[vs.len() - 1])
+    }
+
+    /// Top border row with a title (rewritten as a whole).
+    fn panel_top(&self, scr: &mut Screen, r: Rect, title: &[(&str, u32)]) {
+        let bg = surf(S_PANEL);
+        let b = self.t.border;
+        let x1 = r.x + r.w - 1;
+        scr.put(r.x, r.y, '╭', b, bg);
+        let mut x = r.x + 1;
+        if !title.is_empty() && r.w > 6 {
+            scr.put(x, r.y, ' ', b, bg);
+            x = Self::spans(scr, x + 1, r.y, x1 - 1, bg, title);
+            scr.put(x, r.y, ' ', b, bg);
+            x += 1;
+        }
+        while x < x1 {
+            scr.put(x, r.y, '─', b, bg);
+            x += 1;
+        }
+        scr.put(x1, r.y, '╮', b, bg);
+    }
+
+    pub fn panel(&self, scr: &mut Screen, r: Rect, title: &[(&str, u32)], sub: &str) {
+        if r.w < 2 || r.h < 2 {
+            return;
+        }
+        let t = &self.t;
+        let bg = surf(S_PANEL);
+        let b = t.border;
+        scr.fill(
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            Cell {
+                ch: ' ',
+                fg: STAR_OK,
+                bg,
+            },
+        );
+        let (x1, y1) = (r.x + r.w - 1, r.y + r.h - 1);
+        for x in r.x + 1..x1 {
+            scr.put(x, y1, '─', b, bg);
+        }
+        for y in r.y + 1..y1 {
+            scr.put(r.x, y, '│', b, bg);
+            scr.put(x1, y, '│', b, bg);
+        }
+        self.panel_top(scr, r, title);
+        scr.put(r.x, y1, '╰', b, bg);
+        scr.put(x1, y1, '╯', b, bg);
+        let sl = sub.chars().count();
+        if sl > 0 && sl + 6 < r.w {
+            let x = x1 - 2 - sl;
+            scr.put(x - 1, y1, ' ', b, bg);
+            scr.text(x, y1, sub, t.dim, bg, x1 - 1);
+            scr.put(x1 - 2, y1, ' ', b, bg);
+        }
+    }
+
+    /// Total load, fastest clock (MHz) and hottest sensor (°C, 0 if none).
+    fn summary(&self) -> (f32, f32, f32) {
+        let s = &self.s;
+        let f = s.f.iter().copied().fold(0.0, f32::max);
+        let t = s.temps.iter().map(|t| t.val).fold(0.0, f32::max);
+        (s.tot_u, f, t)
+    }
+
+    fn draw_title(&self, scr: &mut Screen, full: bool) {
+        let t = &self.t;
+        let w = self.w;
+        let bar = surf(S_BAR);
+        let s = &self.s.t;
+        let (h, m, sec) = self.clock;
+        let mut clock = F::new();
+        // eco samples every 1-2 s, so seconds would tick unevenly: show them only
+        // at a fixed speed
+        let secs = [h, m, sec];
+        for v in &secs[..if self.speed > 0 { 3 } else { 2 }] {
+            let v = *v;
+            clock.push(b'0' + (v / 10) as u8);
+            clock.push(b'0' + (v % 10) as u8);
+            clock.push(b':');
+        }
+        clock.n -= 1;
+        clock.push(b' ');
+        let up = {
+            let u = self.uptime;
+            let (d, hh, mm) = (u / 86400, u % 86400 / 3600, u % 3600 / 60);
+            let mut f = F::new();
+            if d > 0 {
+                f.int(d as u32, 0);
+                f.str("d ");
+            }
+            f.int(hh as u32, 0);
+            f.str("h ");
+            f.push(b'0' + (mm / 10) as u8);
+            f.push(b'0' + (mm % 10) as u8);
+            f.push(b'm');
+            f
+        };
+        let tail: [(&str, u32); 4] = [
+            ("   up ", t.dim),
+            (up.s(), t.text),
+            ("   ", 0),
+            (clock.s(), t.fg | BOLD),
+        ];
+        let tail_short: [(&str, u32); 2] = [("   ", 0), (clock.s(), t.fg | BOLD)];
+        if !full {
+            // live frame: only the clock / uptime part changes
+            let tl: &[(&str, u32)] = if self.title_short.get() {
+                &tail_short
+            } else {
+                &tail
+            };
+            let tlen = Self::spans_len(tl);
+            Self::spans(scr, w.saturating_sub(tlen), 0, w, bar, tl);
+            return;
+        }
+        let topo = f!("   {} cores · {} threads", s.groups.len(), s.cpus.len());
+        let drv = f!(" · {}", s.driver);
+        let short = f!("  {}", s.short_model);
+        let brand = (" ◆ cpuview ", t.bg | BOLD);
+        let spd = f!(" {}", SPEEDS[self.speed].0);
+        let state_live: [(&str, u32); 3] = [("● ", t.good), ("live", t.mid), (spd.s(), t.dim)];
+        let drv_sp = if s.driver.is_empty() {
+            ("", 0)
+        } else {
+            (drv.s(), t.dim)
+        };
+        let (su, sf, st) = self.summary();
+        let (pu, pf, pt) = (
+            num(" ", su * 100.0, 0, "%"),
+            ghz(sf),
+            num("  ", st, 0, "°C"),
+        );
+        let maxf = self.s.t.maxf;
+        let (cu, cf, ct) = (
+            t.load.at(su) | BOLD,
+            t.freq.at(sf / maxf),
+            t.temp.at((st - 30.0) / 65.0),
+        );
+        let has_t = !self.s.temps.is_empty();
+        let sum_full: [(&str, u32); 7] = [
+            ("  cpu", t.dim),
+            (pu.s(), cu),
+            ("  ", 0),
+            (pf.s(), cf),
+            (" GHz", t.dim),
+            (if has_t { pt.s() } else { "" }, ct),
+            ("", 0),
+        ];
+        let sum_short: [(&str, u32); 2] =
+            [(pu.s(), cu), (if has_t { &pt.s()[1..] } else { "" }, ct)];
+        let no_top = self.lay.top.is_none();
+        let mut left0 = [(short.s(), t.fg | BOLD); 8];
+        left0[1..].copy_from_slice(&sum_full);
+        // (left part, short tail = clock only without uptime), most detailed first
+        let lefts: [(&[(&str, u32)], bool); 6] = if no_top {
+            [
+                (&left0, false),
+                (&sum_full, false),
+                (&sum_full, true),
+                (&sum_short, false),
+                (&sum_short, true),
+                (&[], true),
+            ]
+        } else {
+            [
+                (
+                    &[(short.s(), t.fg | BOLD), (topo.s(), t.mid), drv_sp],
+                    false,
+                ),
+                (&[(short.s(), t.fg | BOLD), (topo.s(), t.mid)], false),
+                (&[(short.s(), t.fg | BOLD)], false),
+                (&[(short.s(), t.fg | BOLD)], true),
+                (&[], true),
+                (&[], true),
+            ]
+        };
+        let state_len = if self.paused {
+            8
+        } else {
+            Self::spans_len(&state_live)
+        };
+        for (i, &(left, short_tail)) in lefts.iter().enumerate() {
+            let tl: &[(&str, u32)] = if short_tail { &tail_short } else { &tail };
+            let ll = 11 + Self::spans_len(left);
+            let rl = state_len + Self::spans_len(tl);
+            if ll + rl + 2 <= w || i == lefts.len() - 1 {
+                self.title_short.set(short_tail);
+                let mut x = scr.text(0, 0, brand.0, brand.1, t.accent, w);
+                x = Self::spans(scr, x, 0, w, bar, left);
+                let rx0 = w.saturating_sub(rl);
+                while x < rx0 {
+                    scr.put(x, 0, ' ', 0, bar);
+                    x += 1;
+                }
+                let rx = if self.paused {
+                    scr.text(rx0, 0, " PAUSED ", t.bg | BOLD, t.crit, w)
+                } else {
+                    Self::spans(scr, rx0, 0, w, bar, &state_live)
+                };
+                Self::line(scr, rx, 0, w, bar, tl);
+                break;
+            }
+        }
+    }
+
+    /// Braille area graph of the most recent `2 * w` values in `vals` (chronological).
+    #[allow(clippy::too_many_arguments)]
+    pub fn graph(
+        &self,
+        scr: &mut Screen,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+        vals: &[f32],
+        vmax: f32,
+        ramp: &crate::color::Ramp,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let bg = surf(S_PANEL);
+        let top = (h * 4) as f32;
+        let n = vals.len();
+        // dot height of every half-column, computed once (not once per row)
+        let w = w.min(1024);
+        let mut dots = [0u16; 2048];
+        for (i, d) in dots.iter_mut().enumerate().take(2 * w) {
+            // i over 0..2w; vals are right-aligned (newest last)
+            let j = n as isize - 2 * w as isize + i as isize;
+            if j < 0 {
+                continue;
+            }
+            let v = vals[j as usize];
+            if v > 0.0 {
+                *d = (v / vmax * top).round().clamp(1.0, top) as u16;
+            }
+        }
+        let dot = |i: usize| dots[i] as usize;
+        let gl = [
+            (0.25 * top).round() as usize,
+            (0.5 * top).round() as usize,
+            (0.75 * top).round() as usize,
+        ];
+        for r in 0..h {
+            let base = (h - 1 - r) * 4;
+            let col = ramp.at((h as f32 - r as f32 - 0.5) / h as f32);
+            let grid_bit = (0..4).find(|k| gl.contains(&(base + k + 1)));
+            for i in 0..w {
+                let (a, b) = (dot(2 * i), dot(2 * i + 1));
+                let mut code = 0;
+                if a >= base + 4 && b >= base + 4 {
+                    code = 0xff;
+                } else if a > base || b > base {
+                    for (k, &(lb, rb)) in BRAILLE.iter().enumerate() {
+                        if a > base + k {
+                            code |= lb;
+                        }
+                        if b > base + k {
+                            code |= rb;
+                        }
+                    }
+                }
+                if code != 0 {
+                    scr.put(
+                        x0 + i,
+                        y0 + r,
+                        char::from_u32(0x2800 + code).unwrap(),
+                        col,
+                        bg,
+                    );
+                } else if let (Some(k), true) = (grid_bit, i % 2 == 0) {
+                    scr.put(
+                        x0 + i,
+                        y0 + r,
+                        char::from_u32(0x2800 + BRAILLE[k].0).unwrap(),
+                        self.t.border,
+                        bg,
+                    );
+                } else {
+                    scr.put(x0 + i, y0 + r, ' ', NOPATCH, bg);
+                }
+            }
+        }
+    }
+
+    /// Graph with a y-axis label gutter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn axis_graph(
+        &self,
+        scr: &mut Screen,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+        vals: &[f32],
+        vmax: f32,
+        ramp: &crate::color::Ramp,
+        labels: &[(f32, &str)],
+    ) {
+        let labels = if h < 3 { &labels[..0] } else { labels };
+        let gut = labels
+            .iter()
+            .map(|l| l.1.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        if w < gut + 8 {
+            self.graph(scr, x0, y0, w, h, vals, vmax, ramp);
+            return;
+        }
+        self.graph(scr, x0 + gut, y0, w - gut, h, vals, vmax, ramp);
+        let mut used = [false; 64];
+        for r in 0..h.min(64) {
+            for x in x0..x0 + gut {
+                scr.put(x, y0 + r, ' ', 0, surf(S_PANEL));
+            }
+        }
+        for &(frac, s) in labels {
+            let r = (((1.0 - frac) * (h as f32 - 1.0)).round() as usize).min(h - 1);
+            if r < 64 && !used[r] {
+                used[r] = true;
+                let l = s.chars().count();
+                scr.text(
+                    x0 + gut - 1 - l,
+                    y0 + r,
+                    s,
+                    self.t.dim,
+                    surf(S_PANEL),
+                    x0 + gut,
+                );
+            }
+        }
+    }
+
+    fn draw_gload(&mut self, scr: &mut Screen, full: bool, body: bool) {
+        let r = self.lay.g_load;
+        let th = &self.t;
+        let u = self.s.tot_u;
+        let ir = r.inner();
+        let pct = num("", u * 100.0, 0, "%");
+        let title: [(&str, u32); 2] = [("cpu ", th.title | BOLD), (pct.s(), th.load.at(u) | BOLD)];
+        if full {
+            let win = span(2 * ir.w.saturating_sub(5));
+            let sub = f!("total load · last {}", win.s());
+            self.panel(scr, r, &title, sub.s());
+        } else {
+            self.panel_top(scr, r, &title);
+        }
+        if !(full || body) {
+            return;
+        }
+        let mut vals = std::mem::take(&mut self.vals);
+        self.s.h_tot.tail(2 * ir.w, 0.0, &mut vals);
+        self.axis_graph(
+            scr,
+            ir.x,
+            ir.y,
+            ir.w,
+            ir.h,
+            &vals,
+            1.0,
+            &self.t.load,
+            &[(1.0, "100%"), (0.5, "50"), (0.0, "0")],
+        );
+        self.vals = vals;
+    }
+
+    fn draw_gfreq(&mut self, scr: &mut Screen, full: bool, body: bool) {
+        let r = self.lay.g_freq;
+        let th = &self.t;
+        let s = &self.s;
+        let maxf = s.t.maxf;
+        let avg = s.avg_f;
+        let topf = s.f.iter().copied().fold(0.0, f32::max);
+        let ir = r.inner();
+        let (ga, gt) = (ghz(avg), ghz(topf));
+        let (ca, ct) = (
+            th.freq.at(avg / maxf) | BOLD,
+            th.freq.at(topf / maxf) | BOLD,
+        );
+        let vs: [&[(&str, u32)]; 4] = [
+            &[
+                ("clock ", th.title | BOLD),
+                ("avg ", th.mid),
+                (ga.s(), ca),
+                ("  top ", th.mid),
+                (gt.s(), ct),
+                (" GHz", th.mid),
+            ],
+            &[
+                ("clock ", th.title | BOLD),
+                (ga.s(), ca),
+                (" / ", th.dim),
+                (gt.s(), ct),
+            ],
+            &[("clock ", th.title | BOLD), (ga.s(), ca)],
+            &[("clock", th.title | BOLD)],
+        ];
+        let title = Self::pick(r.w, &vs);
+        if full {
+            let win = span(2 * ir.w.saturating_sub(5));
+            let sub = f!("average clock · last {}", win.s());
+            self.panel(scr, r, title, sub.s());
+        } else {
+            self.panel_top(scr, r, title);
+        }
+        if !(full || body) {
+            return;
+        }
+        let mut vals = std::mem::take(&mut self.vals);
+        self.s.h_avg.tail(2 * ir.w, 0.0, &mut vals);
+        let (m1, m2) = (ghz(maxf), ghz(maxf / 2.0));
+        self.axis_graph(
+            scr,
+            ir.x,
+            ir.y,
+            ir.w,
+            ir.h,
+            &vals,
+            maxf,
+            &self.t.freq,
+            &[(1.0, m1.s()), (0.5, m2.s()), (0.0, "0")],
+        );
+        self.vals = vals;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn meter(
+        &self,
+        scr: &mut Screen,
+        x: usize,
+        y: usize,
+        frac: f32,
+        w: usize,
+        ramp: &crate::color::Ramp,
+        bg: u32,
+        g: char,
+    ) {
+        let n8 = eighths(frac, w);
+        for i in 0..w {
+            Self::bar_cell(scr, x, y, i, n8, w, ramp, bg, g);
+        }
+    }
+
+    /// Cell `i` of a half-block bar filled to `n8` eighths: the edge cell is the bar
+    /// colour blended into the track by its covered fraction (sub-cell resolution).
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn bar_cell(
+        scr: &mut Screen,
+        x: usize,
+        y: usize,
+        i: usize,
+        n8: usize,
+        w: usize,
+        ramp: &crate::color::Ramp,
+        bg: u32,
+        g: char,
+    ) {
+        let den = (w.max(2) - 1) as f32;
+        let fg = if i < n8 / 8 {
+            ramp.at(i as f32 / den)
+        } else if i == n8 / 8 && n8 % 8 > 0 {
+            ramp.at(i as f32 / den) | ((n8 % 8) as u32) << BLEND_SHIFT
+        } else {
+            TRACK
+        };
+        scr.put(x + i, y, g, fg, bg);
+    }
+
+    /// Update a meter drawn earlier filled to `old` eighths: only the cells in between
+    /// change (the gradient is fixed per position).
+    #[allow(clippy::too_many_arguments)]
+    fn meter_to(
+        &self,
+        scr: &mut Screen,
+        x: usize,
+        y: usize,
+        old: usize,
+        n: usize,
+        w: usize,
+        ramp: &crate::color::Ramp,
+        bg: u32,
+        g: char,
+    ) {
+        for i in old.min(n) / 8..(old.max(n) / 8 + 1).min(w) {
+            Self::bar_cell(scr, x, y, i, n, w, ramp, bg, g);
+        }
+    }
+
+    fn draw_sensors(&mut self, scr: &mut Screen, full: bool) {
+        let r = self.lay.sensors;
+        if full {
+            self.panel(scr, r, &[("sensors", self.t.title | BOLD)], "");
+        }
+        let ir = r.inner();
+        if ir.h == 0 || ir.w < 10 {
+            return;
+        }
+        let th = &self.t;
+        let bg = surf(S_PANEL);
+        let s = &self.s;
+        // wide enough: bar + value + a history strip (4 s per cell) per sensor
+        let tsw = if ir.w >= 32 { 8 } else { 0 };
+        let bw =
+            ir.w.saturating_sub(13 + if tsw > 0 { tsw + 2 } else { 0 })
+                .max(4);
+        let nt = s.temps.len().max(1);
+        let skip_blank = nt + 5 > ir.h;
+        let mut y = ir.y;
+        let maxy = ir.y + ir.h;
+        let maxx = ir.x + ir.w;
+        if s.temps.is_empty() {
+            Self::line(
+                scr,
+                ir.x,
+                y,
+                maxx,
+                bg,
+                &[("no CPU temperature sensor found", th.dim)],
+            );
+            y += 1;
+        }
+        for sn in &s.temps {
+            if y >= maxy {
+                break;
+            }
+            let x = (sn.val - 30.0) / 65.0;
+            let lab = f!("{:<6}", sn.label);
+            scr.text(ir.x, y, lab.s(), th.mid, bg, ir.x + 6);
+            self.meter(scr, ir.x + 6, y, x, bw, &th.temp, bg, LOAD);
+            let v = num(" ", sn.val, 4, "°C");
+            Self::line(
+                scr,
+                ir.x + 6 + bw,
+                y,
+                maxx,
+                bg,
+                &[(v.s(), th.temp.at(x) | BOLD)],
+            );
+            if tsw > 0 {
+                // the hottest reading in the history window, after the value
+                let mx = (0..sn.hist.len())
+                    .map(|k| sn.hist.back(k))
+                    .fold(sn.val, f32::max);
+                let m = num("", mx, 0, "°");
+                let fm = ((mx - 30.0) / 65.0).clamp(0.0, 1.0);
+                Self::line(
+                    scr,
+                    maxx - tsw,
+                    y,
+                    maxx,
+                    bg,
+                    &[("max ", th.dim), (m.s(), th.temp.at(fm))],
+                );
+            }
+            y += 1;
+        }
+        if !skip_blank {
+            y += 1;
+        }
+        let maxf = s.t.maxf;
+        let peak = s.peak.iter().copied().fold(0.0, f32::max);
+        let boosting =
+            s.f.iter()
+                .filter(|&&f| f >= s.t.boost && s.t.has_freq)
+                .count();
+        let busy = s.u.iter().filter(|&&u| u >= 0.5).count();
+        let epp = if s.epp.is_empty() {
+            f!("")
+        } else {
+            f!(" · {}", s.epp)
+        };
+        let la = {
+            let mut f = F::new();
+            for (i, &v) in s.loadavg.iter().enumerate() {
+                if i > 0 {
+                    f.str("  ");
+                }
+                f.str(ghz(v * 1000.0).s());
+            }
+            f
+        };
+        let b1 = f!("{busy}");
+        let b2 = f!("/{} busy", s.u.len());
+        let b3 = f!("{boosting}");
+        let pk = ghz(peak);
+        let of = f!("  of {}", ghz(maxf).s());
+        let bst = if boosting > 0 { th.freq.at(1.0) } else { th.fg };
+        let pks = th.freq.at(peak / maxf) | BOLD;
+        // each row: variants, most detailed first; the first that fits is drawn
+        let rows: [&[&[(&str, u32)]]; 4] = [
+            &[
+                &[("policy  ", th.dim), (&s.gov, th.text), (epp.s(), th.mid)],
+                &[("policy  ", th.dim), (&s.gov, th.text)],
+                &[(&s.gov, th.text)],
+            ],
+            &[
+                &[("loadavg ", th.dim), (la.s(), th.text)],
+                &[(la.s(), th.text)],
+            ],
+            &[
+                &[
+                    ("active  ", th.dim),
+                    (b1.s(), th.fg),
+                    (b2.s(), th.mid),
+                    ("  ", 0),
+                    (b3.s(), bst),
+                    (" boosting", th.mid),
+                ],
+                &[
+                    ("active  ", th.dim),
+                    (b1.s(), th.fg),
+                    (b2.s(), th.mid),
+                    ("  ", 0),
+                    (b3.s(), bst),
+                    (" boost", th.mid),
+                ],
+                &[
+                    (b1.s(), th.fg),
+                    (b2.s(), th.mid),
+                    ("  ", 0),
+                    (b3.s(), bst),
+                    (" boost", th.mid),
+                ],
+                &[(b1.s(), th.fg), (b2.s(), th.mid)],
+            ],
+            &[
+                &[
+                    ("peak    ", th.dim),
+                    (pk.s(), pks),
+                    (" GHz", th.mid),
+                    (of.s(), th.dim),
+                ],
+                &[("peak    ", th.dim), (pk.s(), pks), (" GHz", th.mid)],
+                &[("peak ", th.dim), (pk.s(), pks)],
+            ],
+        ];
+        for vs in rows {
+            if y >= maxy {
+                break;
+            }
+            let sp = vs
+                .iter()
+                .find(|v| Self::spans_len(v) <= ir.w)
+                .unwrap_or(&vs[vs.len() - 1]);
+            Self::line(scr, ir.x, y, maxx, bg, sp);
+            y += 1;
+        }
+        // spare height: one line per CCD (load bar, mean load, mean core clock)
+        let nd = s.t.ndom;
+        if nd > 1 && y + 1 + nd <= maxy && ir.w >= 24 {
+            y += 1;
+            for d in 0..nd {
+                let (u, f, _) = ccd_stats(s, d);
+                let lab = f!("CCD{d}");
+                scr.text(ir.x, y, lab.s(), th.mid, bg, ir.x + 6);
+                for x in ir.x + lab.n..ir.x + 6 {
+                    scr.put(x, y, ' ', 0, bg);
+                }
+                self.meter(scr, ir.x + 6, y, u, bw, &th.load, bg, LOAD);
+                let pc = num(" ", u * 100.0, 3, "%");
+                let gz = ghz(f);
+                Self::line(
+                    scr,
+                    ir.x + 6 + bw,
+                    y,
+                    maxx,
+                    bg,
+                    &[
+                        (pc.s(), th.load.at(u)),
+                        ("  ", 0),
+                        (gz.s(), self.freq_style(f, f <= s.t.minf * 1.05 + 1.0)),
+                        (" GHz", th.dim),
+                    ],
+                );
+                y += 1;
+            }
+        }
+        // spare height: temperature history
+        let gh = maxy.saturating_sub(y + 2);
+        if let (Some(sn), true) = (s.temps.first(), gh >= 2) {
+            y += 1;
+            let win = span(2 * ir.w.saturating_sub(5));
+            let a = f!("{} history", sn.label);
+            let b = f!(" · last {}", win.s());
+            Self::line(scr, ir.x, y, maxx, bg, &[(a.s(), th.mid), (b.s(), th.dim)]);
+            y += 1;
+            let mut vals = std::mem::take(&mut self.vals);
+            self.s.temps[0].hist.tail(2 * ir.w, 0.0, &mut vals);
+            for v in vals.iter_mut() {
+                *v = (*v - 30.0).max(0.0);
+            }
+            self.axis_graph(
+                scr,
+                ir.x,
+                y,
+                ir.w,
+                gh,
+                &vals,
+                65.0,
+                &self.t.temp,
+                &[(1.0, "95°"), (0.5, "63°"), (0.0, "30°")],
+            );
+            self.vals = vals;
+        }
+    }
+
+    /// Field positions of a core card `width` cells wide in card mode `mode`.
+    pub fn geo(&self, width: usize, mode: u8) -> Geo {
+        let idw = self.idw;
+        // bars grow slowly with the width, the load-history strip takes the rest
+        let split = |avail: usize| -> (usize, usize, usize) {
+            if avail >= 36 {
+                let bars = (26 + (avail - 36) * 3 / 10).min(66);
+                let fw = bars * 47 / 100;
+                (fw, bars - fw, avail - 2 - bars)
+            } else {
+                let a = avail.max(8);
+                let fw = (a * 47 / 100).max(4);
+                (fw, a.saturating_sub(fw).max(3), 0)
+            }
+        };
+        match mode {
+            M_MICRO => {
+                let ghz = width >= 16;
+                let xl = idw + 2;
+                let fixed = xl + 4 + if ghz { 4 } else { 0 };
+                let lw = width.saturating_sub(fixed).max(3);
+                let xn = xl + lw + 1;
+                Geo {
+                    lw,
+                    xl,
+                    xn,
+                    xp: if ghz { xn + 4 } else { xn },
+                    ghz,
+                    ..Default::default()
+                }
+            }
+            M_COMPACT => {
+                let xb = idw + 3;
+                let (fw, lw, sw) = split(width.saturating_sub(idw + 18));
+                let xn = xb + fw + 1;
+                let xl = xn + 6;
+                let xp = xl + lw + 1;
+                Geo {
+                    fw,
+                    lw,
+                    sw,
+                    xb,
+                    xn,
+                    xl,
+                    xp,
+                    xs: xp + 9,
+                    ghz: true,
+                }
+            }
+            _ => {
+                let xb = 2 * idw + 5;
+                let (fw, lw, sw) = split(width.saturating_sub(2 * idw + 17));
+                let xn = xb + fw + 1;
+                let xl = xn + 6;
+                let xp = xl + lw + 1;
+                Geo {
+                    fw,
+                    lw,
+                    sw,
+                    xb,
+                    xn,
+                    xl,
+                    xp,
+                    xs: xp + 6,
+                    ghz: true,
+                }
+            }
+        }
+    }
+
+    /// A core's clock for compact cards: the fastest of its threads (one clock domain).
+    fn core_clock(&self, thr: &[usize]) -> (f32, f32, bool) {
+        let mut f = 0.0f32;
+        let mut b = 0.0f32;
+        let mut idle = true;
+        for &c in thr {
+            let (fc, u) = self.shown(c);
+            f = f.max(fc);
+            b = b.max(self.bf[c]);
+            idle &= u < 0.01 && fc <= self.s.t.minf * 1.05 + 1.0;
+        }
+        (f, b, idle)
+    }
+
+    /// The scheduler's preferred core(s): the highest amd-pstate ranking (ties too).
+    fn preferred(&self, g: usize) -> bool {
+        let r = &self.s.t.rank;
+        r[g] >= 0 && r.iter().all(|&x| x <= r[g]) && r.iter().any(|&x| x != r[g])
+    }
+
+    /// Selection / preferred-core marker before a core's name.
+    fn marker(&self, g: usize) -> (char, u32) {
+        if g == self.selected {
+            ('▌', self.t.accent)
+        } else if self.preferred(g) {
+            ('◆', self.t.warn)
+        } else {
+            (' ', 0)
+        }
+    }
+
+    fn freq_style(&self, f: f32, idle: bool) -> u32 {
+        let th = &self.t;
+        let maxf = self.s.t.maxf;
+        // not bold: clocks are secondary to load (most busy threads boost anyway)
+        if f >= self.s.t.boost {
+            th.freq.at(f / maxf)
+        } else if idle {
+            th.dim
+        } else {
+            th.freq.at((f / maxf).max(0.45))
+        }
+    }
+
+    fn draw_cores(&mut self, scr: &mut Screen, full: bool) {
+        let l = &self.lay;
+        let th = &self.t;
+        let n = self.ngroups();
+        let ir = l.cores.inner();
+        if full {
+            let view = ["full", "compact", "micro"][l.mode as usize];
+            let vtxt = if self.view == 0 {
+                f!("auto · {view}")
+            } else {
+                f!("{view}")
+            };
+            let nn = f!("{n}");
+            let pref = l.mode != M_MICRO && (0..n).any(|g| self.preferred(g));
+            let dual = l.compact && self.s.t.groups.first().is_some_and(|g| g.len() >= 2);
+            let subs: [&str; 4] = [
+                if pref && dual {
+                    "◆ preferred core · faded load = one thread"
+                } else {
+                    ""
+                },
+                if dual { "faded load = one thread" } else { "" },
+                if pref { "◆ preferred core" } else { "" },
+                "",
+            ];
+            let sub = subs
+                .iter()
+                .find(|t| !t.is_empty() && t.chars().count() + 8 < l.cores.w)
+                .copied()
+                .unwrap_or("");
+            let vs: [&[(&str, u32)]; 4] = [
+                &[
+                    ("cores ", th.title | BOLD),
+                    (nn.s(), th.text),
+                    ("   sort ", th.mid),
+                    (SORTS[self.sort], th.text),
+                    ("   view ", th.mid),
+                    (vtxt.s(), th.text),
+                ],
+                &[
+                    ("cores ", th.title | BOLD),
+                    (nn.s(), th.text),
+                    ("   sort ", th.mid),
+                    (SORTS[self.sort], th.text),
+                    ("  ", 0),
+                    (view, th.text),
+                ],
+                &[
+                    ("cores ", th.title | BOLD),
+                    (nn.s(), th.text),
+                    ("  ", 0),
+                    (SORTS[self.sort], th.text),
+                ],
+                &[("cores ", th.title | BOLD), (nn.s(), th.text)],
+            ];
+            self.panel(scr, l.cores, Self::pick(l.cores.w, &vs), sub);
+            // CCD boundaries: a thin rule in the gutter between columns of different CCDs
+            for c in 1..l.cols {
+                let d = |c: usize| self.order.get(c * l.nrows).map(|&k| self.s.t.ccd[k]);
+                let rule = d(c) != d(c - 1) || self.sort != 0;
+                if rule {
+                    let (px, pw) = l.card_x[c - 1];
+                    let x = ir.x + (px + pw + l.card_x[c].0) / 2;
+                    for y in ir.y..ir.y + ir.h {
+                        scr.put(x, y, '│', th.border, surf(S_PANEL));
+                    }
+                }
+            }
+        }
+        if ir.h == 0 {
+            return;
+        }
+        if l.header || l.div {
+            let mut k = mixk(&[
+                self.sort as u64,
+                l.mode as u64,
+                self.s.hist_n.min(4096) / 64,
+            ]);
+            for d in 0..self.s.t.ndom {
+                k = mixk(&[k, self.s.domain_temp(d).map_or(0, |t| t.round() as u64)]);
+            }
+            if self.memo(SLOT_HEADER, k) {
+                self.draw_cores_header(scr, ir);
+            }
+        }
+        let l = self.lay.clone();
+        let hn = self.s.hist_n;
+        for c in 0..l.cols {
+            let (cx, cw) = l.card_x[c];
+            let geo = self.geo(cw, l.mode);
+            for vr in 0..l.vis_rows {
+                let r = vr + self.scroll;
+                if r >= l.nrows {
+                    break;
+                }
+                let k = c * l.nrows + r;
+                let Some(&g) = self.order.get(k) else {
+                    continue;
+                };
+                let y = self.row_y(c, vr);
+                if y + l.rh > ir.y + ir.h {
+                    break;
+                }
+                let s = &self.s;
+                // card position / selection / (compact) values: a change redraws the card
+                let mut key = [0u64; 12];
+                key[0] = (g == self.selected) as u64 | (k as u64) << 1 | (y as u64) << 20;
+                if l.compact {
+                    key[1] = if geo.sw > 0 { hn / self.hist_step() } else { 0 };
+                    let (f, b, idle) = self.core_clock(&s.t.groups[g]);
+                    key[2] =
+                        (f / 10.0) as u64 | (eighths(b, geo.fw) as u64) << 32 | (idle as u64) << 60;
+                    for (j, &t) in s.t.groups[g].iter().take(4).enumerate() {
+                        let u = self.shown(t).1;
+                        key[3 + 2 * j] =
+                            (u * 1000.0) as u64 | (eighths(self.bu[t], geo.lw) as u64) << 32;
+                        key[4 + 2 * j] = (self.shown(t).0 / 10.0) as u64;
+                    }
+                }
+                let force = self.memo(SLOT_CARDS + g, mixk(&key));
+                if l.compact {
+                    if force {
+                        self.draw_card_compact(scr, g, ir.x + cx, y, cw, &geo, l.mode);
+                    }
+                } else {
+                    let mut rm = std::mem::take(&mut self.row_memo);
+                    if rm.len() < self.s.f.len() {
+                        rm.resize(self.s.f.len(), [u32::MAX; 6]);
+                    }
+                    self.draw_card(scr, g, ir.x + cx, y, cw, &geo, l.rh, &mut rm, force);
+                    self.row_memo = rm;
+                }
+            }
+        }
+    }
+
+    fn draw_cores_header(&self, scr: &mut Screen, ir: Rect) {
+        let l = &self.lay;
+        let th = &self.t;
+        let s = &self.s;
+        let bg = surf(S_PANEL);
+        for c in 0..l.cols {
+            let (cx, cw) = l.card_x[c];
+            let x0 = ir.x + cx;
+            let maxx = x0 + cw;
+            let mut dom = usize::MAX;
+            let mut multi = false;
+            for r in 0..l.nrows {
+                if let Some(&g) = self.order.get(c * l.nrows + r) {
+                    let d = s.t.ccd[g];
+                    if dom == usize::MAX {
+                        dom = d;
+                    } else if dom != d {
+                        multi = true;
+                    }
+                }
+            }
+            let geo = self.geo(cw, l.mode);
+            let lead = if l.mode == M_MICRO { "" } else { " " };
+            let label = |d: usize, scr: &mut Screen, y: usize| -> usize {
+                let lab = f!("{lead}CCD{d}");
+                let mut x = scr.text(x0, y, lab.s(), th.text | BOLD, bg, maxx);
+                if let Some(temp) = s.domain_temp(d) {
+                    let tt = num(" ", temp, 0, "°");
+                    x = scr.text(x, y, tt.s(), th.temp.at((temp - 30.0) / 65.0), bg, maxx);
+                }
+                x
+            };
+            if let (true, Some(sr)) = (l.div, self.split_in(c, l.nrows)) {
+                if sr >= self.scroll && sr - self.scroll < l.vis_rows {
+                    let y = self.row_y(c, sr - self.scroll) - 1;
+                    let d = self.order.get(c * l.nrows + sr).map_or(0, |&g| s.t.ccd[g]);
+                    let mut x = label(d, scr, y);
+                    x = scr.text(x, y, " ", 0, bg, maxx);
+                    while x < maxx {
+                        scr.put(x, y, '─', th.border, bg);
+                        x += 1;
+                    }
+                }
+            }
+            if !l.header {
+                continue;
+            }
+            let first = self.order.get(c * l.nrows).map(|&g| s.t.ccd[g]);
+            let mut x;
+            if let (true, Some(d)) = (l.div && self.sort == 0, first) {
+                x = label(d, scr, ir.y);
+            } else if s.t.ndom > 1 && !multi && dom != usize::MAX && self.sort == 0 {
+                let lab = f!("{lead}CCD{dom}");
+                x = scr.text(x0, ir.y, lab.s(), th.text | BOLD, bg, maxx);
+                if let Some(temp) = s.domain_temp(dom) {
+                    let tt = num(" ", temp, 0, "°");
+                    x = scr.text(x, ir.y, tt.s(), th.temp.at((temp - 30.0) / 65.0), bg, maxx);
+                }
+            } else {
+                let lab = f!("{lead}core");
+                x = scr.text(x0, ir.y, lab.s(), th.dim, bg, maxx);
+            }
+            // a label goes exactly over its column, or not at all
+            let mut at = |col: usize, text: &str, x: &mut usize| {
+                let col = x0 + col;
+                if col <= *x || col + text.chars().count() > maxx {
+                    return;
+                }
+                while *x < col {
+                    scr.put(*x, ir.y, ' ', 0, bg);
+                    *x += 1;
+                }
+                *x = scr.text(col, ir.y, text, th.dim, bg, maxx);
+            };
+            if l.mode == M_MICRO {
+                at(geo.xl, "load", &mut x);
+                if geo.ghz {
+                    at(geo.xn, "GHz", &mut x);
+                }
+                at(geo.xp + 2, "%", &mut x);
+            } else {
+                // "clock" sits at the bar's start, or at its end when the CCD label is there
+                if x0 + geo.xb > x {
+                    at(geo.xb, "clock", &mut x);
+                } else if geo.fw >= 12 {
+                    at(geo.xb + geo.fw - 5, "clock", &mut x);
+                }
+                at(geo.xn + 1, "GHz", &mut x);
+                at(geo.xl, "load", &mut x);
+                at(
+                    geo.xp + if l.mode == M_COMPACT { 6 } else { 3 },
+                    "%",
+                    &mut x,
+                );
+                if geo.sw > 0 {
+                    let win = span(geo.sw * STRIP_SECS);
+                    let lab = f!("load history · {}", win.s());
+                    let lab = if lab.n <= geo.sw { lab } else { f!("history") };
+                    at(geo.xs, lab.s(), &mut x);
+                }
+            }
+            while x < maxx {
+                scr.put(x, ir.y, ' ', 0, bg);
+                x += 1;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_card(
+        &self,
+        scr: &mut Screen,
+        g: usize,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        geo: &Geo,
+        rh: usize,
+        rm: &mut [[u32; 6]],
+        force: bool,
+    ) {
+        let sel = g == self.selected;
+        let bg = if sel { surf(S_SELECT) } else { surf(S_PANEL) };
+        let threads = &self.s.t.groups[g];
+        let th = &self.t;
+        let s = &self.s;
+        let maxx = x0 + w;
+        let (fw, lw, sw) = (geo.fw, geo.lw, geo.sw);
+        let idw = self.idw;
+        let active = threads.iter().any(|&c| self.shown(c).1 >= 0.05);
+        let hn = s.hist_n as u32;
+        for j in 0..rh {
+            let y = y0 + j;
+            let Some(&c) = threads.get(j) else {
+                if force {
+                    Self::line(scr, x0, y, maxx, bg, &[]);
+                }
+                continue;
+            };
+            let (f, u) = self.shown(c);
+            let idle = u < 0.01 && f <= s.t.minf * 1.05 + 1.0;
+            let (bf, bu) = (self.bf[c], self.bu[c]);
+            let fnn = eighths(bf, fw) as u32;
+            let lnn = eighths(bu, lw) as u32;
+            let pct = (u * 100.0).round() as u32;
+            let keys = [
+                fnn | (idle as u32) << 16,
+                (f / 10.0) as u32 | (idle as u32) << 24,
+                lnn,
+                pct | ((u * 64.0).round() as u32) << 8,
+                if sw > 0 {
+                    hn / self.hist_step() as u32
+                } else {
+                    0
+                },
+                (j == 0 && (sel || active)) as u32,
+            ];
+            let mut memo = if force || c >= rm.len() {
+                [u32::MAX; 6]
+            } else {
+                rm[c]
+            };
+            if force {
+                // static parts of the row: marker, names, separators
+                let mut x = x0;
+                let (mc, mf) = if j == 0 || sel {
+                    self.marker(g)
+                } else {
+                    (' ', 0)
+                };
+                scr.put(x, y, mc, mf, bg);
+                x += 1 + idw + 1;
+                let tid = f!(" t{:0w$} ", s.t.cpus[c], w = idw);
+                x = scr.text(x, y, tid.s(), th.dim, bg, maxx);
+                x += fw;
+                scr.put(x, y, ' ', 0, bg);
+                x += 5;
+                x = scr.text(x, y, "  ", 0, bg, maxx);
+                x += lw;
+                scr.put(x, y, ' ', 0, bg);
+                x += 4;
+                x = scr.text(x, y, "%", th.dim, bg, maxx);
+                if sw > 0 {
+                    x = scr.text(x, y, "  ", 0, bg, maxx) + sw;
+                }
+                while x < maxx {
+                    scr.put(x, y, ' ', 0, bg);
+                    x += 1;
+                }
+                if j > 0 {
+                    for k in 0..idw + 1 {
+                        scr.put(x0 + 1 + k, y, ' ', 0, bg);
+                    }
+                }
+            }
+            let xb = x0 + geo.xb;
+            if j == 0 && memo[5] != keys[5] {
+                let name = f!("C{:0w$}", g, w = idw);
+                scr.text(
+                    x0 + 1,
+                    y,
+                    name.s(),
+                    if keys[5] == 1 { th.fg } else { th.mid } | BOLD,
+                    bg,
+                    maxx,
+                );
+            }
+            if memo[0] != keys[0] {
+                let ramp = if idle { &th.freq_idle } else { &th.freq };
+                if memo[0] != u32::MAX && memo[0] >> 16 == keys[0] >> 16 {
+                    self.meter_to(
+                        scr,
+                        xb,
+                        y,
+                        (memo[0] & 0xffff) as usize,
+                        fnn as usize,
+                        fw,
+                        ramp,
+                        bg,
+                        CLK,
+                    );
+                } else {
+                    self.meter(scr, xb, y, bf, fw, ramp, bg, CLK);
+                }
+            }
+            if memo[1] != keys[1] {
+                let gz = ghz(f);
+                scr.text(x0 + geo.xn, y, gz.s(), self.freq_style(f, idle), bg, maxx);
+            }
+            let xl = x0 + geo.xl;
+            if memo[2] != keys[2] {
+                if memo[2] != u32::MAX {
+                    self.meter_to(
+                        scr,
+                        xl,
+                        y,
+                        memo[2] as usize,
+                        lnn as usize,
+                        lw,
+                        &th.load,
+                        bg,
+                        LOAD,
+                    );
+                } else {
+                    self.meter(scr, xl, y, bu, lw, &th.load, bg, LOAD);
+                }
+            }
+            if memo[3] != keys[3] {
+                let pc = num("", u * 100.0, 3, "");
+                let uc = if u < 0.01 {
+                    th.dim
+                } else if u >= 0.9 {
+                    th.load.at(u) | BOLD
+                } else {
+                    th.load.at(u)
+                };
+                scr.text(x0 + geo.xp, y, pc.s(), uc, bg, maxx);
+            }
+            if sw > 0 && memo[4] != keys[4] {
+                self.strip(scr, x0 + geo.xs, y, &threads[j..j + 1], sw, bg);
+            }
+            memo = keys;
+            if c < rm.len() {
+                rm[c] = memo;
+            }
+        }
+    }
+
+    /// One row per core: compact (core clock bar, two-thread load bar, both loads,
+    /// history strip) or micro (load bar, clock, busiest thread's load).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_card_compact(
+        &self,
+        scr: &mut Screen,
+        g: usize,
+        x0: usize,
+        y: usize,
+        w: usize,
+        geo: &Geo,
+        mode: u8,
+    ) {
+        let th = &self.t;
+        let thr = &self.s.t.groups[g];
+        let sel = g == self.selected;
+        let bg = if sel { surf(S_SELECT) } else { surf(S_PANEL) };
+        let maxx = x0 + w;
+        let (f, bf, idle) = self.core_clock(thr);
+        let ta = thr[0];
+        let tb = thr.get(1).copied();
+        let ua = self.shown(ta).1;
+        let ub = tb.map_or(0.0, |t| self.shown(t).1);
+        let active = ua.max(ub) >= 0.05;
+        let mut x = x0;
+        let name = f!("C{:0w$}", g, w = self.idw);
+        if mode == M_MICRO {
+            let nc = if sel || active { th.fg } else { th.mid } | BOLD;
+            x = scr.text(x, y, name.s(), nc, bg, maxx);
+        } else {
+            let (mc, mf) = self.marker(g);
+            scr.put(x, y, mc, mf, bg);
+            x = scr.text(
+                x + 1,
+                y,
+                name.s(),
+                if sel || active { th.fg } else { th.mid } | BOLD,
+                bg,
+                maxx,
+            );
+            while x < x0 + geo.xb {
+                scr.put(x, y, ' ', 0, bg);
+                x += 1;
+            }
+            let ramp = if idle { &th.freq_idle } else { &th.freq };
+            self.meter(scr, x, y, bf, geo.fw, ramp, bg, CLK);
+            x = scr.text(x + geo.fw, y, " ", 0, bg, maxx);
+            let gz = ghz(f);
+            x = scr.text(x, y, gz.s(), self.freq_style(f, idle), bg, maxx);
+        }
+        while x < x0 + geo.xl {
+            scr.put(x, y, ' ', 0, bg);
+            x += 1;
+        }
+        match tb {
+            Some(tb) => self.split_meter(scr, x, y, self.bu[ta], self.bu[tb], geo.lw, bg),
+            None => self.meter(scr, x, y, self.bu[ta], geo.lw, &th.load, bg, LOAD),
+        }
+        x += geo.lw;
+        let pc_style = |u: f32| if u < 0.01 { th.dim } else { th.load.at(u) };
+        if mode == M_MICRO {
+            if geo.ghz {
+                x = scr.text(x, y, " ", 0, bg, maxx);
+                let gz = ghz(f);
+                let st = if idle {
+                    th.dim
+                } else {
+                    self.freq_style(f, false)
+                };
+                x = scr.text(x, y, &gz.s()[..3], st, bg, maxx);
+            }
+            let u = ua.max(ub);
+            let pc = num(" ", u * 100.0, 3, "");
+            x = scr.text(x, y, pc.s(), pc_style(u), bg, maxx);
+        } else {
+            for u in [Some(ua), tb.map(|_| ub)] {
+                match u {
+                    Some(u) => {
+                        let pc = num(" ", u * 100.0, 3, "");
+                        x = scr.text(x, y, pc.s(), pc_style(u), bg, maxx);
+                    }
+                    None => x = scr.text(x, y, "    ", 0, bg, maxx),
+                }
+            }
+            if geo.sw > 0 {
+                x = scr.text(x, y, "  ", 0, bg, maxx);
+                self.strip(scr, x, y, thr, geo.sw, bg);
+                x += geo.sw;
+            }
+        }
+        while x < maxx {
+            scr.put(x, y, ' ', 0, bg);
+            x += 1;
+        }
+    }
+
+    /// A core's two threads in one thin bar: full colour up to the less busy thread's
+    /// load, faded from there to the busier one's (edge cells blend, as in `meter`).
+    #[allow(clippy::too_many_arguments)]
+    fn split_meter(&self, scr: &mut Screen, x: usize, y: usize, a: f32, b: f32, w: usize, bg: u32) {
+        let (lo, hi) = (eighths(a.min(b), w), eighths(a.max(b), w));
+        let den = (w.max(2) - 1) as f32;
+        let (full, one) = (&self.t.load, &self.t.load_one);
+        for i in 0..w {
+            let t = i as f32 / den;
+            // whole cells of the lower bar; its edge cell counts if at least half full
+            let in_lo = i < lo / 8 || (i == lo / 8 && lo % 8 >= 4);
+            let fg = if i < hi / 8 {
+                if in_lo {
+                    full.at(t)
+                } else {
+                    one.at(t)
+                }
+            } else if i == hi / 8 && hi % 8 > 0 {
+                (if in_lo { full.at(t) } else { one.at(t) }) | ((hi % 8) as u32) << BLEND_SHIFT
+            } else {
+                TRACK
+            };
+            scr.put(x + i, y, LOAD, fg, bg);
+        }
+    }
+
+    /// Load history of `thr` (averaged) as a strip of eighth-blocks, newest on the
+    /// right, `STRIP_SECS` per cell; buckets are aligned to whole cells so the strip
+    /// moves once per cell, not with every point.
+    #[allow(clippy::too_many_arguments)]
+    fn strip(&self, scr: &mut Screen, x: usize, y: usize, thr: &[usize], w: usize, bg: u32) {
+        let s = &self.s;
+        let k = STRIP_SECS;
+        let lag = (s.hist_n % k as u64) as usize;
+        let len = thr.iter().map(|&c| s.hu[c].len()).min().unwrap_or(0);
+        let ramp = &self.t.load;
+        for i in 0..w {
+            // cell i from the right
+            let (a, b) = (lag + i * k, lag + (i + 1) * k);
+            let xx = x + w - 1 - i;
+            if b > len {
+                scr.put(xx, y, ' ', NOPATCH, bg);
+                continue;
+            }
+            let mut sum = 0u32;
+            for &c in thr {
+                for p in a..b {
+                    sum += s.hu[c].back(p) as u32;
+                }
+            }
+            let v = sum as f32 / (k * thr.len()) as f32 / 255.0;
+            // half a cell at most, like the bars, so neighbouring rows stay apart
+            let lv = (v * 4.0).round() as usize;
+            if lv == 0 {
+                scr.put(xx, y, '▁', TRACK, bg);
+            } else {
+                scr.put(xx, y, BLOCKS[lv.min(4) - 1], ramp.at(v), bg);
+            }
+        }
+    }
+
+    /// Per-core history grid: (cells x, y, w, h of the grid area, rows, cols, cell w, cell h).
+    fn grid_geo(&self, r: Rect) -> Option<(Rect, usize, usize, usize, usize)> {
+        let n = self.ngroups();
+        let ir = r.inner();
+        let gw = ir.w.saturating_sub(GRID_STATS + 3);
+        let mut best = (f32::MAX, 0, 0, 0, 0);
+        for rows in 1..=4usize.min(n) {
+            let cols = n.div_ceil(rows);
+            let cw = ((gw + 2) / cols).saturating_sub(2);
+            let ch = ((ir.h + 1) / rows).saturating_sub(1);
+            if cw < 16 || ch < 5 {
+                continue;
+            }
+            // landscape cells (a cell is ~1:2), and full rows
+            let aspect = cw as f32 / (2.0 * ch as f32);
+            let score = (aspect - 1.5).abs() + if n % rows != 0 { 1.0 } else { 0.0 };
+            if score < best.0 {
+                best = (score, rows, cols, cw, ch);
+            }
+        }
+        let g = Rect {
+            x: ir.x,
+            y: ir.y,
+            w: gw,
+            h: ir.h,
+        };
+        (best.1 > 0).then_some((g, best.1, best.2, best.3, best.4))
+    }
+
+    /// Which core's grid cell is at screen cell (x, y)?
+    fn grid_at(&self, x: usize, y: usize) -> Option<usize> {
+        let r = self.lay.det.filter(|_| self.lay.grid)?;
+        let (g, _, cols, cw, ch) = self.grid_geo(r)?;
+        if !g.contains(x, y) {
+            return None;
+        }
+        let (c, rr) = ((x - g.x) / (cw + 2), (y - g.y) / (ch + 1));
+        let k = rr * cols + c;
+        (k < self.ngroups()).then_some(k)
+    }
+
+    fn draw_grid(&mut self, scr: &mut Screen, r: Rect, full: bool, body: bool) {
+        let th = &self.t;
+        let Some((g, rows, cols, cw, ch)) = self.grid_geo(r) else {
+            return;
+        };
+        let win = span(2 * cw);
+        if full {
+            let sub = f!("last {} per core · click to select", win.s());
+            self.panel(
+                scr,
+                r,
+                &[
+                    ("history ", th.title | BOLD),
+                    ("clock", th.freq.at(0.85)),
+                    (" over ", th.dim),
+                    ("load", th.load.at(0.6)),
+                ],
+                sub.s(),
+            );
+        }
+        let bg = surf(S_PANEL);
+        let maxf = self.s.t.maxf;
+        let mut vals = std::mem::take(&mut self.vals);
+        let mut v16 = std::mem::take(&mut self.tmp16);
+        let mut v8 = std::mem::take(&mut self.tmp8);
+        let n = self.ngroups();
+        for k in 0..n.min(rows * cols) {
+            let (x, y) = (g.x + (k % cols) * (cw + 2), g.y + (k / cols) * (ch + 1));
+            let thr = &self.s.t.groups[k];
+            let sel = k == self.selected;
+            let tbg = if sel { surf(S_SELECT) } else { bg };
+            let (f, _, idle) = self.core_clock(thr);
+            let u = thr.iter().map(|&c| self.shown(c).1).sum::<f32>() / thr.len() as f32;
+            let name = f!("C{:0w$}", k, w = self.idw);
+            let gz = ghz(f);
+            let pc = num("", u * 100.0, 3, "%");
+            let (mc, mf) = self.marker(k);
+            scr.put(x, y, mc, mf, tbg);
+            let mut xx = scr.text(
+                x + 1,
+                y,
+                name.s(),
+                if sel || u >= 0.05 { th.fg } else { th.mid } | BOLD,
+                tbg,
+                x + cw,
+            );
+            // value block right-aligned: "5.64 GHz  99%"
+            let right = gz.n + 4 + 2 + pc.n;
+            let rx = (x + cw).saturating_sub(right).max(xx + 1);
+            while xx < rx {
+                scr.put(xx, y, ' ', 0, tbg);
+                xx += 1;
+            }
+            Self::line(
+                scr,
+                rx,
+                y,
+                x + cw,
+                tbg,
+                &[
+                    (gz.s(), self.freq_style(f, idle)),
+                    (" GHz  ", th.dim),
+                    (pc.s(), if u < 0.01 { th.dim } else { th.load.at(u) }),
+                ],
+            );
+            if !(full || body) {
+                continue;
+            }
+            // clock (max of the threads) above load (mean of the threads)
+            let gh = ch - 1;
+            let fh = (gh * 2 / 5).max(1);
+            let lh = gh - fh;
+            vals.clear();
+            vals.resize(2 * cw, 0.0);
+            for &c in thr {
+                self.s.hf[c].tail(2 * cw, 0, &mut v16);
+                for (o, &v) in vals.iter_mut().zip(v16.iter()) {
+                    *o = o.max(v as f32);
+                }
+            }
+            self.graph(scr, x, y + 1, cw, fh, &vals, maxf, &th.freq);
+            vals.iter_mut().for_each(|v| *v = 0.0);
+            for &c in thr {
+                self.s.hu[c].tail(2 * cw, 0, &mut v8);
+                for (o, &v) in vals.iter_mut().zip(v8.iter()) {
+                    *o += v as f32 / 255.0 / thr.len() as f32;
+                }
+            }
+            self.graph(scr, x, y + 1 + fh, cw, lh, &vals, 1.0, &th.load);
+        }
+        // the selected core's numbers on the right
+        if full || body {
+            let ir = r.inner();
+            let sx = ir.x + ir.w - GRID_STATS;
+            for yy in 0..ir.h {
+                scr.put(sx - 2, ir.y + yy, '┃', th.border, bg);
+            }
+            self.draw_stats(
+                scr,
+                self.selected,
+                sx,
+                ir.y,
+                GRID_STATS,
+                ir.h,
+                2 * cw,
+                &mut v16,
+                &mut v8,
+            );
+        }
+        self.vals = vals;
+        self.tmp16 = v16;
+        self.tmp8 = v8;
+    }
+
+    /// Mean load of `thr` in history cell `i` (from the right, `STRIP_SECS` per cell,
+    /// aligned to whole cells); None before the history starts.
+    fn cell_load(&self, thr: &[usize], i: usize) -> Option<f32> {
+        let s = &self.s;
+        let k = STRIP_SECS;
+        let lag = (s.hist_n % k as u64) as usize;
+        let (a, b) = (lag + i * k, lag + (i + 1) * k);
+        if thr.iter().any(|&c| b > s.hu[c].len()) {
+            return None;
+        }
+        let mut sum = 0u32;
+        for &c in thr {
+            for p in a..b {
+                sum += s.hu[c].back(p) as u32;
+            }
+        }
+        Some(sum as f32 / (k * thr.len()) as f32 / 255.0)
+    }
+
+    /// The all-cores heatmap needs a row per two cores.
+    fn heat_fits(&self, r: Rect) -> bool {
+        let ir = r.inner();
+        let n = self.ngroups();
+        n >= 4 && ir.h >= n.div_ceil(2) && ir.w >= 60
+    }
+
+    /// Detail area as a load heatmap of every core over time (two cores per row:
+    /// upper and lower half of each cell), the selected core's statistics beside it.
+    fn draw_heat(&mut self, scr: &mut Screen, r: Rect, full: bool) {
+        let th = &self.t;
+        let ir = r.inner();
+        let n = self.ngroups();
+        let rows = n.div_ceil(2);
+        let stats_w = if ir.w >= 110 { 30 } else { 0 };
+        let idw = self.idw;
+        let lw = 2 * idw + 3;
+        let hx = ir.x + lw;
+        let hw = ir.w - lw - if stats_w > 0 { stats_w + 3 } else { 0 };
+        // a divider row between CCDs and a time axis, when there is room
+        let ccd_at = (1..n).find(|&g| self.s.t.ccd[g] != self.s.t.ccd[g - 1]);
+        let div = ccd_at.filter(|&g| g % 2 == 0 && ir.h > rows).map(|g| g / 2);
+        let axis = ir.h > rows + div.is_some() as usize;
+        if full {
+            let win = span(hw * STRIP_SECS);
+            let sub = f!("{} s per column · last {}", STRIP_SECS, win.s());
+            self.panel(
+                scr,
+                r,
+                &[("history ", th.title | BOLD), ("load per core", th.mid)],
+                sub.s(),
+            );
+        }
+        let bg = surf(S_PANEL);
+        let track = th.track;
+        let heat = |v: Option<f32>| -> u32 {
+            match v {
+                // quantised so a steady load gives identical neighbours (no repaint)
+                Some(v) if v >= 0.03 => {
+                    let q = (v * 16.0).round() / 16.0;
+                    crate::color::mix(track, th.temp.at(q), 0.45 + 0.55 * q.min(1.0))
+                }
+                Some(_) => track,
+                None => crate::color::mix(track, th.panel, 0.6),
+            }
+        };
+        let mut y = ir.y;
+        for k in 0..rows {
+            if div == Some(k) {
+                let d = self.s.t.ccd[2 * k];
+                let lab = f!("CCD{d}");
+                let mut x = scr.text(ir.x, y, lab.s(), th.dim, bg, hx);
+                while x < hx + hw {
+                    scr.put(x, y, if x >= hx { '─' } else { ' ' }, th.border, bg);
+                    x += 1;
+                }
+                y += 1;
+            }
+            let (ga, gb) = (2 * k, 2 * k + 1);
+            // label "C00·01", the selected core's number in the accent colour
+            let num_st = |g: usize| {
+                if g == self.selected {
+                    th.accent | BOLD
+                } else {
+                    th.mid
+                }
+            };
+            let na = f!("{:0w$}", ga, w = idw);
+            let nb = f!("{:0w$}", gb, w = idw);
+            let mut x = scr.text(ir.x, y, "C", th.dim, bg, hx);
+            x = scr.text(x, y, na.s(), num_st(ga), bg, hx);
+            if gb < n {
+                x = scr.text(x, y, "·", th.dim, bg, hx);
+                x = scr.text(x, y, nb.s(), num_st(gb), bg, hx);
+            }
+            while x < hx {
+                scr.put(x, y, ' ', 0, bg);
+                x += 1;
+            }
+            let ta = &self.s.t.groups[ga];
+            for i in 0..hw {
+                let va = self.cell_load(ta, i);
+                if va.is_none() {
+                    // before the history starts: plain panel (the picture shows through)
+                    scr.put(hx + hw - 1 - i, y, ' ', NOPATCH, bg);
+                    continue;
+                }
+                let up = heat(va);
+                let lo = if gb < n {
+                    heat(self.cell_load(&self.s.t.groups[gb], i))
+                } else {
+                    th.panel
+                };
+                scr.put(hx + hw - 1 - i, y, '▀', up, lo);
+            }
+            y += 1;
+        }
+        if axis {
+            // minute ticks under the heatmap, "now" at the right
+            let mut x = hx;
+            while x < hx + hw {
+                scr.put(x, y, ' ', 0, bg);
+                x += 1;
+            }
+            let per_min = 60 / STRIP_SECS;
+            let mut m = 1;
+            while m * per_min + 3 < hw {
+                let lab = f!("-{m}m");
+                let tx = hx + hw - m * per_min;
+                scr.put(tx, y, '╵', th.border, bg);
+                scr.text(tx + 1, y, lab.s(), th.dim, bg, hx + hw);
+                m += if hw / per_min > 8 { 2 } else { 1 };
+            }
+            scr.text(hx + hw - 3, y, "now", th.dim, bg, hx + hw);
+        }
+        if stats_w > 0 {
+            let sx = ir.x + ir.w - stats_w;
+            for yy in 0..ir.h {
+                scr.put(sx - 2, ir.y + yy, '┃', th.border, bg);
+            }
+            let mut v16 = std::mem::take(&mut self.tmp16);
+            let mut v8 = std::mem::take(&mut self.tmp8);
+            self.draw_stats(
+                scr,
+                self.selected,
+                sx,
+                ir.y,
+                stats_w,
+                ir.h,
+                hw * STRIP_SECS,
+                &mut v16,
+                &mut v8,
+            );
+            self.tmp16 = v16;
+            self.tmp8 = v8;
+        }
+    }
+
+    fn draw_detail(&mut self, scr: &mut Screen, full: bool, body: bool) {
+        let Some(r) = self.lay.det else { return };
+        if self.lay.grid {
+            self.draw_grid(scr, r, full, body);
+            return;
+        }
+        if !self.det_core && self.heat_fits(r) {
+            if full || body {
+                self.draw_heat(scr, r, full);
+            }
+            return;
+        }
+        let gi = self.selected;
+        if full {
+            let name = f!("C{:0w$} ", gi, w = self.idw);
+            let mut tl = F::new();
+            for (i, &c) in self.s.t.groups[gi].iter().enumerate() {
+                if i > 0 {
+                    let _ = tl.write_str(" + ");
+                }
+                let _ = write!(tl, "t{:0w$}", self.s.t.cpus[c], w = self.idw);
+            }
+            self.panel(
+                scr,
+                r,
+                &[(name.s(), self.t.title | BOLD), (tl.s(), self.t.mid)],
+                "clock (top) · load (bottom)",
+            );
+        }
+        let mut vals = std::mem::take(&mut self.vals);
+        let mut v16 = std::mem::take(&mut self.tmp16);
+        let mut v8 = std::mem::take(&mut self.tmp8);
+        self.detail_body(scr, r, gi, &mut vals, &mut v16, &mut v8, full || body);
+        self.vals = vals;
+        self.tmp16 = v16;
+        self.tmp8 = v8;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn detail_body(
+        &self,
+        scr: &mut Screen,
+        r: Rect,
+        gi: usize,
+        vals: &mut Vec<f32>,
+        v16: &mut Vec<u16>,
+        v8: &mut Vec<u8>,
+        body: bool,
+    ) {
+        let threads = &self.s.t.groups[gi];
+        let th = &self.t;
+        let ir = r.inner();
+        let (w, h) = (ir.w, ir.h);
+        if h == 0 || w < 12 {
+            return;
+        }
+        let bg = surf(S_PANEL);
+        let stats_w = if w >= 110 { 30 } else { 0 };
+        let n = threads.len().max(1);
+        let gap = 3;
+        let cw = if stats_w > 0 {
+            ((w.saturating_sub(stats_w + gap * n)) / n).max(12)
+        } else {
+            ((w.saturating_sub(gap * (n - 1))) / n).max(12)
+        };
+        let lh = ((h.saturating_sub(1)) * 2 / 5).max(1);
+        let fh = h.saturating_sub(1 + lh).max(1);
+        let maxf = self.s.t.maxf;
+        let mut x = ir.x;
+        for (i, &c) in threads.iter().enumerate() {
+            if x + cw > ir.x + w + 1 {
+                break;
+            }
+            if i > 0 {
+                for yy in 0..h {
+                    scr.put(x - 2, ir.y + yy, '│', th.border, bg);
+                }
+            }
+            let s = &self.s;
+            let (f, u) = self.shown(c);
+            let tn = f!("t{:0w$}", s.t.cpus[c], w = self.idw);
+            let gz = ghz(f);
+            let ld = num("", u * 100.0, 0, "%");
+            let pk = ghz(s.peak[c]);
+            let maxx = (x + cw).min(ir.x + w);
+            Self::line(
+                scr,
+                x,
+                ir.y,
+                maxx,
+                bg,
+                &[
+                    (tn.s(), th.fg | BOLD),
+                    ("  ", 0),
+                    (gz.s(), th.freq.at(f / maxf) | BOLD),
+                    (" GHz", th.mid),
+                    ("   load ", th.dim),
+                    (ld.s(), th.load.at(u) | BOLD),
+                    ("   peak ", th.dim),
+                    (pk.s(), th.text),
+                ],
+            );
+            let gw = cw.min(ir.x + w - x);
+            if !body {
+                x += cw + gap;
+                continue;
+            }
+            s.hf[c].tail(2 * gw, 0, v16);
+            vals.clear();
+            vals.extend(v16.iter().map(|&v| v as f32));
+            let (mx, md) = (ghz(maxf), ghz(maxf / 2.0));
+            // no "0" at the clock's foot: the load graph's "100%" sits right below it
+            let fl: &[(f32, &str)] = if fh >= 5 {
+                &[(1.0, mx.s()), (0.5, md.s())]
+            } else {
+                &[(1.0, mx.s())]
+            };
+            self.axis_graph(scr, x, ir.y + 1, gw, fh, vals, maxf, &th.freq, fl);
+            self.s.hu[c].tail(2 * gw, 0, v8);
+            vals.clear();
+            vals.extend(v8.iter().map(|&v| v as f32 / 255.0));
+            let ll: &[(f32, &str)] = if lh >= 2 {
+                &[(1.0, "100%"), (0.0, "0")]
+            } else {
+                &[(0.5, "load")]
+            };
+            self.axis_graph(scr, x, ir.y + 1 + fh, gw, lh, vals, 1.0, &th.load, ll);
+            x += cw + gap;
+        }
+        if stats_w > 0 && body {
+            let sx = ir.x + w - stats_w;
+            for yy in 0..h {
+                scr.put(sx - 2, ir.y + yy, '┃', th.border, bg);
+            }
+            self.draw_stats(
+                scr,
+                gi,
+                sx,
+                ir.y,
+                stats_w,
+                h,
+                2 * cw.saturating_sub(5),
+                v16,
+                v8,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_stats(
+        &self,
+        scr: &mut Screen,
+        gi: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        win: usize,
+        v16: &mut Vec<u16>,
+        v8: &mut Vec<u8>,
+    ) {
+        let s = &self.s;
+        let th = &self.t;
+        let bg = surf(S_PANEL);
+        let threads = &s.t.groups[gi];
+        let (mut fs, mut fn_, mut boost, mut us, mut un) = (0.0f64, 0usize, 0usize, 0.0f64, 0usize);
+        for &c in threads {
+            let have = s.hf[c].len().min(win);
+            s.hf[c].tail(have, 0, v16);
+            for &f in v16.iter() {
+                fs += f as f64;
+                fn_ += 1;
+                if f as f32 >= s.t.boost && s.t.has_freq {
+                    boost += 1;
+                }
+            }
+            let have = s.hu[c].len().min(win);
+            s.hu[c].tail(have, 0, v8);
+            for &u in v8.iter() {
+                us += u as f64 / 255.0;
+                un += 1;
+            }
+        }
+        let avg_f = if fn_ > 0 {
+            (fs / fn_ as f64) as f32
+        } else {
+            0.0
+        };
+        let avg_u = if un > 0 { (us / un as f64) as f32 } else { 0.0 };
+        let boost = if fn_ > 0 {
+            boost as f32 / fn_ as f32
+        } else {
+            0.0
+        };
+        let peak = threads.iter().map(|&c| s.peak[c]).fold(0.0, f32::max);
+        let maxf = s.t.maxf;
+        let maxx = x + w;
+        let mut yy = y;
+        let name = f!("C{:0w$}", gi, w = self.idw);
+        let ccd = if s.t.ndom > 1 {
+            f!("  ·  CCD{}", s.t.ccd[gi])
+        } else {
+            f!("")
+        };
+        let thr = f!(
+            "  ·  {} thread{}",
+            threads.len(),
+            if threads.len() == 1 { "" } else { "s" }
+        );
+        let mut line = |sp: &[(&str, u32)], yy: &mut usize| {
+            if *yy < y + h {
+                Self::line(scr, x, *yy, maxx, bg, sp);
+                *yy += 1;
+            }
+        };
+        line(
+            &[
+                (name.s(), th.accent | BOLD),
+                (ccd.s(), th.mid),
+                (thr.s(), th.mid),
+            ],
+            &mut yy,
+        );
+        let rank = s.t.rank[gi];
+        if rank >= 0 {
+            let pos = 1 + s.t.rank.iter().filter(|&&r| r > rank).count();
+            let p = f!("#{pos}");
+            let of = f!(" of {}", s.t.rank.len());
+            line(
+                &[
+                    ("pref.   ", th.dim),
+                    (p.s(), th.fg | BOLD),
+                    (of.s(), th.mid),
+                    (if pos == 1 { "  ◆ best" } else { "" }, th.warn),
+                ],
+                &mut yy,
+            );
+        }
+        let (a, p) = (ghz(avg_f), ghz(peak));
+        let b = num("", boost * 100.0, 0, "%");
+        let l = num("", avg_u * 100.0, 0, "%");
+        let wn = span(win);
+        line(
+            &[
+                ("avg     ", th.dim),
+                (a.s(), th.freq.at(avg_f / maxf)),
+                (" GHz", th.mid),
+            ],
+            &mut yy,
+        );
+        line(
+            &[
+                ("peak    ", th.dim),
+                (p.s(), th.freq.at(peak / maxf)),
+                (" GHz", th.mid),
+            ],
+            &mut yy,
+        );
+        line(
+            &[
+                ("boost   ", th.dim),
+                (b.s(), th.fg),
+                (" of the time", th.mid),
+            ],
+            &mut yy,
+        );
+        line(
+            &[
+                ("load    ", th.dim),
+                (l.s(), th.load.at(avg_u)),
+                (" average", th.mid),
+            ],
+            &mut yy,
+        );
+        line(&[("window  ", th.dim), (wn.s(), th.text)], &mut yy);
+    }
+
+    fn draw_keys(&mut self, scr: &mut Screen) {
+        let w = self.w;
+        let y = self.h - 1;
+        let bar = surf(S_BAR);
+        scr.fill(
+            0,
+            y,
+            w,
+            1,
+            Cell {
+                ch: ' ',
+                fg: 0,
+                bg: bar,
+            },
+        );
+        let th = &self.t;
+        // (key, long, short, label)
+        let keys: [(char, &str, Option<&str>, &str); 10] = [
+            ('q', "quit", Some("quit"), "q"),
+            (' ', "pause", Some("pause"), "spc"),
+            ('s', "speed −/+", Some("speed"), "s"),
+            ('o', "sort", Some("sort"), "o"),
+            ('c', "view", Some("view"), "c"),
+            ('g', "graphs", Some("graphs"), "g"),
+            ('d', "detail", Some("detail"), "d"),
+            ('r', "reset peaks", Some("peaks"), "r"),
+            ('t', "theme", Some("theme"), "t"),
+            ('\0', "select", None, "←↑↓→"),
+        ];
+        let state = |k: char| -> &str {
+            match k {
+                's' => SPEEDS[self.speed].0,
+                'o' => SORTS[self.sort],
+                'c' => VIEWS[self.view],
+                'd' if !self.show_det => "off",
+                'd' if self.det_core => "core",
+                't' => &self.t.label,
+                _ => "",
+            }
+        };
+        // variants, most detailed first: (desc 0 long / 1 short / 2 none, pad, sep, theme name)
+        for (dv, pad, sep, tn) in [
+            (0, true, 2, true),
+            (1, true, 2, true),
+            (1, true, 1, true),
+            (1, false, 1, true),
+            (1, false, 1, false),
+            (2, false, 1, false),
+        ] {
+            let st = |k: char| if k == 't' && !tn { "" } else { state(k) };
+            let mut len = 0;
+            for (k, long, short, lab) in keys {
+                let d = match dv {
+                    0 => long,
+                    1 => short.unwrap_or(""),
+                    _ => "",
+                };
+                if dv > 0 && short.is_none() {
+                    continue;
+                }
+                len += lab.chars().count() + if pad { 2 } else { 0 };
+                if !d.is_empty() {
+                    len += 1 + d.chars().count();
+                }
+                let sv = st(k);
+                if !sv.is_empty() {
+                    len += 1 + sv.chars().count();
+                }
+                len += sep;
+            }
+            if len.saturating_sub(sep) > w && dv < 2 {
+                continue;
+            }
+            self.zones.clear();
+            let mut x = 0;
+            for (k, long, short, lab) in keys {
+                let d = match dv {
+                    0 => long,
+                    1 => short.unwrap_or(""),
+                    _ => "",
+                };
+                if dv > 0 && short.is_none() {
+                    continue;
+                }
+                let x0 = x;
+                if pad {
+                    x = scr.text(x, y, " ", th.accent, surf(S_CHIP), w);
+                }
+                x = scr.text(x, y, lab, th.accent | BOLD, surf(S_CHIP), w);
+                if pad {
+                    x = scr.text(x, y, " ", th.accent, surf(S_CHIP), w);
+                }
+                if !d.is_empty() {
+                    x = scr.text(x, y, " ", 0, bar, w);
+                    x = scr.text(x, y, d, th.mid, bar, w);
+                }
+                let sv = st(k);
+                if !sv.is_empty() {
+                    x = scr.text(x, y, " ", 0, bar, w);
+                    x = scr.text(x, y, sv, th.fg, bar, w);
+                }
+                if k != '\0' {
+                    self.zones.push((x0, x, k));
+                }
+                x += sep;
+            }
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake 16-core / 32-thread, 2-CCD machine (or any shape).
+    fn app(cores: usize, smt: usize, ccds: usize) -> App {
+        let n = cores * smt;
+        let mut s = Sampler::new_for_test(&(0..n).collect::<Vec<_>>());
+        s.t.groups = (0..cores)
+            .map(|c| (0..smt).map(|k| c + k * cores).collect())
+            .collect();
+        s.t.ccd = (0..cores).map(|c| c * ccds / cores).collect();
+        s.t.ndom = ccds;
+        s.t.rank = vec![-1; cores];
+        s.t.maxf = 5760.0;
+        s.t.minf = 620.0;
+        s.t.has_freq = true;
+        for i in 0..n {
+            s.f[i] = 620.0 + (i * 157 % 5000) as f32;
+            s.u[i] = (i * 37 % 100) as f32 / 100.0;
+        }
+        for _ in 0..200 {
+            s.sample_fake();
+        }
+        App::new(s, crate::theme::load("default").unwrap())
+    }
+
+    fn check(a: &App, w: usize, h: usize) {
+        let l = &a.lay;
+        let inside = |r: Rect| r.x + r.w <= w && r.y >= 1 && r.y + r.h <= h - 1;
+        assert!(inside(l.cores), "{w}x{h} cores {:?}", l.cores);
+        if let Some(t) = l.top {
+            assert!(inside(t) && t.y + t.h <= l.cores.y, "{w}x{h} top");
+            assert!(l.g_load.w + l.g_freq.w + l.sensors.w == w);
+        }
+        if let Some(d) = l.det {
+            assert!(inside(d) && d.y >= l.cores.y + l.cores.h, "{w}x{h} detail");
+        }
+        let ir = l.cores.inner();
+        for &(cx, cw) in &l.card_x {
+            assert!(cx + cw <= ir.w, "{w}x{h} card column overflows");
+        }
+        let step = l.rh + l.gap as usize;
+        let used = l.header as usize + l.vis_rows.min(l.nrows) * step - l.gap as usize;
+        assert!(used <= ir.h, "{w}x{h} rows overflow: {used} > {}", ir.h);
+    }
+
+    #[test]
+    fn all_cores_visible_at_the_three_sizes() {
+        for (w, h, compact) in [(172, 40, false), (120, 30, false), (80, 24, true)] {
+            let mut a = app(16, 2, 2);
+            a.first_size(w, h);
+            check(&a, w, h);
+            assert!(a.lay.fits, "{w}x{h}: cores must fit without scrolling");
+            assert_eq!(a.lay.compact, compact, "{w}x{h} view");
+            assert!(
+                a.lay.nrows <= a.lay.vis_rows,
+                "{w}x{h}: {} rows, {} visible",
+                a.lay.nrows,
+                a.lay.vis_rows
+            );
+            assert_eq!(a.lay.cols * a.lay.nrows >= 16, true);
+        }
+        // 172x40 = graphs + cores + detail (one CCD per column); the detail area takes a
+        // row from the graphs so the all-core heatmap (8 rows + borders) fits
+        let mut a = app(16, 2, 2);
+        a.first_size(172, 40);
+        assert!(a.lay.top.is_some() && a.lay.det.is_some());
+        assert_eq!(
+            (
+                a.lay.cols,
+                a.lay.nrows,
+                a.lay.top.unwrap().h,
+                a.lay.cores.h,
+                a.lay.det.unwrap().h
+            ),
+            (2, 8, 9, 19, 10)
+        );
+        assert!(a.heat_fits(a.lay.det.unwrap()));
+    }
+
+    #[test]
+    fn layout_and_drawing_at_many_sizes() {
+        for (cores, smt, ccds) in [
+            (16, 2, 2),
+            (8, 1, 1),
+            (4, 2, 1),
+            (64, 2, 8),
+            (1, 1, 1),
+            (12, 2, 2),
+        ] {
+            for w in (20..=260).step_by(13) {
+                for h in (6..=80).step_by(5) {
+                    let mut a = app(cores, smt, ccds);
+                    a.first_size(w, h);
+                    if h >= 8 && w >= 30 {
+                        check(&a, w, h);
+                    }
+                    if a.lay.fits {
+                        assert!(a.lay.nrows <= a.lay.vis_rows, "{cores}c {w}x{h}");
+                    }
+                    let mut scr = Screen::new(w, h);
+                    a.draw(&mut scr, true);
+                    a.draw(&mut scr, false);
+                    // toggles keep working
+                    a.show_top = !a.show_top;
+                    a.fit(w, h);
+                    a.draw(&mut scr, true);
+                    a.menu = Some(crate::menu::Menu::new("default"));
+                    a.draw(&mut scr, true);
+                }
+            }
+        }
+        // 16 cores fit without scrolling down to 40x12 (micro cards)
+        for (w, h) in [
+            (40, 12),
+            (50, 16),
+            (60, 20),
+            (45, 12),
+            (90, 50),
+            (200, 30),
+            (415, 105),
+        ] {
+            let mut a = app(16, 2, 2);
+            a.first_size(w, h);
+            check(&a, w, h);
+            assert!(a.lay.fits && a.lay.nrows <= a.lay.vis_rows, "{w}x{h}");
+        }
+        for w in [80, 100, 120, 140, 172, 200, 250] {
+            for h in [24, 30, 40, 50, 60] {
+                let mut a = app(16, 2, 2);
+                a.first_size(w, h);
+                assert!(a.lay.fits && a.lay.nrows <= a.lay.vis_rows, "{w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_and_clicks() {
+        let mut a = app(16, 2, 2);
+        a.first_size(172, 40);
+        a.selected = 0;
+        a.move_sel(0, 1);
+        assert_eq!(a.selected, 1);
+        a.move_sel(1, 0);
+        assert_eq!(a.selected, 9); // columns run top to bottom: C08.. in column 2
+        a.move_sel(1, 0);
+        assert_eq!(a.selected, 9);
+        let mut scr = Screen::new(172, 40);
+        a.draw(&mut scr, true);
+        let ir = a.lay.cores.inner();
+        let g = a.card_at(ir.x + 5, ir.y + 1 + 2 * a.lay.rh);
+        assert_eq!(g, Some(2));
+        assert_eq!(a.key_at(1, 39), Some('q'));
+        let t = a.zones.iter().find(|z| z.2 == 't').unwrap();
+        assert_eq!(a.key_at(t.0, 39), Some('t'));
+    }
+
+    #[test]
+    fn spring_eases_without_overshoot_and_settles() {
+        let (mut x, mut v) = (0.0f32, 0.0f32);
+        let dt = 1.0 / 60.0;
+        let ex = (-SPRING_W * dt).exp();
+        let mut prev = 0.0;
+        let mut frames = 0;
+        while spring(&mut x, &mut v, 1.0, dt, ex, 0.002) {
+            assert!(
+                x >= prev - 1e-6 && x <= 1.0 + 1e-3,
+                "monotone, no overshoot: {x}"
+            );
+            prev = x;
+            frames += 1;
+            assert!(frames < 120, "settles within 2 s");
+        }
+        assert_eq!((x, v), (1.0, 0.0), "snaps exactly onto the target");
+        assert!(
+            frames > 6,
+            "eases over several frames, not a jump ({frames})"
+        );
+        // frame-rate independent: two half steps land where one full step does
+        let (mut a, mut va, mut b, mut vb) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        spring(&mut a, &mut va, 1.0, 0.1, (-SPRING_W * 0.1f32).exp(), 1e-6);
+        for _ in 0..2 {
+            spring(
+                &mut b,
+                &mut vb,
+                1.0,
+                0.05,
+                (-SPRING_W * 0.05f32).exp(),
+                1e-6,
+            );
+        }
+        assert!((a - b).abs() < 1e-4 && (va - vb).abs() < 1e-3);
+    }
+
+    #[test]
+    fn smooth_bars_follow_samples_and_come_to_rest() {
+        let mut a = app(16, 2, 2);
+        a.fit(172, 40);
+        a.speed = SMOOTH;
+        let n = a.bf.len();
+        a.bars_snap(); // from rest at 0
+        for i in 0..n {
+            a.s.fe[i] = 5000.0;
+            a.s.ur[i] = 0.3;
+        }
+        a.retarget();
+        let mut t = 0.0;
+        let mut fast = a.bars_step(1.0 / 60.0);
+        assert!(
+            fast > 60.0,
+            "a big step moves faster than an eighth per frame"
+        );
+        while fast > 0.0 {
+            fast = a.bars_step(1.0 / 60.0);
+            t += 1.0 / 60.0;
+            assert!(t < 2.0);
+        }
+        assert!(a.bu.iter().all(|&u| u == 0.3));
+        assert!(a.bf.iter().all(|&f| f == 5000.0 / 5760.0));
+        // noise below the deadband doesn't move a settled bar; 0 % always does
+        a.s.ur[0] = 0.305;
+        a.s.ur[1] = 0.0;
+        a.retarget();
+        a.bars_step(1.0 / 60.0);
+        assert_eq!(a.bu[0], 0.3);
+        assert!(a.bu[1] < 0.3);
+        // numbers show where the bars are
+        a.snap_numbers();
+        assert_eq!(a.shown(0), (5000.0, 0.3));
+        // other speeds: bars jump to the sample
+        a.speed = 0;
+        a.bars_snap();
+        assert_eq!(a.bu[0], 0.305);
+    }
+
+    #[test]
+    fn bars_have_eighth_cell_resolution() {
+        assert_eq!(eighths(0.0, 10), 0);
+        assert_eq!(eighths(1.0, 10), 80);
+        assert_eq!(eighths(0.5 + 1.0 / 160.0, 10), 41);
+        assert_eq!(eighths(2.0, 10), 80);
+        let a = app(4, 1, 1);
+        let mut scr = Screen::new(12, 1);
+        a.meter(&mut scr, 0, 0, 0.3125, 10, &a.t.load, surf(S_PANEL), LOAD); // 3 1/8 cells
+        let cell = |i: usize| scr.buf[i].fg;
+        assert!((0..3).all(|i| cell(i) & (TRACK | BLEND) == 0));
+        assert_eq!((cell(3) & BLEND) >> BLEND_SHIFT, 1, "edge cell covers 1/8");
+        assert!((4..10).all(|i| cell(i) & TRACK != 0));
+    }
+
+    #[test]
+    fn formatting() {
+        assert_eq!(ghz(5530.0).s(), "5.53");
+        assert_eq!(ghz(620.0).s(), "0.62");
+        assert_eq!(ghz(10004.0).s(), "10.00");
+        assert_eq!(num(" ", 7.4, 3, "%").s(), "   7%");
+        assert_eq!(num("", 100.0, 3, "").s(), "100");
+        assert_eq!(span(108).s(), "1m 48s");
+        assert_eq!(span(54).s(), "54s");
+        use crate::sys::pf;
+        assert_eq!(pf(" 4.21\n"), Some(4.21));
+        assert_eq!(pf("0.6"), Some(0.6));
+        assert_eq!(pf("-2"), Some(-2.0));
+        assert_eq!((pf("x"), pf(""), pf("1.2.3")), (None, None, None));
+        assert_eq!(ghz(4.21 * 1000.0).s(), "4.21");
+    }
+}

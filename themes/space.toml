@@ -1,0 +1,90 @@
+# cpuview theme — schema: themes/README.md
+name = "space"
+label = "Space"
+description = "Deep black-blue void, a faint Milky Way band and a crisp starfield"
+schema = 1
+
+[palette]
+bg        = "#03050b"
+panel     = "#070b16"
+bar       = "#04060d"
+select    = "#142245"
+chip      = "#15223f"
+track     = "#121b30"
+border    = "#1e2a48"
+border_hi = "#3b5a9c"
+title     = "#eef2ff"
+accent    = "#8fb8ff"
+accent2   = "#c9a8ff"
+fg        = "#e4eaff"
+text      = "#b6c2e2"
+mid       = "#8290b4"
+dim       = "#536080"
+good      = "#5eead4"
+warn      = "#facc15"
+crit      = "#f43f5e"
+freq = ["#1e3a7a", "#3f7fe0", "#8fd3ff", "#f0f8ff"]
+load = ["#5eead4", "#facc15", "#fb923c", "#f43f5e"]
+temp = ["#60a5fa", "#5eead4", "#facc15", "#f43f5e"]
+
+[blend]
+brightness = 1.0
+screen = { tint = "#03050b", alpha = 0.0,  text_alpha = 0.3 }
+bar    = { tint = "#02040a", alpha = 0.4,  text_alpha = 0.6 }
+panel  = { tint = "#050914", alpha = 0.3,  text_alpha = 0.6 }
+select = { tint = "#1a2c5c", alpha = 0.55, text_alpha = 0.7 }
+chip   = { tint = "#1a2a50", alpha = 0.85, text_alpha = 0.9 }
+track  = { tint = "#25345c", alpha = 0.5 }
+dialog = { tint = "#040812", alpha = 0.78, text_alpha = 0.88 }
+
+[[background]]
+type = "gradient"
+angle = 0
+stops = [[0.0, "#01020a"], [0.6, "#040817"], [1.0, "#070c1e"]]
+
+[[background]]
+type = "noise"                       # Milky Way: warped clouds inside a diagonal band
+seed = 21
+scale = 3.0
+octaves = 6
+warp = 0.8
+colors = ["#101a40", "#4a5fa0", "#c8d4ff"]
+threshold = 0.3
+power = 1.2
+band = { center = 0.45, slope = -0.55, width = 0.26 }
+blend = "screen"
+opacity = 0.8
+
+[[background]]
+type = "noise"                       # dark dust lanes along the band
+seed = 37
+scale = 6.0
+octaves = 4
+ridged = true
+colors = ["#000000", "#000000"]
+threshold = 0.72
+power = 1.0
+band = { center = 0.45, slope = -0.55, width = 0.12 }
+blend = "over"
+opacity = 0.5
+
+[[background]]
+type = "radial"                      # a distant blue glow
+center = [0.82, 0.2]
+radius = 0.6
+stops = ["#3a2a7a", "#0a0f28"]
+blend = "screen"
+opacity = 0.6
+
+[[background]]
+type = "stars"
+seed = 7
+density = 0.006
+min_brightness = 0.25
+colors = ["#ffffff", "#cfe0ff", "#ffe9c4", "#ffd2d2", "#bcd4ff"]
+glyph_density = 0.022
+glyphs = ["·", "·", "∙", "•"]
+
+[[background]]
+type = "vignette"
+strength = 0.4
