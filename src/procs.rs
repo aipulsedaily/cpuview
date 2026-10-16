@@ -1256,7 +1256,10 @@ mod tests {
         assert_eq!(n(b"-bash\0", b"bash"), ("-bash".into(), 5));
         // a rewritten title whose path holds spaces
         assert_eq!(
-            n(b"/home/u/My Apps/chrome-headless-shell --type=renderer", b"chrome-headless"),
+            n(
+                b"/home/u/My Apps/chrome-headless-shell --type=renderer",
+                b"chrome-headless"
+            ),
             ("chrome-headless-shell".into(), 38)
         );
     }

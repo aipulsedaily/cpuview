@@ -1890,7 +1890,12 @@ impl App {
         }
         let total_ram = (self.m.mi.total as f32).max(1.0);
         cell(&mut w, C_MEM, bsize(a.mem.n, false).s(), t.fg);
-        cell(&mut w, C_RAM, pct1((a.mem.n / total_ram).min(1.0)).s(), t.mid);
+        cell(
+            &mut w,
+            C_RAM,
+            pct1((a.mem.n / total_ram).min(1.0)).s(),
+            t.mid,
+        );
         for (col, v) in [(C_RD, rd), (C_WR, wr)] {
             let s = if noio {
                 fs("?")
@@ -2465,7 +2470,11 @@ mod tests {
         };
         let long = "x".repeat(10_000);
         let procs: [(u32, String, &[u8]); 5] = [
-            (100, stat(100, "my (weird) name", 'S', 1, 0, 300), b"/usr/bin/my app\0--flag\0"),
+            (
+                100,
+                stat(100, "my (weird) name", 'S', 1, 0, 300),
+                b"/usr/bin/my app\0--flag\0",
+            ),
             (200, stat(200, "defunct", 'Z', 100, 0, 0), b""),
             (300, stat(300, "kworker/0:1", 'I', 2, 0x0020_0000, 0), b""),
             (400, stat(400, "long", 'R', 1, 0, 500), long.as_bytes()),
@@ -2497,7 +2506,12 @@ mod tests {
         let mut scr = Screen::new(128, 45);
         a.draw(&mut scr, true);
         let text: String = (0..45)
-            .map(|y| (0..128).map(|x| scr.buf[y * 128 + x].ch).collect::<String>() + "\n")
+            .map(|y| {
+                (0..128)
+                    .map(|x| scr.buf[y * 128 + x].ch)
+                    .collect::<String>()
+                    + "\n"
+            })
             .collect();
         let d = a.pv.d.as_ref().unwrap();
         // the kernel thread is hidden and counted, the unreadable one counted
