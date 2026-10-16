@@ -200,10 +200,7 @@ impl Config {
         s += &format!("sort = {}\n", crate::ui::SORTS[self.sort]);
         s += &format!("view = {}\n", crate::ui::VIEWS[self.view]);
         s += &format!("speed = {}\n", crate::ui::SPEEDS[self.speed].0);
-        s += &format!(
-            "page = {}\n",
-            crate::ui::page_name(self.page).1
-        );
+        s += &format!("page = {}\n", crate::ui::page_name(self.page).1);
         for o in &self.imgs {
             s += &format!(
                 "image.{}.dim = {}.{}\nimage.{}.blur = {}\n",

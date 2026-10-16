@@ -73,7 +73,9 @@ const NC: usize = 11;
 /// widths (with the space before), the bar's is set by the layout
 const CW: [usize; NC] = [7, 9, 6, 0, 9, 6, 7, 7, 5, 2, 7];
 /// dropped first to last as the table narrows
-const DROP: [usize; 10] = [C_AGE, C_WR, C_RD, C_THR, C_ST, C_RAM, C_BAR, C_USER, C_PID, C_MEM];
+const DROP: [usize; 10] = [
+    C_AGE, C_WR, C_RD, C_THR, C_ST, C_RAM, C_BAR, C_USER, C_PID, C_MEM,
+];
 /// the command column's minimum
 const CMD_MIN: usize = 14;
 
@@ -238,7 +240,10 @@ fn hsort(v: &mut [u64], names: Option<(&[procs::P], bool)>) {
         let Some((list, rev)) = names else {
             return a < b;
         };
-        let name = |k: u64| list.get((k & 0xffff_ffff) as usize).map_or("", |p| p.name());
+        let name = |k: u64| {
+            list.get((k & 0xffff_ffff) as usize)
+                .map_or("", |p| p.name())
+        };
         let o = name(a)
             .bytes()
             .map(|c| c.to_ascii_lowercase())
@@ -592,7 +597,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(r, &k)| {
-                    let h = list.get(idx(k) as usize).map_or(0, |p| procs_hash(p.group()));
+                    let h = list
+                        .get(idx(k) as usize)
+                        .map_or(0, |p| procs_hash(p.group()));
                     (h as u64) << 32 | r as u64
                 })
                 .collect();
@@ -633,7 +640,10 @@ impl App {
                     SO_MEM => a.rss as f32,
                     _ => a.rd + a.wr,
                 };
-                let (mut sv, mut svt) = old.iter().find(|o| o.key == a.key).map_or((v, 0), |o| (o.sv, o.svt));
+                let (mut sv, mut svt) = old
+                    .iter()
+                    .find(|o| o.key == a.key)
+                    .map_or((v, 0), |o| (o.sv, o.svt));
                 hyst_sv(&mut sv, &mut svt, v, so, now, snap);
                 (a.sv, a.svt) = (sv, svt);
             }
@@ -643,7 +653,11 @@ impl App {
                 .enumerate()
                 .map(|(gi, a)| {
                     let pid = list.get(a.first as usize).map_or(0, |p| p.pid);
-                    let k = if so == SO_NAME { a.first as u64 } else { gi as u64 };
+                    let k = if so == SO_NAME {
+                        a.first as u64
+                    } else {
+                        gi as u64
+                    };
                     key32(if so >= SO_PID { 0.0 } else { a.sv }, pid) | k
                 })
                 .collect();
@@ -721,7 +735,9 @@ impl App {
                     let mut x = first[i as usize];
                     let mut lst = 1u64;
                     while x != NONE {
-                        stack.push(x as u64 | ((dep + 1) as u64) << 32 | (g as u64) << 40 | lst << 56);
+                        stack.push(
+                            x as u64 | ((dep + 1) as u64) << 32 | (g as u64) << 40 | lst << 56,
+                        );
                         lst = 0;
                         x = next.get(x as usize).copied().unwrap_or(NONE);
                     }
@@ -758,7 +774,11 @@ impl App {
         // selection: the same process (or group) if it is still there, else the row
         // now at its place
         // (until the user picks one, the selection stays on the top row)
-        let found = if self.pv.pinned { self.pfind(self.pv.sel) } else { Some(0) };
+        let found = if self.pv.pinned {
+            self.pfind(self.pv.sel)
+        } else {
+            Some(0)
+        };
         let nrows = self.pv.rows.len();
         self.pv.sel_i = found.unwrap_or(self.pv.sel_i.min(nrows.saturating_sub(1)));
         if let Some(r) = self.pv.rows.get(self.pv.sel_i).copied() {
@@ -782,7 +802,8 @@ impl App {
 
     /// The index of the row with `key`.
     fn pfind(&self, key: u64) -> Option<usize> {
-        (0..self.pv.rows.len()).find(|&i| self.pv.rows.get(i).is_some_and(|r| self.row_key(r) == key))
+        (0..self.pv.rows.len())
+            .find(|&i| self.pv.rows.get(i).is_some_and(|r| self.row_key(r) == key))
     }
 
     /// Keep the selection on screen.
@@ -820,7 +841,8 @@ impl App {
     /// Values a row shows: (CPU % of one thread, resident bytes).
     fn row_vals(&self, r: &Row) -> (f32, f32) {
         if r.g > 0 {
-            self.pagg(r).map_or((0.0, 0.0), |a| (a.cpu * 100.0, a.rss as f32))
+            self.pagg(r)
+                .map_or((0.0, 0.0), |a| (a.cpu * 100.0, a.rss as f32))
         } else {
             self.prow_proc(r)
                 .map_or((0.0, 0.0), |p| (p.cpu * 100.0, p.rss as f32))
@@ -833,7 +855,10 @@ impl App {
         self.pv.ver += 1;
         let smooth = self.smooth() && !snap;
         let vh = self.prows_vis();
-        let (s0, s1) = (self.pv.scroll, (self.pv.scroll + vh).min(self.pv.rows.len()));
+        let (s0, s1) = (
+            self.pv.scroll,
+            (self.pv.scroll + vh).min(self.pv.rows.len()),
+        );
         for a in self.pv.ra.iter_mut() {
             a.live = false;
             a.rest = false;
@@ -954,7 +979,13 @@ impl App {
         for a in self.pv.ra.iter_mut().filter(|a| !a.rest) {
             let mut m = spring(&mut a.pos, &mut a.vel, a.target, dt, W_SLIDE, xs, 0.02);
             m |= a.cpu.step(dt, W_LOAD, xl, 0.01);
-            let u = if total { 0.1 * ncpu } else if a.cpu.x >= 99.5 { 1.0 } else { 0.1 };
+            let u = if total {
+                0.1 * ncpu
+            } else if a.cpu.x >= 99.5 {
+                1.0
+            } else {
+                0.1
+            };
             m |= a.cpu.digits(dt, u, 100.0);
             m |= a.mem.step(dt, W_LOAD, xl, 1.0);
             m |= a.mem.digits(dt, bstep(a.mem.x), 0.0);
@@ -1219,9 +1250,7 @@ impl App {
         };
         let Some(d) = self.pv.d.as_ref() else { return };
         let mut who = Vec::new();
-        let label;
-        let nice;
-        if r.g > 0 {
+        let (label, nice) = if r.g > 0 {
             let Some(a) = self.pagg(&r) else { return };
             for p in a.mem.iter().filter_map(|&m| d.list.get(m as usize)) {
                 who.push((p.pid, p.start));
@@ -1229,16 +1258,20 @@ impl App {
             let Some(p) = d.list.get(a.first as usize) else {
                 return;
             };
-            nice = p.nice as i32;
-            label = nf("", a.n, " processes named ").s().to_string() + p.group();
+            (
+                nf("", a.n, " processes named ").s().to_string() + p.group(),
+                p.nice as i32,
+            )
         } else {
             let Some(p) = d.list.get(r.idx as usize) else {
                 return;
             };
             who.push((p.pid, p.start));
-            nice = p.nice as i32;
-            label = p.name().to_string() + nf(" (pid ", p.pid, ", user ").s() + d.user(p.uid) + ")";
-        }
+            (
+                p.name().to_string() + nf(" (pid ", p.pid, ", user ").s() + d.user(p.uid) + ")",
+                p.nice as i32,
+            )
+        };
         self.pv.dlg = Some(Dlg {
             kind,
             sig: 0,
@@ -1391,7 +1424,11 @@ impl App {
         let so = self.pv.sort;
         let mut st = fs(" · sorted by ");
         st.str(psort_name(so));
-        st.str(if self.pv.rev != (so >= SO_PID) { " ▲" } else { " ▼" });
+        st.str(if self.pv.rev != (so >= SO_PID) {
+            " ▲ (o: next column)"
+        } else {
+            " ▼ (o: next column)"
+        });
         let mode = if self.pv.tree {
             " · tree"
         } else if self.pv.group {
@@ -1406,9 +1443,13 @@ impl App {
         ];
         let ncpu = self.s.f.len();
         let unit = if self.pv.total {
-            nf("CPU % of all ", ncpu as u32, " threads · memory resident · disk per second")
+            nf(
+                "CPU % of all ",
+                ncpu as u32,
+                " threads · memory resident · disk per second, ? not permitted",
+            )
         } else {
-            fs("CPU % of one CPU thread · memory resident · disk per second")
+            fs("CPU % of one CPU thread · memory resident · disk per second, ? not permitted")
         };
         let iw = l.table.inner().w;
         let sub = if iw >= unit.n + 4 {
@@ -1450,7 +1491,9 @@ impl App {
             ir.w as u64,
             c.iter().fold(0u64, |a, &c| a * 31 + c as u64),
             self.pv.threads as u64 | (d.nk as u64) << 32,
-            (d.load[0] * 100.0) as u64 | ((d.load[1] * 100.0) as u64) << 21 | ((d.load[2] * 100.0) as u64) << 42,
+            (d.load[0] * 100.0) as u64
+                | ((d.load[1] * 100.0) as u64) << 21
+                | ((d.load[2] * 100.0) as u64) << 42,
             msg as u64 | (self.pv.editing as u64) << 1 | (d.show_k as u64) << 2,
             procs_hash(&self.pv.filter) as u64 | (self.pv.shown as u64) << 32,
             d.denied as u64,
@@ -1460,21 +1503,35 @@ impl App {
         }
         let t = &self.t;
         let (x0, y, maxx) = (ir.x, ir.y, ir.x + ir.w);
-        let line = |scr: &mut Screen, sp: &[(&str, u32)]| Self::line(scr, x0, y, maxx, surf(S_PANEL), sp);
+        let line =
+            |scr: &mut Screen, sp: &[(&str, u32)]| Self::line(scr, x0, y, maxx, surf(S_PANEL), sp);
         if self.pv.editing {
             line(
                 scr,
                 &[
                     ("filter: ", t.accent | BOLD),
                     (&self.pv.filter, t.fg | BOLD),
-                    ("▏  enter keep · esc clear · matches name, command, user, pid", t.dim),
+                    (
+                        "▏  enter keep · esc clear · matches name, command, user, pid",
+                        t.dim,
+                    ),
                 ],
             );
             return;
         }
         if msg {
             let m = &self.pv.msg;
-            line(scr, &[(m, if self.pv.msg_bad { t.crit | BOLD } else { t.good | BOLD })]);
+            line(
+                scr,
+                &[(
+                    m,
+                    if self.pv.msg_bad {
+                        t.crit | BOLD
+                    } else {
+                        t.good | BOLD
+                    },
+                )],
+            );
             return;
         }
         let mut rest = nf(" processes: ", c[1], " running · ");
@@ -1554,7 +1611,11 @@ impl App {
         let (x0, y, maxx) = (ir.x, ir.y + 1, ir.x + ir.w);
         Self::line(scr, x0, y, maxx, bg, &[]);
         let so = self.pv.sort;
-        let arrow = if self.pv.rev != (so >= SO_PID) { "▲" } else { "▼" };
+        let arrow = if self.pv.rev != (so >= SO_PID) {
+            "▲"
+        } else {
+            "▼"
+        };
         let ncpu = self.s.f.len();
         let of = if self.pv.total {
             nf("of all ", ncpu as u32, "")
@@ -1599,7 +1660,14 @@ impl App {
             );
         }
         if l.bw > 0 {
-            scr.text(x0 + l.cx[C_BAR] + 1, y, of.s(), t.dim, bg, x0 + l.cx[C_BAR] + 1 + l.bw);
+            scr.text(
+                x0 + l.cx[C_BAR] + 1,
+                y,
+                of.s(),
+                t.dim,
+                bg,
+                x0 + l.cx[C_BAR] + 1 + l.bw,
+            );
         }
         let hi = so == SO_NAME;
         let cmd = if self.pv.group && !self.pv.tree {
@@ -1648,7 +1716,10 @@ impl App {
         let y0 = ir.y + 2;
         for s in 0..vh {
             let y = y0 + s;
-            match cand.get(s).and_then(|&c| self.pv.ra.get((c & 0xfff) as usize)) {
+            match cand
+                .get(s)
+                .and_then(|&c| self.pv.ra.get((c & 0xfff) as usize))
+            {
                 Some(&a) => {
                     self.pv.slots.push(a.key);
                     self.prow(scr, y, &a);
@@ -1670,7 +1741,14 @@ impl App {
                 "scanning…"
             };
             if pmemo(&mut self.pv.memo, K_ROWS, 2) {
-                Self::line(scr, ir.x, y0, ir.x + ir.w, surf(S_PANEL), &[(msg, self.t.dim)]);
+                Self::line(
+                    scr,
+                    ir.x,
+                    y0,
+                    ir.x + ir.w,
+                    surf(S_PANEL),
+                    &[(msg, self.t.dim)],
+                );
             }
         }
     }
@@ -1712,7 +1790,7 @@ impl App {
         // first, so most frames cost no lookups
         let key = mixk(&[
             a.key,
-            sel as u64 | (a.alpha * 32.0) as u64 * 2,
+            sel as u64 | ((a.alpha * 32.0) as u64 * 2),
             cpu_n.to_bits() as u64,
             a.mem.n.to_bits() as u64,
             self.pv.ver,
@@ -1775,14 +1853,21 @@ impl App {
                 w.right(x0 + l.cx[col] + CW[col], s, fg);
             }
         };
-        let pid = if group { nf("×", n, "") } else { nf("", p.pid, "") };
+        let pid = if group {
+            nf("×", n, "")
+        } else {
+            nf("", p.pid, "")
+        };
         cell(&mut w, C_PID, pid.s(), if group { t.accent } else { t.dim });
         if l.cx[C_USER] != usize::MAX {
             w.to(x0 + l.cx[C_USER] + 1);
             let u = d.user(p.uid);
             let cut = u.char_indices().nth(7).map_or(u.len(), |c| c.0);
             let long = u.chars().count() > 8;
-            w.put(if long { &u[..cut] } else { u }, if p.uid == 0 { t.dim } else { t.mid });
+            w.put(
+                if long { &u[..cut] } else { u },
+                if p.uid == 0 { t.dim } else { t.mid },
+            );
             if long {
                 w.put("+", t.dim);
             }
@@ -1805,7 +1890,7 @@ impl App {
         }
         let total_ram = (self.m.mi.total as f32).max(1.0);
         cell(&mut w, C_MEM, bsize(a.mem.n, false).s(), t.fg);
-        cell(&mut w, C_RAM, pct1(a.mem.n / total_ram).s(), t.mid);
+        cell(&mut w, C_RAM, pct1((a.mem.n / total_ram).min(1.0)).s(), t.mid);
         for (col, v) in [(C_RD, rd), (C_WR, wr)] {
             let s = if noio {
                 fs("?")
@@ -1816,7 +1901,12 @@ impl App {
             } else {
                 bsize(v, true)
             };
-            cell(&mut w, col, s.s(), if v >= 1.0 && iok { t.text } else { t.dim });
+            cell(
+                &mut w,
+                col,
+                s.s(),
+                if v >= 1.0 && iok { t.text } else { t.dim },
+            );
         }
         cell(&mut w, C_THR, nf("", thr, "").s(), t.mid);
         let (ch, sc) = match p.state {
@@ -1837,7 +1927,14 @@ impl App {
             for k in 1..dep.min((room - 16) / 2) {
                 w.put(if r.guide >> k & 1 == 1 { "│ " } else { "  " }, t.border);
             }
-            w.put(if r.fl & R_LAST != 0 { "└─" } else { "├─" }, t.border);
+            w.put(
+                if r.fl & R_LAST != 0 {
+                    "└─"
+                } else {
+                    "├─"
+                },
+                t.border,
+            );
         }
         if r.fl & R_KIDS != 0 {
             w.put(if r.fl & R_OPEN != 0 { "▾ " } else { "▸ " }, t.accent);
@@ -1909,7 +2006,9 @@ impl App {
             ir.w as u64,
             age(age_s).s().len() as u64 + age_s / 60,
             p.ppid as u64,
-            tr.map_or(0, |t| t.hlen as u64 | (t.back(&t.hc, 0).to_bits() as u64) << 8),
+            tr.map_or(0, |t| {
+                t.hlen as u64 | (t.back(&t.hc, 0).to_bits() as u64) << 8
+            }),
             self.pv.total as u64,
         ]);
         if !pmemo(&mut self.pv.memo, K_DET, k) && !full {
@@ -1937,7 +2036,10 @@ impl App {
             } else {
                 num(&mut s, "", p.ppid);
                 s += " ";
-                s += d.find(p.ppid).and_then(|j| d.list.get(j)).map_or("", |q| q.name());
+                s += d
+                    .find(p.ppid)
+                    .and_then(|j| d.list.get(j))
+                    .map_or("", |q| q.name());
             }
             s += " · user ";
             s += d.user(p.uid);
@@ -1965,7 +2067,10 @@ impl App {
             maxx,
             bg,
             &[
-                (if agg.is_some() { p.group() } else { p.name() }, t.fg | BOLD),
+                (
+                    if agg.is_some() { p.group() } else { p.name() },
+                    t.fg | BOLD,
+                ),
                 (&s, t.mid),
             ],
         );
@@ -1982,10 +2087,22 @@ impl App {
         } else {
             "?"
         };
-        let rows = if charts { 2 } else { ir.h.saturating_sub(2).max(1) }.min(ir.h - 1);
+        let rows = if charts {
+            2
+        } else {
+            ir.h.saturating_sub(2).max(1)
+        }
+        .min(ir.h - 1);
         let mut rest = cmd;
         for k in 0..rows {
-            let x = scr.text(x0, y, if k == 0 { "command " } else { "        " }, t.dim, bg, maxx);
+            let x = scr.text(
+                x0,
+                y,
+                if k == 0 { "command " } else { "        " },
+                t.dim,
+                bg,
+                maxx,
+            );
             let last = k + 1 == rows;
             let room = (maxx - x).saturating_sub(last as usize);
             let b = rest.char_indices().nth(room).map_or(rest.len(), |c| c.0);
@@ -2000,15 +2117,28 @@ impl App {
             y += 1;
         }
         if y < ir.y + ir.h {
-            let cg = if det.cgroup.is_empty() { "?" } else { &det.cgroup };
-            let cwd = if det.pid == p.pid { det.cwd.as_str() } else { "?" };
+            let cg = if det.cgroup.is_empty() {
+                "?"
+            } else {
+                &det.cgroup
+            };
+            let cwd = if det.pid == p.pid {
+                det.cwd.as_str()
+            } else {
+                "?"
+            };
             Self::line(
                 scr,
                 x0,
                 y,
                 maxx,
                 bg,
-                &[("cwd ", t.dim), (cwd, t.text), ("   cgroup ", t.dim), (cg, t.mid)],
+                &[
+                    ("cwd ", t.dim),
+                    (cwd, t.text),
+                    ("   cgroup ", t.dim),
+                    (cg, t.mid),
+                ],
             );
             y += 1;
         }
@@ -2054,16 +2184,28 @@ impl App {
         let mmax = mem.iter().copied().fold(1.0, f32::max);
         let mscale = nice(mmax).max(mmax);
         let secs = nf("   last ", pts.min(procs::HN) as u32, " s … now");
+        #[allow(clippy::type_complexity)]
         let charts: [(&[f32], &str, F, f32, F, &crate::color::Ramp); 2] = [
             (
                 cpu,
-                if self.pv.total { "CPU % of all" } else { "CPU % of 1 CPU" },
+                if self.pv.total {
+                    "CPU % of all"
+                } else {
+                    "CPU % of 1 CPU"
+                },
                 cpct(cpu[pts - 1]),
                 cscale,
                 cpct(cscale),
                 &t.load,
             ),
-            (mem, "memory", bsize(mem[pts - 1], false), mscale, blabel(mscale), &t.freq),
+            (
+                mem,
+                "memory",
+                bsize(mem[pts - 1], false),
+                mscale,
+                blabel(mscale),
+                &t.freq,
+            ),
         ];
         for (k, (vals, title, now, scale, top, ramp)) in charts.into_iter().enumerate() {
             let gx = x0 + k * (half + 2);
@@ -2073,7 +2215,12 @@ impl App {
                 y,
                 gx + half,
                 bg,
-                &[(title, t.mid), ("  ", 0), (now.s(), t.fg | BOLD), (secs.s(), t.dim)],
+                &[
+                    (title, t.mid),
+                    ("  ", 0),
+                    (now.s(), t.fg | BOLD),
+                    (secs.s(), t.dim),
+                ],
             );
             for yy in y + 1..y + 1 + gh {
                 Self::line(scr, gx, yy, (gx + half + 2).min(maxx), bg, &[]);
@@ -2098,7 +2245,9 @@ impl App {
 
     /// The signal / nice dialog (drawn over the table on every frame while open).
     fn pdlg_draw(&self, scr: &mut Screen) {
-        let Some(g) = self.pv.dlg.as_ref() else { return };
+        let Some(g) = self.pv.dlg.as_ref() else {
+            return;
+        };
         let t = &self.t;
         let w = (self.w.saturating_sub(4)).min(66);
         let h = 9;
@@ -2121,7 +2270,14 @@ impl App {
         self.panel(scr, r, &[(title, t.title | BOLD)], "");
         scr.set_bg(r.x, r.y, r.w, r.h, bg);
         let (x0, mx) = (r.x + 2, r.x + r.w - 2);
-        Self::spans(scr, x0, r.y + 2, mx, bg, &[("to ", t.dim), (&g.label, t.fg | BOLD)]);
+        Self::spans(
+            scr,
+            x0,
+            r.y + 2,
+            mx,
+            bg,
+            &[("to ", t.dim), (&g.label, t.fg | BOLD)],
+        );
         if g.kind == 0 {
             let mut x = x0;
             for k in 0..procs::NSIG {
@@ -2143,7 +2299,11 @@ impl App {
                 r.y + 5,
                 mx,
                 bg,
-                &[(procs::sig(g.sig).0, t.accent | BOLD), (" ", 0), (procs::sig(g.sig).2, t.mid)],
+                &[
+                    (procs::sig(g.sig).0, t.accent | BOLD),
+                    (" ", 0),
+                    (procs::sig(g.sig).2, t.mid),
+                ],
             );
         } else {
             let a = fi(g.old_nice);
@@ -2171,7 +2331,10 @@ impl App {
                 r.y + 5,
                 mx,
                 bg,
-                &[("higher = lower priority; going lower than now needs root", t.mid)],
+                &[(
+                    "higher = lower priority; going lower than now needs root",
+                    t.mid,
+                )],
             );
         }
         Self::spans(
@@ -2184,7 +2347,14 @@ impl App {
                 ("enter", t.accent | BOLD),
                 (" confirm · ", t.dim),
                 ("←→", t.accent | BOLD),
-                (if g.kind == 0 { " choose · " } else { " change · " }, t.dim),
+                (
+                    if g.kind == 0 {
+                        " choose · "
+                    } else {
+                        " change · "
+                    },
+                    t.dim,
+                ),
                 ("esc", t.accent | BOLD),
                 (" cancel", t.dim),
             ],
@@ -2200,7 +2370,14 @@ impl App {
         self.panel(scr, r, &[("network & system", self.t.title | BOLD)], "");
         let s = "Network — coming soon";
         let x = r.x + r.w.saturating_sub(s.chars().count()) / 2;
-        scr.text(x, r.y + r.h / 2, s, self.t.mid, surf(S_PANEL), r.x + r.w - 1);
+        scr.text(
+            x,
+            r.y + r.h / 2,
+            s,
+            self.t.mid,
+            surf(S_PANEL),
+            r.x + r.w - 1,
+        );
     }
 }
 
@@ -2245,8 +2422,9 @@ fn pmemo(memo: &mut Vec<u64>, slot: usize, key: u64) -> bool {
 }
 
 fn procs_hash(s: &str) -> u32 {
-    s.bytes()
-        .fold(0x811c_9dc5u32, |h, c| (h ^ c as u32).wrapping_mul(0x0100_0193))
+    s.bytes().fold(0x811c_9dc5u32, |h, c| {
+        (h ^ c as u32).wrapping_mul(0x0100_0193)
+    })
 }
 
 /// A sort value with hysteresis: follows `v` at once when they differ by more than
@@ -2261,8 +2439,7 @@ fn hyst_sv(sv: &mut f32, svt: &mut u32, v: f32, so: usize, now: u32, snap: bool)
     };
     if v == *sv {
         *svt = 0;
-    } else if snap || (v - *sv).abs() > margin || (*svt != 0 && now.wrapping_sub(*svt) >= HOLD_MS)
-    {
+    } else if snap || (v - *sv).abs() > margin || (*svt != 0 && now.wrapping_sub(*svt) >= HOLD_MS) {
         *sv = v;
         *svt = 0;
     } else if *svt == 0 {
@@ -2273,6 +2450,73 @@ fn hyst_sv(sv: &mut f32, svt: &mut u32, v: f32, so: usize, now: u32, snap: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake /proc: what a hidepid=2 mount shows a user (only their processes), an
+    /// unreadable process, a zombie, a kernel thread, odd names, a very long command
+    /// line. The real scanner reads it; the page draws it.
+    #[test]
+    fn restricted_proc_fixture() {
+        let dir = std::env::temp_dir().join(format!("cpuview-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stat = |pid: u32, name: &str, st: char, ppid: u32, flags: u64, rss: u32| {
+            format!(
+                "{pid} ({name}) {st} {ppid} {pid} {pid} 0 -1 {flags} 0 0 0 0 50 10 0 0 20 0 1 0 1000 9000000 {rss} 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0\n"
+            )
+        };
+        let long = "x".repeat(10_000);
+        let procs: [(u32, String, &[u8]); 5] = [
+            (100, stat(100, "my (weird) name", 'S', 1, 0, 300), b"/usr/bin/my app\0--flag\0"),
+            (200, stat(200, "defunct", 'Z', 100, 0, 0), b""),
+            (300, stat(300, "kworker/0:1", 'I', 2, 0x0020_0000, 0), b""),
+            (400, stat(400, "long", 'R', 1, 0, 500), long.as_bytes()),
+            (500, stat(500, "secret", 'S', 1, 0, 100), b"secret\0"),
+        ];
+        for (pid, st, cmd) in &procs {
+            let d = dir.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("stat"), st).unwrap();
+            std::fs::write(d.join("cmdline"), cmd).unwrap();
+        }
+        std::fs::write(dir.join("loadavg"), "1.50 0.75 0.25 2/300 999\n").unwrap();
+        // not readable (another user's, hidepid=1 style)
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("500/stat");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root = unsafe { libc::geteuid() } == 0;
+
+        let mut s = Sampler::new_for_test(&[0, 1]);
+        s.t.maxf = 5000.0;
+        let mut a = App::new(s, crate::theme::load("default").unwrap());
+        a.page = PG_PROC;
+        let mut d = Procs::new(dir.to_str().unwrap());
+        d.hide = 2;
+        a.pv.d = Some(d);
+        a.pv.group = false;
+        a.first_size(128, 45);
+        a.procs_enter();
+        let mut scr = Screen::new(128, 45);
+        a.draw(&mut scr, true);
+        let text: String = (0..45)
+            .map(|y| (0..128).map(|x| scr.buf[y * 128 + x].ch).collect::<String>() + "\n")
+            .collect();
+        let d = a.pv.d.as_ref().unwrap();
+        // the kernel thread is hidden and counted, the unreadable one counted
+        assert_eq!(d.nk, 1);
+        assert_eq!(d.list.len(), if root { 4 } else { 3 }, "{text}");
+        if !root {
+            assert_eq!(d.denied, 1);
+        }
+        assert!(text.contains("only your processes are visible"), "{text}");
+        assert!(text.contains("app --flag"), "{text}");
+        assert!(text.contains("<defunct>"), "{text}");
+        assert!(text.contains("xxxxxxxxxxxxxxxx"), "{text}");
+        assert!(text.contains("load 1.50 0.75 0.25"), "{text}");
+        // no io file (or not readable): disk "?", never blank
+        assert!(text.contains("      ?      ?"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn heap_sort_and_formats() {

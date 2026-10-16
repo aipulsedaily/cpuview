@@ -126,7 +126,10 @@ pub fn field(b: &[u8], key: &[u8]) -> Option<u64> {
     for l in b.split(|&c| c == b'\n') {
         if l.len() > key.len() && l.starts_with(key) && l[key.len()] == b':' {
             let r = &l[key.len() + 1..];
-            let r = &r[r.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(r.len())..];
+            let r = &r[r
+                .iter()
+                .position(|c| !c.is_ascii_whitespace())
+                .unwrap_or(r.len())..];
             return Some(parse_u64(r).0);
         }
     }
@@ -179,18 +182,24 @@ pub fn prog_name<'a>(c: &'a [u8], comm: &'a [u8]) -> (&'a [u8], usize) {
     let end = c.iter().position(|&b| b == 0).unwrap_or(c.len());
     let mut a0 = &c[..end];
     let mut args = end + 1;
-    if end == c.len() {
-        // one argument: a rewritten title ("nginx: worker process")
-        if let Some(sp) = a0.iter().position(|&b| b == b' ') {
-            a0 = &a0[..sp];
-            args = sp + 1;
-        }
-    }
     let base = |a: &'a [u8]| {
         let b = a.rsplit(|&x| x == b'/').next().unwrap_or(a);
         let k = b.iter().rposition(|&x| x != b':').map_or(0, |i| i + 1);
         &b[..k]
     };
+    if end == c.len() {
+        // one argument: a rewritten title ("nginx: worker process"); its program path
+        // may hold spaces ("/opt/My Apps/chrome --type=renderer"): the first space
+        // after which the file name is comm's, else the first
+        let sps = || (0..a0.len()).filter(|&i| a0[i] == b' ');
+        let sp = sps()
+            .find(|&i| comm.len() >= 3 && base(&a0[..i]).starts_with(comm))
+            .or_else(|| sps().next());
+        if let Some(sp) = sp {
+            a0 = &a0[..sp];
+            args = sp + 1;
+        }
+    }
     let name = base(a0);
     // a script run by an interpreter: comm is the script's (first 15 bytes of its) name
     if comm.len() >= 3 && !name.starts_with(comm) {
@@ -320,8 +329,9 @@ fn bsearch(list: &[P], pid: u32) -> Result<usize, usize> {
 }
 
 fn hash(b: &[u8]) -> u32 {
-    b.iter()
-        .fold(0x811c_9dc5u32, |h, &c| (h ^ c as u32).wrapping_mul(0x0100_0193))
+    b.iter().fold(0x811c_9dc5u32, |h, &c| {
+        (h ^ c as u32).wrapping_mul(0x0100_0193)
+    })
 }
 
 /// A tracked process: `stat` and `io` kept open, samples of the last second, and the
@@ -554,18 +564,13 @@ impl Procs {
 
     /// The process `pid` started at `start` (not a later one reusing the pid).
     pub fn get(&self, pid: u32, start: u64) -> Option<&P> {
-        self.list
-            .get(self.find(pid)?)
-            .filter(|p| p.start == start)
+        self.list.get(self.find(pid)?).filter(|p| p.start == start)
     }
 
     /// The user name of `uid` (cached: /etc/passwd, then the system's user database,
     /// else the number).
     pub fn user(&self, uid: u32) -> &str {
-        self.users
-            .iter()
-            .find(|u| u.0 == uid)
-            .map_or("?", |u| &u.1)
+        self.users.iter().find(|u| u.0 == uid).map_or("?", |u| &u.1)
     }
 
     fn learn_user(&mut self, uid: u32) {
@@ -748,7 +753,10 @@ impl Procs {
             let page = self.page;
             let io_all = self.io_all;
             // exec'd (or renamed itself): name and command line again
-            let exec = self.list.get(j).is_some_and(|p| p.comm_h != hash(st.comm()) as u16);
+            let exec = self
+                .list
+                .get(j)
+                .is_some_and(|p| p.comm_h != hash(st.comm()) as u16);
             let txt = exec.then(|| self.read_txt(pid, &st));
             let Some(p) = self.list.get_mut(j) else {
                 continue;
@@ -836,7 +844,11 @@ impl Procs {
             t.want = false;
         }
         for &(pid, start) in want.iter().take(MAX_TRACK) {
-            if let Some(t) = self.tr.iter_mut().find(|t| t.pid == pid && t.start == start) {
+            if let Some(t) = self
+                .tr
+                .iter_mut()
+                .find(|t| t.pid == pid && t.start == start)
+            {
                 t.want = true;
                 continue;
             }
@@ -902,7 +914,11 @@ impl Procs {
                 let mut pa = [0u8; 48];
                 path(t.pid, "io", &mut pa);
                 let fd = unsafe {
-                    libc::openat(dfd, pa.as_ptr() as *const _, libc::O_RDONLY | libc::O_CLOEXEC)
+                    libc::openat(
+                        dfd,
+                        pa.as_ptr() as *const _,
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
                 };
                 t.iofd = if fd >= 0 { fd } else { -2 };
             }
@@ -935,7 +951,11 @@ impl Procs {
             p.nice = st.nice;
             p.threads = st.threads.min(65535) as u16;
             let n = pread(t.mfd, &mut b);
-            p.rss = b.get(..n).map_or(0, |m| parse_statm(m).1).max(st.rss * (n == 0) as u64) * page;
+            p.rss = b
+                .get(..n)
+                .map_or(0, |m| parse_statm(m).1)
+                .max(st.rss * (n == 0) as u64)
+                * page;
             p.ppid = st.ppid;
             if denied {
                 p.flags |= NOIO;
@@ -957,7 +977,10 @@ impl Procs {
     /// process.
     pub fn hist_push(&mut self, n: u32) {
         for t in self.tr.iter_mut() {
-            let Some(p) = bsearch(&self.list, t.pid).ok().and_then(|j| self.list.get(j)) else {
+            let Some(p) = bsearch(&self.list, t.pid)
+                .ok()
+                .and_then(|j| self.list.get(j))
+            else {
                 continue;
             };
             for _ in 0..n.min(HN as u32) {
@@ -1050,18 +1073,28 @@ pub const NSIG: usize = 6;
 pub fn sig(i: usize) -> (&'static str, c_int, &'static str) {
     match i {
         1 => ("KILL", libc::SIGKILL, "ends it at once (no clean-up)"),
-        2 => ("HUP", libc::SIGHUP, "hang-up: many daemons reload their settings"),
+        2 => (
+            "HUP",
+            libc::SIGHUP,
+            "hang-up: many daemons reload their settings",
+        ),
         3 => ("INT", libc::SIGINT, "as Ctrl-C"),
         4 => ("STOP", libc::SIGSTOP, "pauses it (CONT resumes)"),
         5 => ("CONT", libc::SIGCONT, "resumes a stopped process"),
-        _ => ("TERM", libc::SIGTERM, "asks it to exit (it can clean up first)"),
+        _ => (
+            "TERM",
+            libc::SIGTERM,
+            "asks it to exit (it can clean up first)",
+        ),
     }
 }
 
 /// Why an action failed, in words.
 pub fn why(e: c_int) -> &'static str {
     match e {
-        libc::EPERM | libc::EACCES => "permission denied (another user's process: run cpuview as root)",
+        libc::EPERM | libc::EACCES => {
+            "permission denied (another user's process: run cpuview as root)"
+        }
         libc::ESRCH => "it has already exited",
         _ => "failed",
     }
@@ -1203,18 +1236,29 @@ mod tests {
             let (n, a) = prog_name(c, comm);
             (String::from_utf8_lossy(n).to_string(), a)
         };
-        assert_eq!(n(b"/usr/bin/node\0server.js\0", b"MainThread"), ("node".into(), 14));
+        assert_eq!(
+            n(b"/usr/bin/node\0server.js\0", b"MainThread"),
+            ("node".into(), 14)
+        );
         assert_eq!(
             n(b"postgres: checkpointer \0\0\0", b"postgres"),
             ("postgres".into(), 10)
         );
         assert_eq!(
-            n(b"/usr/bin/python3\0-u\0/opt/tool/sync-files.py\0", b"sync-files.py"),
+            n(
+                b"/usr/bin/python3\0-u\0/opt/tool/sync-files.py\0",
+                b"sync-files.py"
+            ),
             ("sync-files.py".into(), 0)
         );
         assert_eq!(n(b"", b"kworker/0:1"), ("kworker/0:1".into(), 0));
         assert_eq!(n(b"/opt/My App/app\0--x\0", b"app"), ("app".into(), 16));
         assert_eq!(n(b"-bash\0", b"bash"), ("-bash".into(), 5));
+        // a rewritten title whose path holds spaces
+        assert_eq!(
+            n(b"/home/u/My Apps/chrome-headless-shell --type=renderer", b"chrome-headless"),
+            ("chrome-headless-shell".into(), 38)
+        );
     }
 
     #[test]
@@ -1232,7 +1276,10 @@ mod tests {
         assert_eq!(hidepid(mi, "/proc"), 2);
         let mi = "22 28 0:21 / /proc rw,relatime - proc proc rw,hidepid=1,gid=4\n";
         assert_eq!(hidepid(mi, "/proc"), 1);
-        assert_eq!(hidepid("22 28 0:21 / /proc rw - proc proc rw\n", "/proc"), 0);
+        assert_eq!(
+            hidepid("22 28 0:21 / /proc rw - proc proc rw\n", "/proc"),
+            0
+        );
     }
 
     /// A scan of this machine's /proc finds us, with sane numbers.
@@ -1252,7 +1299,12 @@ mod tests {
         let me = std::process::id();
         let j = p.find(me).expect("own process listed");
         let q = &p.list[j];
-        assert!(q.rss > 0 && q.threads >= 1 && q.cpu > 0.2, "{} {}", q.rss, q.cpu);
+        assert!(
+            q.rss > 0 && q.threads >= 1 && q.cpu > 0.2,
+            "{} {}",
+            q.rss,
+            q.cpu
+        );
         assert_eq!(q.uid, unsafe { libc::geteuid() });
         let start = q.start;
         assert!(p.list.windows(2).all(|w| w[0].pid < w[1].pid));
