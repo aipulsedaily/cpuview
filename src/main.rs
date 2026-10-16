@@ -10,6 +10,7 @@ mod input;
 mod mem;
 mod menu;
 mod probe;
+mod procs;
 mod prof;
 mod screen;
 mod sys;
@@ -28,7 +29,8 @@ use ui::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
-memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes)
+memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes) and a
+processes page (every process: CPU, memory, disk, tree, groups, signals)
 
 usage: cpuview [options]
 
@@ -41,15 +43,21 @@ usage: cpuview [options]
                         smooth (10 samples/s, everything animated at a steady
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
-  --page PAGE           start on: cpu, or memory (RAM, swap, disks, filesystems)
+  --page PAGE           start on: cpu, memory (RAM, swap, disks, filesystems),
+                        network, or processes
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
   -V, --version         version
 
-keys: arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
+keys: 1 2 3 4 or tab / shift-tab pages (cpu, memory, network, processes)
+      arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
       o sort · c view · g graphs · d/enter detail · r reset peaks · space pause
       t themes · q quit
+processes page: arrows/pgup/pgdn/home/end/click select · o sort (cpu, mem,
+      disk, pid, name) · r reverse · / filter (esc clears) · T tree · G group by
+      program · enter/←→ fold · k or F9 signal · n nice ·
+      I CPU % of one CPU / all · K kernel threads
 ";
 
 const OUT: i32 = 1;
@@ -421,7 +429,7 @@ impl State {
                 rects.push((S_PANEL, d));
             }
         }
-        for r in self.app.ml.rects() {
+        for r in self.app.ml.rects().into_iter().chain(self.app.page_rects()) {
             if r.w > 0 && r.h > 0 {
                 rects.push((S_PANEL, r));
             }
@@ -651,6 +659,34 @@ impl State {
         }
     }
 
+    /// Switch to page `p` (remembered). Always true (keep running).
+    fn set_page(&mut self, p: usize) -> bool {
+        let a = &mut self.app;
+        if a.page == p {
+            return true;
+        }
+        if a.page == ui::PG_PROC {
+            a.procs_leave();
+        }
+        a.page = p;
+        self.cfg.page = p;
+        self.cfg.save();
+        a.fit(a.w, a.h);
+        if a.mem_visible() {
+            // fresh numbers for what just appeared (outside the eco budget: input
+            // handling isn't charged)
+            a.m.refresh_fs();
+            if a.procs_visible() && !a.m.proc_ok {
+                a.m.scan_procs();
+            }
+            a.mem_retarget(false);
+        }
+        if p == ui::PG_PROC {
+            a.procs_enter();
+        }
+        true
+    }
+
     /// Returns false to quit.
     fn handle(&mut self, ev: Ev) -> bool {
         if self.app.menu.is_some() {
@@ -674,6 +710,10 @@ impl State {
             Ev::Key(k) => k,
             Ev::Mouse { x, y, btn } => {
                 let (x, y) = (x as usize, y as usize);
+                // processes page: rows, column titles, wheel
+                if self.app.key_at(x, y).is_none() && self.app.proc_click(x, y, btn) {
+                    return true;
+                }
                 match btn {
                     0 => {
                         if let Some(k) = self.app.key_at(x, y) {
@@ -691,6 +731,20 @@ impl State {
                 }
             }
         };
+        // the processes page's own keys (and its dialogs / filter line) come first
+        if self.app.proc_key(key) {
+            return true;
+        }
+        // pages: 1-4, tab / shift-tab
+        let np = ui::NPAGES;
+        let p = self.app.page;
+        match key {
+            Key::Char(c @ '1'..='4') => return self.set_page(c as usize - '1' as usize),
+            Key::Tab => return self.set_page((p + 1) % np),
+            Key::BackTab => return self.set_page((p + np - 1) % np),
+            Key::Char('m') => return self.set_page(if p == ui::PG_MEM { 0 } else { ui::PG_MEM }),
+            _ => {}
+        }
         let a = &mut self.app;
         match key {
             Key::Char('q') | Key::CtrlC => return false,
@@ -710,21 +764,6 @@ impl State {
                 self.cfg.sort = a.sort;
                 self.cfg.save();
                 a.fit(a.w, a.h); // CCD divider rows exist only in core order
-            }
-            Key::Char('m') => {
-                a.page = 1 - a.page;
-                self.cfg.page = a.page;
-                self.cfg.save();
-                a.fit(a.w, a.h);
-                if a.mem_visible() {
-                    // fresh numbers for what just appeared (outside the eco budget:
-                    // input handling isn't charged)
-                    a.m.refresh_fs();
-                    if a.procs_visible() && !a.m.proc_ok {
-                        a.m.scan_procs();
-                    }
-                    a.mem_retarget(false);
-                }
             }
             Key::Char('c') => {
                 a.view = (a.view + 1) % 3;
@@ -1042,11 +1081,9 @@ fn main() {
             }
             "--page" => {
                 let v = val();
-                page_arg = Some(match v.as_str() {
-                    "cpu" => 0,
-                    "memory" | "mem" | "storage" => 1,
-                    _ => die(&format!("unknown page: {v} (cpu or memory)")),
-                });
+                page_arg = Some(ui::page_index(&v).unwrap_or_else(|| {
+                    die("unknown page (one of cpu, memory, network, processes)")
+                }));
             }
             "--image-mode" => {
                 let v = val();
@@ -1168,6 +1205,9 @@ fn main() {
     st.app.first_size(cols as usize, rows as usize);
     if st.app.procs_visible() {
         st.app.m.scan_procs();
+    }
+    if st.app.page == ui::PG_PROC {
+        st.app.procs_enter();
     }
     st.rebuild(img);
     update_clock(&mut st.app);
@@ -1442,6 +1482,10 @@ fn main() {
                     m.last_top = now;
                     m.refresh_procs(prows);
                 }
+            }
+            // processes page (view 4): only while shown, see App::procs_sample
+            if st.app.page == ui::PG_PROC {
+                prof(16, || st.app.procs_sample(now, eco, smooth, tick, push));
             }
             if smooth {
                 if tick % 4 == 0 {

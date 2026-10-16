@@ -9,6 +9,10 @@ use std::fmt::Write as _;
 #[path = "memui.rs"]
 mod memui;
 pub use memui::*;
+// view 4: processes (and the page numbers / tabs shared by all views)
+#[path = "procui.rs"]
+mod procui;
+pub use procui::*;
 
 const SLOT_TITLE: usize = 0;
 const SLOT_GLOAD: usize = 1;
@@ -404,6 +408,8 @@ pub struct App {
     pub ml: MemLay,
     ma: MA,
     mcache: Vec<u64>,
+    /// view 4: processes (procui.rs)
+    pub pv: PV,
     /// colour of the series in `vals2` that `graph` draws under its own (0: none)
     pub under: std::cell::Cell<u32>,
 }
@@ -481,6 +487,7 @@ impl App {
             ml: MemLay::default(),
             ma: MA::default(),
             mcache: Vec::new(),
+            pv: PV::new(),
             under: std::cell::Cell::new(0),
         }
         .with_bars()
@@ -598,7 +605,7 @@ impl App {
         }
         let ta = &mut self.ta;
         moving |= spring(&mut ta.0, &mut ta.1, self.s.avg_r, dt, W_CLOCK, xf, 1.0);
-        moving | self.mem_step(dt)
+        moving | self.mem_step(dt) | self.proc_step(dt)
     }
 
     /// Smooth mode: the digits follow the moving values (with hysteresis, see
@@ -909,6 +916,18 @@ impl App {
         if self.page == 1 {
             self.fit_cpu(w, h);
             self.ml = self.mem_layout(area, w >= 100 && area.h >= 20);
+            return;
+        }
+        // views 3 (network, placeholder) and 4 (processes, procui.rs)
+        self.pv.lay = PLay::default();
+        if self.page == PG_NET || self.page == PG_PROC {
+            self.fit_cpu(w, h);
+            if self.page == PG_PROC {
+                self.proc_layout(area);
+                if self.pv.d.is_some() {
+                    self.psync(true);
+                }
+            }
             return;
         }
         if w >= SIDE_W && h >= SIDE_H {
@@ -1224,6 +1243,9 @@ impl App {
             if self.mem_visible() {
                 self.draw_mem(scr, false, false);
             }
+            if self.page == PG_PROC {
+                self.draw_proc_page(scr, false, true);
+            }
         }
     }
 
@@ -1321,6 +1343,11 @@ impl App {
         }
         if self.mem_visible() {
             prof(15, || self.draw_mem(scr, full, true));
+        }
+        if self.page == PG_PROC {
+            prof(15, || self.draw_proc_page(scr, full, false));
+        } else if self.page == PG_NET {
+            self.draw_net_placeholder(scr, full);
         }
         if full {
             self.draw_keys(scr);
@@ -1541,7 +1568,8 @@ impl App {
         ];
         let sum_short: [(&str, u32); 2] =
             [(pu.s(), cu), (if has_t { &pt.s()[1..] } else { "" }, ct)];
-        let mem_page = self.page == 1;
+        // (pages 2 to 4 have a title like the memory page's)
+        let mem_page = self.page != 0;
         let no_top = !mem_page && self.lay.top.is_none();
         let mi = self.m.mi;
         let minfo = f!(
@@ -1551,7 +1579,14 @@ impl App {
         );
         let ndk = self.m.disks.len();
         let dinfo = f!(" · {} disk{}", ndk, if ndk == 1 { "" } else { "s" });
-        let mtitle = ("  memory & storage", t.fg | BOLD);
+        let mtitle = (
+            match self.page {
+                PG_PROC => "  processes",
+                PG_NET => "  network & system",
+                _ => "  memory & storage",
+            },
+            t.fg | BOLD,
+        );
         let mut left0 = [(short.s(), t.fg | BOLD); 8];
         left0[1..].copy_from_slice(&sum_full);
         // (left part, short tail = clock only without uptime), most detailed first
@@ -3460,6 +3495,36 @@ impl App {
         line(&[("window  ", th.dim), (wn.s(), th.text)], &mut yy);
     }
 
+    /// Page tabs at the footer's left, the current one highlighted: "1 cpu 2 mem
+    /// 3 net 4 proc" (narrow screens: "1 2 3 4"). Clickable (keys 1-4). Returns the x
+    /// after them.
+    fn draw_tabs(&mut self, scr: &mut Screen, y: usize) -> usize {
+        let w = self.w;
+        let long = w >= 72;
+        let th = &self.t;
+        let bar = surf(S_BAR);
+        let mut x = 0;
+        for i in 0..NPAGES {
+            let lab = page_name(i).0;
+            let x0 = x;
+            let d = (b'1' + i as u8) as char;
+            let (dc, lc, bg) = if i == self.page {
+                (th.bg | BOLD, th.bg | BOLD, th.accent)
+            } else {
+                (th.accent | BOLD, th.mid, bar)
+            };
+            scr.put(x, y, ' ', 0, bg);
+            scr.put(x + 1, y, d, dc, bg);
+            x = scr.text(x + 2, y, " ", 0, bg, w);
+            if long {
+                x = scr.text(x, y, lab, lc, bg, w);
+                x = scr.text(x, y, " ", 0, bg, w);
+            }
+            self.zones.push((x0, x, d));
+        }
+        x + 1
+    }
+
     fn draw_keys(&mut self, scr: &mut Screen) {
         let w = self.w;
         let y = self.h - 1;
@@ -3475,6 +3540,10 @@ impl App {
                 bg: bar,
             },
         );
+        // page tabs first (1 cpu 2 mem 3 net 4 proc), then the page's keys
+        self.zones.clear();
+        let tx = self.draw_tabs(scr, y);
+        let ntab = self.zones.len();
         let th = &self.t;
         // (key, long, short, label)
         let cpu_keys: [(char, &str, Option<&str>, &str); 11] = [
@@ -3497,11 +3566,35 @@ impl App {
             ('m', "cpu view", Some("cpu"), "m"),
             ('t', "theme", Some("theme"), "t"),
         ];
-        let keys: &[(char, &str, Option<&str>, &str)] =
-            if self.page == 1 { &mem_keys } else { &cpu_keys };
+        // view 4 (procui.rs); keys without a short text drop out first
+        let proc_keys: [(char, &str, Option<&str>, &str); 13] = [
+            ('q', "quit", Some("quit"), "q"),
+            (' ', "pause", None, "spc"),
+            ('s', "speed", Some("speed"), "s"),
+            ('o', "sort", Some("sort"), "o"),
+            ('r', "reverse", Some("rev"), "r"),
+            ('/', "filter", Some("filter"), "/"),
+            ('T', "tree", Some("tree"), "T"),
+            ('G', "group", Some("group"), "G"),
+            ('k', "kill", Some("kill"), "k"),
+            ('n', "nice", Some("nice"), "n"),
+            ('I', "cpu % scale", None, "I"),
+            ('K', "kernel threads", None, "K"),
+            ('t', "theme", Some("theme"), "t"),
+        ];
+        let keys: &[(char, &str, Option<&str>, &str)] = match self.page {
+            PG_MEM => &mem_keys,
+            PG_NET => &mem_keys[..3],
+            PG_PROC => &proc_keys,
+            _ => &cpu_keys,
+        };
+        let pv = &self.pv;
         let state = |k: char| -> &str {
             match k {
                 's' => SPEEDS[self.speed].0,
+                'o' if self.page == PG_PROC => psort_name(pv.sort),
+                'T' if pv.tree => "on",
+                'G' if pv.group && !pv.tree => "on",
                 'o' => SORTS[self.sort],
                 'c' => VIEWS[self.view],
                 'd' if !self.show_det => "off",
@@ -3510,6 +3603,7 @@ impl App {
                 _ => "",
             }
         };
+        let w = w.saturating_sub(tx);
         // variants, most detailed first: (desc 0 long / 1 short / 2 none, pad, sep, theme name)
         for (dv, pad, sep, tn) in [
             (0, true, 2, true),
@@ -3543,8 +3637,9 @@ impl App {
             if len.saturating_sub(sep) > w && dv < 2 {
                 continue;
             }
-            self.zones.clear();
-            let mut x = 0;
+            self.zones.truncate(ntab);
+            let w = w + tx;
+            let mut x = tx;
             for &(k, long, short, lab) in keys {
                 let d = match dv {
                     0 => long,
@@ -3860,9 +3955,12 @@ mod tests {
         let ir = a.lay.cores.inner();
         let g = a.card_at(ir.x + 5, ir.y + 1 + 2 * a.lay.rh);
         assert_eq!(g, Some(2));
-        assert_eq!(a.key_at(1, 39), Some('q'));
-        let t = a.zones.iter().find(|z| z.2 == 't').unwrap();
-        assert_eq!(a.key_at(t.0, 39), Some('t'));
+        // page tabs first (1 cpu 2 mem 3 net 4 proc), then the keys
+        assert_eq!(a.key_at(1, 39), Some('1'));
+        for k in ['4', 'q', 't'] {
+            let z = a.zones.iter().find(|z| z.2 == k).unwrap();
+            assert_eq!(a.key_at(z.0, 39), Some(k));
+        }
     }
 
     #[test]

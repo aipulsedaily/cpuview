@@ -548,8 +548,7 @@ fn statm_rss(dfd: c_int, pid: u32) -> Option<u64> {
     if n <= 0 {
         return None;
     }
-    let (_, k) = parse_u64(&b[..n as usize]);
-    Some(parse_u64(&b[k..n as usize]).0)
+    Some(crate::procs::parse_statm(&b[..n as usize]).1)
 }
 
 /// A process's program: argv[0]'s file name (comm is often a thread's name, such as
