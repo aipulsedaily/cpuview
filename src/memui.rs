@@ -64,8 +64,10 @@ pub struct MA {
     pub(super) rows: Vec<PRow>,
     /// RAM chart's newest point, held to whole dots (no flicker at a dot's edge)
     pub(super) head: f32,
-    /// disk chart's newest column (read, write), held to whole eighths
-    pub(super) dhead: std::cell::Cell<(f32, f32)>,
+    /// disk chart's newest column (read, write), held to whole eighths, and when it
+    /// last moved (smooth: it moves at most every 150 ms, so a one-sample burst can't
+    /// blink a bar on and off)
+    pub(super) dhead: std::cell::Cell<(f32, f32, i64)>,
     /// programs panel: one row per process instead of one per program
     pub split: bool,
 }
@@ -1778,11 +1780,14 @@ impl App {
         // the newest column moves only by more than half an eighth of a cell (its
         // two rates change at different moments: their sum mustn't flicker at an
         // edge)
-        let (hr, hw) = self.ma.dhead.get();
+        let (hr, hw, ht) = self.ma.dhead.get();
         let now = cols[0];
         let q = sc / (8 * y1.saturating_sub(y0 + 3).max(1)) as f32;
-        if (now.rd + now.wr - hr - hw).abs() > 0.6 * q || !self.smooth() {
-            self.ma.dhead.set((now.rd, now.wr));
+        let t = crate::term::mono();
+        if !self.smooth()
+            || (now.rd + now.wr - hr - hw).abs() > 0.6 * q && t - ht >= 150_000_000
+        {
+            self.ma.dhead.set((now.rd, now.wr, t));
         } else {
             cols[0] = Col { rd: hr, wr: hw };
         }

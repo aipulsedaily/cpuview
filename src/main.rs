@@ -9,6 +9,7 @@ mod image;
 mod input;
 mod mem;
 mod menu;
+mod mosaic;
 mod net;
 mod probe;
 mod procs;
@@ -45,6 +46,14 @@ usage: cpuview [options]
   --image PATH|URL      use a picture as the background (copied / downloaded into
                         ~/.config/cpuview/images/ and remembered)
   --image-mode MODE     auto | kitty | sixel | iterm | blocks | blocks256 | terminal | off
+  --glass GLASS         pictures: light (default: a light veil; text turns darker
+                        or lighter where the picture needs it), clear (the picture
+                        as it is) or frosted (blurred, darker panels)
+  --fit FIT             pictures: contain (default: the whole picture, margins
+                        filled with a soft copy) or cover (fill the window, crop;
+                        image.<file>.focus = x,y in the config picks what stays)
+  --glyphs SET          block glyphs for pictures drawn with characters: auto,
+                        octant (2×4), sextant (2×3), quadrant (2×2) or half (1×2)
   --speed SPEED         eco (default: adaptive 1-2 s, ≤ 0.01 % of one thread),
                         smooth (10 samples/s, everything animated at a steady
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
@@ -88,11 +97,16 @@ struct Gfx {
     truecolor: bool,
     cell: (u32, u32),
     cell_src: &'static str,
+    /// block glyphs for pictures drawn with characters (requested: None = auto)
+    glyph_req: Option<mosaic::Glyphs>,
+    glyphs: mosaic::Glyphs,
     bd: Option<Backdrop>,
     comp: Comp,
     depth: Depth,
     kitty_key: Vec<usize>,
     kitty_live: bool,
+    /// kitty: size of the transmitted blurred picture (frosted panels)
+    kitty_soft: Option<(usize, usize)>,
 }
 
 impl Gfx {
@@ -100,6 +114,7 @@ impl Gfx {
         let (m, why) = probe::choose_mode(&self.caps, &self.env, self.req);
         self.mode = m;
         self.why = why;
+        self.glyphs = probe::choose_glyphs(&self.caps, &self.env, self.glyph_req).0;
         self.depth = if self.mode == Mode::Blocks256
             || (!self.truecolor && !self.mode.pixels() && self.mode != Mode::Blocks)
         {
@@ -125,7 +140,7 @@ impl Gfx {
     }
 }
 
-fn image_theme(file: &str, img: &image::Img, opt: &config::ImgOpt) -> Theme {
+fn image_theme(file: &str, img: &image::Img, opt: &config::ImgOpt, glass: Glass) -> Theme {
     let mut t = theme::load("default").unwrap();
     let p = image::palette_from(img);
     let (tint, a1, a2, text) = (p.tint, p.a1, p.a2, p.text);
@@ -152,24 +167,44 @@ fn image_theme(file: &str, img: &image::Img, opt: &config::ImgOpt) -> Theme {
     t.dim = mix(text, tint, 0.62);
     t.freq = Ramp::even(&[image::with_value(a2, 0.45), a2, a1, mix(a1, 0xffffff, 0.6)]);
     t.brightness = opt.dim;
-    // calmer than the reference behind dense data: panels use a blurred copy of the
-    // picture (see Backdrop::soft) and a slightly denser plate
     let s = |tint, alpha, text_alpha| Surf {
         tint,
         alpha,
         text_alpha,
     };
-    // blank and text alpha are close, so text plates don't show as dark boxes over
-    // the (pixel-patched) picture; the contrast guard darkens only where needed
-    t.surf[S_SCREEN as usize] = s(tint, 0.25, 0.5);
-    t.surf[S_BAR as usize] = s(tint, 0.6, 0.7);
-    t.surf[S_PANEL as usize] = s(tint, 0.52, 0.6);
+    match glass {
+        Glass::Frosted => {
+            // calmer than the reference behind dense data: panels use a blurred copy
+            // of the picture (see Backdrop::soft) and a denser plate. Blank and text
+            // alpha are close, so text plates don't show as dark boxes over the
+            // (pixel-patched) picture; the contrast guard darkens only where needed
+            t.surf[S_SCREEN as usize] = s(tint, 0.25, 0.5);
+            t.surf[S_BAR as usize] = s(tint, 0.6, 0.7);
+            t.surf[S_PANEL as usize] = s(tint, 0.52, 0.6);
+        }
+        _ => {
+            // one even veil over screen, bars and panels (the picture reads as one
+            // picture; the borders show the panels). Text cells show the picture's
+            // colour through the same veil; the contrast guard changes the text's
+            // lightness where it doesn't read (Comp::guarded)
+            let (a, ta) = if glass == Glass::Clear {
+                (0.0, 0.0)
+            } else {
+                (0.2, 0.2)
+            };
+            for sid in [S_SCREEN, S_BAR, S_PANEL] {
+                t.surf[sid as usize] = s(tint, a, ta);
+            }
+        }
+    }
     t.surf[S_SELECT as usize] = s(t.select, 0.68, 0.74);
     t.surf[S_CHIP as usize] = s(t.chip, 0.8, 0.85);
     t.surf[S_TRACK as usize] = s(t.track, 0.7, 0.8);
     t.surf[S_DIALOG as usize] = s(tint, 0.84, 0.88);
     t.image = Some(file.to_string());
     t.soft_blur = opt.blur;
+    t.glass = glass;
+    t.place = opt.place();
     t.layers = &[];
     refresh_derived(&mut t);
     t
@@ -185,7 +220,7 @@ fn load_theme(id: &str, cfg: &Config) -> Result<(Theme, Option<image::Img>), Str
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or(file.to_string());
-        let t = image_theme(&name, &img, &cfg.img(&name));
+        let t = image_theme(&name, &img, &cfg.img(&name), cfg.glass);
         Ok((t, Some(img)))
     } else {
         theme::load(id)
@@ -201,15 +236,72 @@ fn trim_heap() {
     }
 }
 
-/// Half-block canvas (w × 2h RGB) → per-cell [upper, lower] pixel pairs.
-fn to_cells(b: &[u8], w: usize, h: usize) -> Vec<screen::Px2> {
-    (0..w * h)
-        .map(|i| {
-            let o = (i / w * 2 * w + i % w) * 3;
-            let p = o + 3 * w;
-            [b[o], b[o + 1], b[o + 2], b[p], b[p + 1], b[p + 2]]
-        })
-        .collect()
+/// Stored resolution of the hi-res picture: the screen's pixels (`pw × ph`), but no
+/// more than the picture itself has (patches scale it up), so a 4K window doesn't
+/// keep a 4K copy of a 1080p picture.
+fn store_size(src: (usize, usize), pw: usize, ph: usize, pl: &image::Place) -> (usize, usize) {
+    let (sw, sh) = (src.0 as f64, src.1 as f64);
+    let (fx, fy) = (pw as f64 / sw, ph as f64 / sh);
+    let shown = if pl.fit == image::Fit::Contain {
+        fx.min(fy)
+    } else {
+        fx.max(fy)
+    };
+    let s = (1.0 / shown).min(1.0);
+    (
+        ((pw as f64 * s).round() as usize).max(1),
+        ((ph as f64 * s).round() as usize).max(1),
+    )
+}
+
+/// Hi-res picture for the pixel modes: kitty keeps the RGB to transmit once, the
+/// others a palette image (190 colours: the rest are inks and transparent).
+fn hires(rgbv: Vec<u8>, soft: Option<Vec<u8>>, sw: usize, sh: usize, g: &Gfx) -> Hires {
+    let (cw, ch) = (g.cell.0 as usize, g.cell.1 as usize);
+    let empty = || image::Indexed {
+        w: 0,
+        h: 0,
+        idx: Vec::new(),
+        pal: Vec::new(),
+    };
+    if g.mode == Mode::Kitty {
+        // the blurred layer needs no detail: 1/4 resolution, kitty scales placements
+        let soft = soft.map(|hs| {
+            let (w4, h4) = ((sw / 4).max(1), (sh / 4).max(1));
+            let small = image::stretch(
+                &image::Img {
+                    w: sw,
+                    h: sh,
+                    rgb: hs,
+                },
+                w4,
+                h4,
+            );
+            (small, w4, h4)
+        });
+        Hires {
+            cw,
+            ch,
+            sharp: empty(),
+            soft: None,
+            kitty: Some(KittyData {
+                rgb: rgbv,
+                w: sw,
+                h: sh,
+                soft,
+            }),
+        }
+    } else {
+        let qs = image::quantize(&rgbv, sw, sh, screen::PAL_MAX);
+        drop(rgbv);
+        Hires {
+            cw,
+            ch,
+            sharp: qs,
+            soft: soft.map(|hs| image::quantize(&hs, sw, sh, 128)),
+            kitty: None,
+        }
+    }
 }
 
 fn build_backdrop(
@@ -222,92 +314,111 @@ fn build_backdrop(
     if t.transparent || matches!(g.mode, Mode::Off | Mode::Terminal) || w == 0 || h == 0 {
         return None;
     }
+    let gl = g.glyphs;
+    let (gx, gy) = gl.grid();
+    // the cell canvas: gx × gy sub-pixels per cell, for the glyph mosaic
+    let (mw, mh) = (w * gx, h * gy);
+    let (cw, ch) = (g.cell.0 as usize, g.cell.1 as usize);
+    let (pw, ph) = (w * cw, h * ch);
+    // width / height of one sub-pixel of the cell canvas
+    let aspect = (cw as f64 / gx as f64) / (ch as f64 / gy as f64);
+    let mut bd = Backdrop::empty(w, h);
+    bd.glyphs = gl;
+    let cells = |bd: &mut Backdrop, cv: &[u8]| {
+        bd.sharp = mosaic::halves(gl, cv, w, h);
+        bd.widen();
+        if gl != mosaic::Glyphs::Half {
+            bd.mos = mosaic::build(gl, cv, w, h);
+        }
+    };
     if let Some(file) = &t.image {
         let img = match img {
             Some(i) => i,
             None => image::decode_file(&config::resolve_image(file)?.to_string_lossy()).ok()?,
         };
         let ub = t.soft_blur;
+        let frosted = t.glass == Glass::Frosted;
         let soft_r = 2.0 + ub;
-        let mut sharp = image::cover(&img, w, 2 * h);
+        // blur radii in cells: x = r cells, y = r/2 cells (the same distance on screen)
+        let mut cv = image::place(&img, mw, mh, aspect, &t.place);
         if ub > 0.0 {
-            image::blur(&mut sharp, w, 2 * h, ub, ub);
+            image::blur(&mut cv, mw, mh, ub * gx as f32, ub * gy as f32 / 2.0);
         }
-        let mut soft = sharp.clone();
-        image::blur(&mut soft, w, 2 * h, soft_r, soft_r);
-        let mut bd = Backdrop::empty(w, h);
-        bd.sharp = to_cells(&sharp, w, h);
-        bd.soft = Some(to_cells(&soft, w, h));
-        drop((sharp, soft));
-        if !g.mode.pixels() {
-            // drop the decoded original *before* trimming the heap
+        cells(&mut bd, &cv);
+        if frosted {
+            image::blur(
+                &mut cv,
+                mw,
+                mh,
+                soft_r * gx as f32,
+                soft_r * gy as f32 / 2.0,
+            );
+            bd.soft = Some(mosaic::halves(gl, &cv, w, h));
+        }
+        drop(cv);
+        if g.mode.pixels() {
+            let (sw, sh) = store_size((img.w, img.h), pw, ph, &t.place);
+            let mut hr = image::place(&img, sw, sh, 1.0, &t.place);
             drop(img);
-        } else {
-            let (cw, ch) = (g.cell.0 as usize, g.cell.1 as usize);
-            let (pw, ph) = (w * cw, h * ch);
-            let mut hr = image::cover(&img, pw, ph);
-            drop(img);
+            // pixels per cell column in the stored picture
+            let k = sw as f32 / w as f32;
             if ub > 0.0 {
-                image::blur(&mut hr, pw, ph, ub * cw as f32, ub * cw as f32);
+                image::blur(&mut hr, sw, sh, ub * k, ub * k);
             }
-            let mut hs = hr.clone();
-            image::blur(&mut hs, pw, ph, soft_r * cw as f32, soft_r * cw as f32);
-            let empty = || image::Indexed {
-                w: 0,
-                h: 0,
-                idx: Vec::new(),
-                pal: Vec::new(),
-            };
-            bd.hires = Some(if g.mode == Mode::Kitty {
-                // the blurred layer needs no detail: send it at 1/4 resolution, kitty
-                // scales placements to their cell rectangles
-                let small = image::stretch(
-                    &image::Img {
-                        w: pw,
-                        h: ph,
-                        rgb: hs,
-                    },
-                    pw / 4,
-                    ph / 4,
-                );
-                Hires {
-                    cw,
-                    ch,
-                    sharp: empty(),
-                    soft: empty(),
-                    kitty: Some((hr, small)),
-                }
-            } else {
-                let qs = image::quantize(&hr, pw, ph, 256);
-                drop(hr);
-                let qf = image::quantize(&hs, pw, ph, 128);
-                Hires {
-                    cw,
-                    ch,
-                    sharp: qs,
-                    soft: qf,
-                    kitty: None,
-                }
+            let soft = frosted.then(|| {
+                let mut hs = hr.clone();
+                image::blur(&mut hs, sw, sh, soft_r * k, soft_r * k);
+                hs
             });
+            bd.hires = Some(hires(hr, soft, sw, sh, g));
         }
-        trim_heap();
-        Some(bd)
     } else {
-        let cv = bg::render(t.layers, t.bg, w, 2 * h, w, h, false);
-        let mut bd = Backdrop::empty(w, h);
-        bd.sharp = (0..w * h)
-            .map(|i| {
-                let o = i / w * 2 * w + i % w;
-                screen::px2(color::from_f(cv.px[o]), color::from_f(cv.px[o + w]))
-            })
-            .collect();
+        let rgb8 = |cv: &bg::Canvas| -> Vec<u8> {
+            cv.px
+                .iter()
+                .flat_map(|p| color::ch(color::from_f(*p)))
+                .collect()
+        };
+        let img = |w: usize, h: usize, rgb: Vec<u8>| image::Img { w, h, rgb };
+        // the layers assume square pixels and cost ~1 µs a pixel: pixel modes render
+        // one canvas of at most 250 kpx (the layers are smooth; pixel stars at that
+        // grid) and derive the cell canvas from it; otherwise 2 pixels per cell width
+        let pixels = g.mode.pixels();
+        let (rw, rh) = if pixels {
+            let s = (250_000.0 / (pw * ph) as f64).sqrt().min(1.0);
+            (
+                ((pw as f64 * s).round() as usize).max(1),
+                ((ph as f64 * s).round() as usize).max(1),
+            )
+        } else {
+            (
+                w * 2,
+                ((h * 2 * ch) as f64 / cw as f64).round().max(1.0) as usize,
+            )
+        };
+        let cv = bg::render(t.layers, t.bg, rw, rh, w, h, pixels);
         bd.has_glyphs = cv.glyph.iter().any(|g| g.0 != '\0');
+        let px = rgb8(&cv);
         if bd.has_glyphs {
             bd.glyph = cv.glyph;
         }
-        trim_heap();
-        Some(bd)
+        let src = img(rw, rh, px);
+        cells(&mut bd, &image::stretch(&src, mw, mh));
+        if pixels {
+            // stored at up to ~1.3 Mpx (a 1080p-class window at full resolution),
+            // enlarged smoothly from the render; patches scale it up from there
+            let s = (1_300_000.0 / (pw * ph) as f64).sqrt().min(1.0);
+            let (sw, sh) = (
+                ((pw as f64 * s).round() as usize).max(1),
+                ((ph as f64 * s).round() as usize).max(1),
+            );
+            let hr = image::stretch(&src, sw, sh);
+            drop(src);
+            bd.hires = Some(hires(hr, None, sw, sh, g));
+        }
     }
+    trim_heap();
+    Some(bd)
 }
 
 fn look_for(t: &Theme, g: &Gfx) -> Look {
@@ -315,7 +426,7 @@ fn look_for(t: &Theme, g: &Gfx) -> Look {
         Look::Transparent
     } else if g.bd.is_none() {
         Look::Solid
-    } else if g.mode == Mode::Kitty && t.image.is_some() {
+    } else if g.mode == Mode::Kitty && g.bd.as_ref().is_some_and(|b| b.hires.is_some()) {
         Look::KittyGlass
     } else {
         Look::Glass
@@ -324,6 +435,8 @@ fn look_for(t: &Theme, g: &Gfx) -> Look {
 
 struct State {
     full: bool,
+    /// smooth: time of the last pixel-patch tick
+    ptick: i64,
     app: App,
     scr: Screen,
     g: Gfx,
@@ -381,15 +494,16 @@ impl State {
         let Some(hr) = bd.hires.as_mut() else { return };
         let (cw, ch) = (hr.cw, hr.ch);
         let (w, h) = (self.app.w, self.app.h);
-        if let Some((sharp, soft)) = hr.kitty.take() {
+        if let Some(k) = hr.kitty.take() {
             gfx::kitty_delete(None, out, tmux);
-            gfx::kitty_transmit_rgb(&sharp, w * cw, h * ch, 1, out, tmux);
-            gfx::kitty_transmit_rgb(&soft, w * cw / 4, h * ch / 4, 2, out, tmux);
+            gfx::kitty_transmit_rgb(&k.rgb, k.w, k.h, 1, out, tmux);
+            // blurred panels (frosted): its size, for the source rectangles below
+            self.g.kitty_soft = k.soft.as_ref().map(|s| (s.1, s.2));
+            if let Some((soft, sw, sh)) = &k.soft {
+                gfx::kitty_transmit_rgb(soft, *sw, *sh, 2, out, tmux);
+            }
             for sid in 1..8u8 {
-                let (tint, a) = self
-                    .g
-                    .comp
-                    .surf_tint(sid, sid == S_PANEL || sid == S_DIALOG);
+                let (tint, a) = self.g.comp.overlay(sid);
                 let [r, g, b] = color::ch(tint);
                 gfx::kitty_transmit_pixel([r, g, b, (a * 255.0) as u8], 10 + sid as u32, out, tmux);
             }
@@ -455,17 +569,18 @@ impl State {
             gfx::wrap(s.as_bytes(), out, tmux);
         }
         gfx::kitty_place(1, 1, 0, 0, w, h, -1_073_741_830, out, tmux);
+        let (pw, ph) = (w * cw, h * ch);
         for (pid, (sid, r)) in rects.iter().enumerate() {
             let pid = pid as u32 + 2;
-            if soft_surface(*sid) {
+            if let (true, Some((sw, sh))) = (soft_surface(*sid), self.g.kitty_soft) {
                 let s = format!(
                     "\x1b[{};{}H\x1b_Ga=p,i=2,p={pid},x={},y={},w={},h={},c={},r={},z=-1073741829,C=1,q=2;\x1b\\",
                     r.y + 1,
                     r.x + 1,
-                    r.x * cw / 4,
-                    r.y * ch / 4,
-                    r.w * cw / 4,
-                    r.h * ch / 4,
+                    r.x * cw * sw / pw,
+                    r.y * ch * sh / ph,
+                    (r.w * cw * sw / pw).max(1),
+                    (r.h * ch * sh / ph).max(1),
                     r.w,
                     r.h
                 );
@@ -509,12 +624,21 @@ impl State {
         } else {
             prof(1, || self.app.draw(&mut self.scr, full));
         }
-        // smooth: picture patches only with full repaints, never mid-animation (cells
-        // that turn blank in between show the half-block backdrop until then)
-        let patch = if self.app.smooth() && !full {
-            Patch::None
+        // smooth: cells that turn blank show their glyph mosaic first and get their
+        // pixels at a patch tick (4 a second) once they have stayed blank since the
+        // previous one: nothing is patched mid-animation, and a cell that blanks for a
+        // frame or two never costs a patch
+        let patch = self.patch();
+        self.scr.when = if !self.app.smooth() || full {
+            When::Now
         } else {
-            self.patch()
+            let now = term::mono();
+            if now - self.ptick >= 250_000_000 {
+                self.ptick = now;
+                When::Tick
+            } else {
+                When::Later
+            }
         };
         let mut pre = Vec::new();
         self.kitty_layers(&mut pre);
@@ -600,6 +724,30 @@ impl State {
                         1 => 2.0,
                         2 => 4.0,
                         _ => 0.0,
+                    };
+                    self.cfg.save();
+                    let id = self.app.t.id.clone();
+                    let _ = self.set_theme(&id);
+                }
+            }
+            Fit => {
+                if let Some(file) = self.app.t.image.clone() {
+                    let o = self.cfg.img_mut(&file);
+                    o.fit = match o.fit {
+                        image::Fit::Contain => image::Fit::Cover,
+                        image::Fit::Cover => image::Fit::Contain,
+                    };
+                    self.cfg.save();
+                    let id = self.app.t.id.clone();
+                    let _ = self.set_theme(&id);
+                }
+            }
+            Glass => {
+                if self.app.t.image.is_some() {
+                    self.cfg.glass = match self.cfg.glass {
+                        theme::Glass::Light => theme::Glass::Clear,
+                        theme::Glass::Clear => theme::Glass::Frosted,
+                        theme::Glass::Frosted => theme::Glass::Light,
                     };
                     self.cfg.save();
                     let id = self.app.t.id.clone();
@@ -896,7 +1044,7 @@ fn update_clock(app: &mut App) {
     app.uptime = (term::now_ns(libc::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
 }
 
-fn doctor(req: Mode, no_probe: bool) {
+fn doctor(req: Mode, glyphs: Option<mosaic::Glyphs>, no_probe: bool) {
     let env = Env::get();
     let fd = unsafe {
         libc::open(
@@ -979,6 +1127,8 @@ fn doctor(req: Mode, no_probe: bool) {
         }
     );
     println!("→ image mode  {}  ({why})", mode.name());
+    let (gl, gwhy) = probe::choose_glyphs(&caps, &env, glyphs);
+    println!("→ glyphs      {}  ({gwhy})", gl.name());
     println!("raw replies   {:?}", String::from_utf8_lossy(&caps.raw));
     // test strip in the chosen mode
     let (w, h) = (320usize, 120usize);
@@ -1072,6 +1222,7 @@ fn main() {
     let mut mode_arg = None;
     let mut speed_arg = None;
     let mut page_arg = None;
+    let mut fit_arg = None;
     let (mut setup, mut undo, mut per_core, mut dry) = (false, false, false, false);
     let mut i = 0;
     while i < args.len() {
@@ -1121,6 +1272,28 @@ fn main() {
                     die("unknown page (one of overview, cpu, memory, network, processes, sensors)")
                 }));
             }
+            "--glass" => {
+                let v = val();
+                cfg.glass = Glass::parse(&v)
+                    .unwrap_or_else(|| die(&format!("unknown glass: {v} (clear, light, frosted)")));
+                cfg.save();
+            }
+            "--glyphs" => {
+                let v = val();
+                if !mosaic::GLYPH_NAMES.contains(&v.as_str()) {
+                    die(&format!("unknown glyphs: {v} ({})", mosaic::GLYPH_NAMES.join(", ")));
+                }
+                cfg.glyphs = mosaic::Glyphs::parse(&v);
+                cfg.save();
+            }
+            "--fit" => {
+                let v = val();
+                fit_arg = Some(match v.as_str() {
+                    "contain" => image::Fit::Contain,
+                    "cover" => image::Fit::Cover,
+                    _ => die(&format!("unknown fit: {v} (contain, cover)")),
+                });
+            }
             "--image-mode" => {
                 let v = val();
                 mode_arg = Some(
@@ -1150,7 +1323,7 @@ fn main() {
         cfg.save();
     }
     if want_doctor {
-        doctor(cfg.image_mode, no_probe);
+        doctor(cfg.image_mode, cfg.glyphs, no_probe);
         return;
     }
     if let Some(src) = image_arg {
@@ -1171,6 +1344,18 @@ fn main() {
         }
         cfg.theme = t;
         cfg.save();
+    }
+    if let Some(f) = fit_arg {
+        match cfg.theme.strip_prefix("image:").map(str::to_string) {
+            Some(file) => {
+                let name = config::resolve_image(&file)
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .unwrap_or(file);
+                cfg.img_mut(&name).fit = f;
+                cfg.save();
+            }
+            None => die("--fit applies to picture themes (--theme image:<file>)"),
+        }
     }
     if !term::is_tty(0) || !term::is_tty(OUT) {
         die("needs a terminal (stdin and stdout must be a tty)");
@@ -1214,6 +1399,9 @@ fn main() {
         depth: Depth::True,
         kitty_key: Vec::new(),
         kitty_live: false,
+        kitty_soft: None,
+        glyph_req: cfg.glyphs,
+        glyphs: mosaic::Glyphs::Half,
     };
     g.resolve();
     let _ = (&g.why, g.cell_src);
@@ -1238,6 +1426,7 @@ fn main() {
     };
     let mut st = State {
         full: true,
+        ptick: 0,
         app,
         scr: Screen::new(cols as usize, rows as usize),
         g,

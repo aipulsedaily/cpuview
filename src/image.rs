@@ -1,5 +1,6 @@
-//! Pictures: decoding (JPEG/PNG via zune), EXIF orientation, cover-crop resampling,
-//! blur, palette extraction (median cut + k-means) and quantisation for sixel.
+//! Pictures: decoding (JPEG/PNG via zune), EXIF orientation, placement (contain with soft
+//! margins, or cover around a focus point), resampling, blur, palette extraction (median
+//! cut + k-means) and quantisation for sixel.
 //! The decoded original is dropped as soon as it has been downscaled.
 
 use crate::color::{chf, from_f, hsv_to_rgb, lum, mix, rgb, rgb_to_hsv, Rgb};
@@ -187,6 +188,7 @@ fn orient_img(img: Img, o: u8) -> Img {
     }
 }
 
+#[cfg(test)]
 /// Cover-crop (centre) and resample to dw × dh: area average when shrinking,
 /// bilinear when enlarging.
 pub fn cover(src: &Img, dw: usize, dh: usize) -> Vec<u8> {
@@ -195,6 +197,154 @@ pub fn cover(src: &Img, dw: usize, dh: usize) -> Vec<u8> {
     let (cw, chh) = (dw as f64 / scale, dh as f64 / scale);
     let (x0, y0) = ((sw - cw) / 2.0, (sh - chh) / 2.0);
     resample(src, (x0, y0, cw, chh), dw, dh)
+}
+
+/// How a picture fills the window.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Fit {
+    /// the whole picture, as large as fits; the margins show a blurred, dimmed
+    /// enlargement of it, so the edges continue instead of ending in black bars
+    Contain,
+    /// fill the window, cropping around the focus point
+    Cover,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Place {
+    pub fit: Fit,
+    /// focus (0..1, 0..1): what stays in view when cropping (cover), where the picture
+    /// sits in the margins (contain)
+    pub focus: (f32, f32),
+}
+
+impl Default for Place {
+    fn default() -> Self {
+        Place {
+            fit: Fit::Contain,
+            focus: (0.5, 0.5),
+        }
+    }
+}
+
+/// The picture's rectangle (x, y, w, h) inside a dw × dh canvas under `contain`;
+/// `aspect` = width / height of one canvas pixel (cell canvases: 5 × 6.7 px sextants).
+pub fn contain_rect(
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    aspect: f64,
+    focus: (f32, f32),
+) -> (usize, usize, usize, usize) {
+    let s = (dw as f64 * aspect / sw as f64).min(dh as f64 / sh as f64);
+    let iw = ((sw as f64 * s / aspect).round() as usize).clamp(1, dw.max(1));
+    let ih = ((sh as f64 * s).round() as usize).clamp(1, dh.max(1));
+    let x = (((dw - iw) as f32) * focus.0.clamp(0.0, 1.0)).round() as usize;
+    let y = (((dh - ih) as f32) * focus.1.clamp(0.0, 1.0)).round() as usize;
+    (x, y, iw, ih)
+}
+
+/// The picture placed in a dw × dh canvas (RGB) whose pixels are `aspect` times as
+/// wide as they are high.
+pub fn place(src: &Img, dw: usize, dh: usize, aspect: f64, pl: &Place) -> Vec<u8> {
+    let (sw, sh) = (src.w as f64, src.h as f64);
+    if dw == 0 || dh == 0 || src.w == 0 || src.h == 0 {
+        return vec![0; dw * dh * 3];
+    }
+    let (fx, fy) = (
+        pl.focus.0.clamp(0.0, 1.0) as f64,
+        pl.focus.1.clamp(0.0, 1.0) as f64,
+    );
+    // the canvas in square units
+    let (pw, ph) = (dw as f64 * aspect, dh as f64);
+    if pl.fit == Fit::Cover {
+        let scale = (pw / sw).max(ph / sh);
+        let (cw, chh) = (pw / scale, ph / scale);
+        let x0 = (fx * sw - cw / 2.0).clamp(0.0, sw - cw);
+        let y0 = (fy * sh - chh / 2.0).clamp(0.0, sh - chh);
+        return resample(src, (x0, y0, cw, chh), dw, dh);
+    }
+    let (x0, y0, iw, ih) = contain_rect(src.w, src.h, dw, dh, aspect, pl.focus);
+    if iw + 1 >= dw && ih + 1 >= dh {
+        // the window has the picture's shape (within a pixel): no margins
+        return stretch(src, dw, dh);
+    }
+    // margins: the picture mirrored at its edges, blurred (a 1/16-scale copy, so the
+    // same at every canvas size) and dimmed more with distance, so the edge continues
+    // into soft colour instead of ending in a seam or black bars
+    let (bw, bh) = (
+        ((iw as f64 * aspect / ih as f64 * 24.0).round() as usize).max(2),
+        24usize,
+    );
+    let mut small = stretch(src, bw, bh);
+    blur(&mut small, bw, bh, 1.5, 1.5);
+    let mut out = vec![0u8; dw * dh * 3];
+    let (fw, fh) = (iw as f32, ih as f32);
+    for y in 0..dh {
+        let ry = y as f32 + 0.5 - y0 as f32;
+        let my = if ry < 0.0 {
+            -ry
+        } else if ry > fh {
+            2.0 * fh - ry
+        } else {
+            ry
+        };
+        let sy = (my / fh * bh as f32 - 0.5).clamp(0.0, bh as f32 - 1.0);
+        let dy = (-ry).max(ry - fh).max(0.0) / fh;
+        for x in 0..dw {
+            let rx = x as f32 + 0.5 - x0 as f32;
+            let mx = if rx < 0.0 {
+                -rx
+            } else if rx > fw {
+                2.0 * fw - rx
+            } else {
+                rx
+            };
+            let sx = (mx / fw * bw as f32 - 0.5).clamp(0.0, bw as f32 - 1.0);
+            // distance from the picture (in picture sizes, aspect-corrected)
+            let dx = (-rx).max(rx - fw).max(0.0) / fw;
+            let dist = dx.max(dy);
+            let dim = 0.8 - 0.5 * (dist * 4.0).min(1.0);
+            let (ix, iy) = (sx as usize, sy as usize);
+            let (tx, ty) = (sx - ix as f32, sy - iy as f32);
+            let (ix1, iy1) = ((ix + 1).min(bw - 1), (iy + 1).min(bh - 1));
+            let d = (y * dw + x) * 3;
+            for k in 0..3 {
+                let p = |xx: usize, yy: usize| small[(yy * bw + xx) * 3 + k] as f32;
+                let top = p(ix, iy) + (p(ix1, iy) - p(ix, iy)) * tx;
+                let bot = p(ix, iy1) + (p(ix1, iy1) - p(ix, iy1)) * tx;
+                out[d + k] = ((top + (bot - top) * ty) * dim + 0.5) as u8;
+            }
+        }
+    }
+    let pic = stretch(src, iw, ih);
+    // feather the edges that border a margin (3 % of the picture's short side)
+    let f = ((iw as f64 * aspect).min(ih as f64) * 0.03).max(1.0) as f32;
+    let (fxw, fyw) = ((f / aspect as f32).max(1.0), f);
+    let (mx, my) = (iw + 1 < dw, ih + 1 < dh);
+    for y in 0..ih {
+        let dy = if my {
+            (y.min(ih - 1 - y) as f32 + 0.5) / fyw
+        } else {
+            9.0
+        };
+        for x in 0..iw {
+            let dx = if mx {
+                (x.min(iw - 1 - x) as f32 + 0.5) / fxw
+            } else {
+                9.0
+            };
+            let t = dx.min(dy).min(1.0);
+            let t = t * t * (3.0 - 2.0 * t);
+            let s = (y * iw + x) * 3;
+            let d = ((y0 + y) * dw + x0 + x) * 3;
+            for k in 0..3 {
+                let a = out[d + k] as f32;
+                out[d + k] = (a + (pic[s + k] as f32 - a) * t + 0.5) as u8;
+            }
+        }
+    }
+    out
 }
 
 /// Stretch the whole image to dw × dh.
@@ -608,6 +758,62 @@ mod tests {
         assert_eq!(q.pal.len(), 2);
         assert_ne!(q.idx[0], q.idx[7]);
     }
+    #[test]
+    fn contain_and_cover() {
+        // 16:9 into a 128×45-cell window of 10×20 px (1280×900): full width, 720 high
+        assert_eq!(
+            contain_rect(1920, 1080, 1280, 900, 1.0, (0.5, 0.5)),
+            (0, 90, 1280, 720)
+        );
+        // the same window as an octant canvas (256×180 sub-pixels of 5×5 px)
+        assert_eq!(
+            contain_rect(1920, 1080, 256, 180, 1.0, (0.5, 0.5)),
+            (0, 18, 256, 144)
+        );
+        // sextants are 5 × 6.67 px: the picture keeps its shape
+        let (_, y, w, hh) = contain_rect(1920, 1080, 256, 135, 0.75, (0.5, 0.5));
+        assert_eq!((w, hh, y), (256, 108, 14));
+        // a wide window (209×51 cells: 2090×1020): side margins
+        assert_eq!(
+            contain_rect(1920, 1080, 2090, 1020, 1.0, (0.5, 0.5)),
+            (139, 0, 1813, 1020)
+        );
+        // a picture: left half red, right half blue
+        let (sw, sh) = (32usize, 18usize);
+        let mut rgb = Vec::new();
+        for _ in 0..sh {
+            for x in 0..sw {
+                rgb.extend_from_slice(if x < sw / 2 {
+                    &[255, 0, 0]
+                } else {
+                    &[0, 0, 255]
+                });
+            }
+        }
+        let img = Img { w: sw, h: sh, rgb };
+        // contain into a square: all of it (both colours) in the middle band, the
+        // margins a dimmer copy
+        let c = place(&img, 64, 64, 1.0, &Place::default());
+        let px = |c: &[u8], x: usize, y: usize| {
+            let o = (y * 64 + x) * 3;
+            [c[o], c[o + 1], c[o + 2]]
+        };
+        assert_eq!(px(&c, 4, 32), [255, 0, 0]);
+        assert_eq!(px(&c, 60, 32), [0, 0, 255]);
+        let m = px(&c, 4, 2);
+        assert!(m[0] > 60 && m[0] < 230 && m[2] < 60, "{m:?}");
+        // cover with the focus on the left: the left edge (red) fills most of it
+        let pl = Place {
+            fit: Fit::Cover,
+            focus: (0.0, 0.5),
+        };
+        let c = place(&img, 64, 64, 1.0, &pl);
+        assert_eq!(px(&c, 50, 32), [255, 0, 0]);
+        // same shape: exact stretch, no margins
+        let c = place(&img, 64, 36, 1.0, &Place::default());
+        assert_eq!(c, stretch(&img, 64, 36));
+    }
+
     #[test]
     fn exif() {
         // II*\0, IFD at 8, 1 entry: tag 0x0112 type 3 count 1 value 6

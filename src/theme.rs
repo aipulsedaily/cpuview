@@ -88,6 +88,33 @@ pub const SURF_NAMES: [&str; 8] = [
     "", "screen", "bar", "panel", "select", "chip", "dialog", "track",
 ];
 
+/// How much the panels veil a picture (image themes; config `glass`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glass {
+    /// the picture as it is; only cells with text get a plate, where needed
+    Clear,
+    /// a light even veil over everything, plates under text only where needed
+    Light,
+    /// panels show a blurred, darker copy (the look of the built-in themes)
+    Frosted,
+}
+
+pub const GLASS_NAMES: [&str; 3] = ["clear", "light", "frosted"];
+
+impl Glass {
+    pub fn name(self) -> &'static str {
+        GLASS_NAMES[self as usize]
+    }
+    pub fn parse(s: &str) -> Option<Glass> {
+        match s {
+            "clear" => Some(Glass::Clear),
+            "light" => Some(Glass::Light),
+            "frosted" => Some(Glass::Frosted),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Surf {
     pub tint: Rgb,
@@ -134,6 +161,10 @@ pub struct Theme {
     pub image: Option<String>,
     /// Image themes: blur radius (cells) used under panels.
     pub soft_blur: f32,
+    /// Image themes: the veil (built-in themes are always `Frosted`: as designed).
+    pub glass: Glass,
+    /// Image themes: fit and focus of the picture.
+    pub place: crate::image::Place,
 }
 
 impl Theme {
@@ -249,6 +280,8 @@ pub fn load(name: &str) -> Option<Theme> {
         layers: t.arr("background"),
         image: None,
         soft_blur: 0.0,
+        glass: Glass::Frosted,
+        place: crate::image::Place::default(),
     })
 }
 

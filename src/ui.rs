@@ -3257,6 +3257,7 @@ impl App {
         }
         let bg = surf(S_PANEL);
         let track = th.track;
+        let picture = th.image.is_some();
         let heat = |v: Option<f32>| -> u32 {
             match v {
                 // quantised so a steady load gives identical neighbours (no repaint)
@@ -3321,14 +3322,22 @@ impl App {
                     scr.put(hx + hw - 1 - i, y, ' ', NOPATCH, bg);
                     continue;
                 }
-                let up = heat(va);
-                let lo = if gb >= n {
-                    th.panel
+                let vb = if gb >= n {
+                    None
                 } else if smooth {
-                    heat((i < hb).then(|| cb[hw - 1 - i]))
+                    (i < hb).then(|| cb[hw - 1 - i])
                 } else {
-                    heat(self.cell_load(&self.s.t.groups[gb], i))
+                    self.cell_load(&self.s.t.groups[gb], i)
                 };
+                let idle = |v: Option<f32>| v.is_some_and(|v| v < 0.03);
+                if picture && i > 0 && idle(va) && (gb >= n || idle(vb)) {
+                    // picture themes: an idle cell leaves the picture showing (not the
+                    // live newest column: its value moves every frame in smooth mode)
+                    scr.put(hx + hw - 1 - i, y, ' ', NOPATCH, bg);
+                    continue;
+                }
+                let up = heat(va);
+                let lo = if gb >= n { th.panel } else { heat(vb) };
                 scr.put(hx + hw - 1 - i, y, '▀', up, lo);
             }
             y += 1;

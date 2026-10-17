@@ -88,13 +88,14 @@ and every driver with what it shows.*
 | ![4K, 275x70](docs/screenshots/rust-4k-275x70.webp) 275×70 (4K at 150 %): per-core history grid, memory column | ![172x40](docs/screenshots/rust-default.webp) 172×40, Midnight |
 | ![60x20](docs/screenshots/rust-60x20.webp) 60×20: one row per core, live summary in the title | ![40x12](docs/screenshots/rust-40x12.webp) 40×12, Nebula: all 16 cores |
 | ![Nebula](docs/screenshots/rust-nebula.webp) Nebula | ![Synthwave](docs/screenshots/rust-synthwave.webp) Synthwave Sunset |
-| ![ISS aurora picture, sixel](docs/screenshots/rust-iss.webp) Picture theme (ISS aurora), sixel mode¹ | ![Night city picture, sixel](docs/screenshots/rust-city.webp) Picture theme (pixel night city), sixel mode¹ |
+| ![Synthwave picture, sixel, 128x45](docs/screenshots/rust-picture-128x45.webp) Picture theme (synthwave sunset), 128×45 in Windows Terminal (sixel): the whole picture at 1280×720 of the window's 1280×900 pixels¹ | ![Night city picture, sixel](docs/screenshots/rust-city.webp) Picture theme (pixel night city), sixel mode¹ |
+| ![ISS aurora picture, sixel](docs/screenshots/rust-iss.webp) Picture theme (ISS aurora), 172×40, sixel mode¹ | ![Synthwave picture, 4K](docs/screenshots/rust-picture-4k.webp) The same picture at 415×105 (4K): whole, the side margins continue it softly¹ |
 | ![Theme menu](docs/screenshots/rust-menu.webp) Theme menu with live preview | ![Smooth](docs/screenshots/rust-smooth.webp) `smooth` speed, mid-animation |
 | ![120x30 Night Forest](docs/screenshots/rust-c120.webp) 120×30, Night Forest | ![80x24 compact](docs/screenshots/rust-compact.webp) 80×24 compact, Space |
 
-¹ The sixel patches in these captures were decoded and composited by the capture harness
-(with Windows Terminal's rule that text erases the image in its cell), not shown by a real
-terminal.
+¹ The sixel pictures in these captures were decoded and composited by the capture harness,
+which answers the terminal queries like Windows Terminal (10×20 px cells) and applies its rule
+that text erases the image in its cell; not shown by a real terminal.
 
 ## Features
 
@@ -121,7 +122,8 @@ terminal.
   (8 bundled wallpapers, your own JPEG/PNG files, or a URL)
 - **Terminal graphics, detected over SSH**: sixel (Windows Terminal ≥ 1.22, foot, WezTerm,
   Konsole, xterm vt340, tmux ≥ 3.4), kitty, iTerm2 inline images, truecolor or 256-colour
-  half-blocks, or the terminal's own background image
+  block mosaics (octants, sextants, quadrants or half blocks), or the terminal's own background
+  image. Pictures are shown whole and at the window's own pixel resolution behind the panels
 - Mouse: click a core (in the list or the history grid) to select it, click a footer key, wheel in
   the theme menu
 - No root, no daemon: reads `/proc/stat` and sysfs; works on any Linux x86_64 / aarch64 and
@@ -439,9 +441,10 @@ jumping, on a fixed frame grid.
   neighbours once a second: one-point peaks shrank and regrew and one-dot features blinked off
   and on. Checked frame by frame: no cell changes and returns within 6 frames in 40 s runs at
   128×45 and 172×40, CPU view and Memory & Storage, Midnight and a picture theme.
-- **Pictures**: sixel/iTerm pixel patches are sent only with full repaints (start, keys,
-  resize), never mid-animation; a cell that turns blank in between shows the half-block
-  backdrop until then.
+- **Pictures**: the picture is sent once (start, resize, theme change); a cell that turns
+  blank shows the picture drawn with block glyphs and gets its pixels at the next patch tick
+  (4 a second) once it has stayed blank a full tick, never mid-animation. Cells of the busy
+  areas (graphs, bars) wait three ticks, at most 96 of them a tick (eco: until the next sample, at most 128).
 
 Measured from frame-by-frame captures at 128×45 (one thread driven by a 10 ms duty-cycle load,
 bar length read back from the edge cell's colour), previous smooth → now: frame intervals p95 /
@@ -473,9 +476,29 @@ scp .\pic.jpg you@yourserver:~/.config/cpuview/images/
 ```
 
 A picture theme takes its palette from the picture (load and temperature colours keep their
-meaning). Behind the panels the picture is blurred and tinted so the numbers stay readable over
-busy pictures; the bare screen between panels shows it sharp. The theme menu shows the credit of
-the bundled pictures (`wallpapers/CREDITS.md`: NASA public-domain photos and CC0 scenes).
+meaning). The theme menu shows the credit of the bundled pictures (`wallpapers/CREDITS.md`: NASA
+public-domain photos and CC0 scenes).
+
+**The whole picture, at the window's resolution.** By default the picture is shown whole
+(`fit = contain`): a 16:9 picture in a 128×45 window (1280×900 px in Windows Terminal) is
+1280×720, and the margins above and below continue it with a soft, dimmed enlargement of
+the picture instead of black bars (side margins in wide windows). In sixel and kitty mode
+every cell without text shows real pixels, including the empty space inside the panels,
+the graph grid and the bars' tracks; panel frames and graph grid lines are drawn into the
+picture. Text cells can't hold pixels in sixel terminals (writing a character erases the
+picture in that cell), so they get the picture's colour there, darkened only as far as the
+text needs to stay readable (a label reads as one plate). In `blocks` mode, and for cells
+that change too often for a pixel patch, the picture is drawn with block glyphs: octants
+(2×4 per cell), sextants (2×3), quadrants or half blocks, whichever the terminal draws
+itself (`glyphs = auto`, see `--doctor`).
+
+| setting | values | |
+|---|---|---|
+| `glass = ` / `--glass` / `g` in the menu | `light` (default), `clear`, `frosted` | light: an even light veil; clear: the picture as it is; frosted: blurred, darker panels |
+| `image.<file>.fit = ` / `--fit` / `f` in the menu | `contain` (default), `cover` | the whole picture, or fill the window and crop |
+| `image.<file>.focus = x,y` | 0..1 each, e.g. `0.5,0.3` | what stays in view when cropping (`cover`), where the picture sits in the margins (`contain`) |
+| `glyphs = ` / `--glyphs` | `auto`, `octant`, `sextant`, `quadrant`, `half` | block glyphs for pictures drawn with characters |
+| `image.<file>.dim` / `.blur` | ←→ / `b` in the menu | brightness, blur |
 Pictures stay on disk; the binary embeds only the theme definitions (`themes/*.toml`, compiled in
 by `build.rs`).
 
@@ -495,13 +518,25 @@ TERM          xterm-256color   COLORTERM=(unset)   ssh=yes
 replies       yes in 41 ms   DA1=[61, 4, 6, 7, 14, 21, 22, 23, 24, 28, 32, 42, 52]
 truecolor     yes (DECRQSS echoed)
 sixel         yes
-cell size     10x20 px (sixel default (VT340 / Windows Terminal virtual cell))
+cell size     10x20 px (CSI 16 t)
+window        128x45 cells, ioctl pixels 640x480, CSI 14t Some((1280, 900))
 → image mode  sixel  (DA1 lists 4 (sixel))
+→ glyphs      sextant  (Windows Terminal draws sextants)
 ```
 
-(that is what a Windows Terminal 1.22 reply looks like; `--doctor` then draws a test strip in
-the chosen mode). Pixel data is sent only on start, resize and theme change: sixel / iTerm2
-patches cover blank cells and survive live redraws because unchanged cells are never rewritten.
+(that is what Windows Terminal over SSH looks like; `--doctor` then draws a test strip in the
+chosen mode). Windows Terminal draws sixel at a fixed 10×20 px per cell and scales it to the
+font, so a 128×45 window is a 1280×900 canvas whatever the font size. Pixel data is sent once
+on start, resize and theme change: one picture for the whole window, which text then erases
+cell by cell, and afterwards small patches for cells that turn blank. Unchanged cells are never
+rewritten, so the picture survives live redraws.
+
+What a terminal can't do: in sixel terminals (Windows Terminal included) a cell holds either
+pixels or a character, never both, so the picture can't continue *under* text. kitty and
+Ghostty layer the picture under the text (kitty graphics with a negative z-index); WezTerm
+speaks that protocol too, but text over an image still erases it there (wezterm#7222), so it
+gets sixel. Windows Terminal has no kitty graphics (as of 1.25). Its profile `backgroundImage`
+is the other way to get a picture under every character (`--theme transparent`, below).
 
 **Windows Terminal background image**: `cpuview --theme transparent` leaves every cell at the
 terminal's default background so a `backgroundImage` set in the Windows Terminal profile shows
@@ -548,8 +583,8 @@ work; smooth and eco 60 s runs, fixed speeds 20 s):
 | 20/s · 30/s · 60/s | 20 · 30 · 60 | ~18 · 27 · 51 | 2.0 · 2.7 · 5.2 ms | 0.20 · 0.27 · 0.52 % | 31 · 25 · 68 KB/s |
 
 Smooth, 60 s runs at 128×45 · 172×40: Midnight 2.2 · 2.7 ms/s and 30 · 33 KB/s; NASA Webb
-picture (sixel) 3.4 · 3.6 ms/s and 38 · 27 KB/s; ≤ 3.3 KB per frame, never a picture patch after
-the first paint. (The previous smooth: 1.0 – 2.3 ms/s at ~20 – 50 irregular frames/s.) Its cost
+picture (sixel) 3.4 · 3.6 ms/s and 38 · 27 KB/s; ≤ 3.3 KB per frame (builds before the whole-picture
+rework below). (The previous smooth: 1.0 – 2.3 ms/s at ~20 – 50 irregular frames/s.) Its cost
 is mostly the 60 wakeups a second: on an idle machine a bare wakeup of a cache-cold core costs
 20–30 µs (3–6 µs when the CCD is busy). Fixed-speed
 cost depends mostly on how many cells change, so a busier machine costs more.
@@ -582,8 +617,24 @@ every minute or more; nothing is read for the page while it isn't shown.
 Smooth, 40 s runs at 128×45 · 172×40 under the same load: Memory & Storage page Midnight 3.4 ·
 3.5 ms/s and 7 · 7 KB/s, NASA Webb picture (sixel) 3.2 · 3.3 ms/s and 11 · 10 KB/s; CPU view 3.7 ·
 3.9 ms/s and 66 · 73 KB/s, 4.2 · 4.2 ms/s and 53 · 52 KB/s; frames stay on the 60 fps grid
-(consecutive frame intervals p95 / median 1.03–1.04, ≤ 0.1 % off the grid, no picture data after
-the first paint).
+(consecutive frame intervals p95 / median 1.03–1.04, ≤ 0.1 % off the grid; builds before the
+whole-picture rework).
+
+**Picture themes, whole picture at the window's resolution** (synthwave picture, sixel with
+Windows Terminal's replies, 60 s runs, load average 1.5–3.6 from other work):
+
+| | 128×45 | 209×51 | 415×105 |
+|---|---|---|---|
+| eco, CPU view · overview | 60.1 · 56.1 µs/s | 52.4 · 55.3 µs/s | 56.6 · 79.3 µs/s |
+| eco, the build before (cropped, blurred, half blocks) | 67.3 · 89.4 µs/s | 54.1 · 115.6 µs/s | 73 · 302 µs/s |
+| RSS (eco, CPU view), before → now | 6.5 → 5.5 MB | 8.8 → 6.8 MB | 22.8 → 8.1 MB |
+| smooth, CPU view · overview | 4.2 · 3.8 ms/s, 73 · 14 KB/s | 4.4–4.7 · 4.8 ms/s, 67 · 36 KB/s | |
+
+NASA ISS photo, eco CPU view: 57.0 (128×45) · 56.5 (172×40) · 77.9 (209×51) · 47.1 µs/s (415×105).
+Smooth frames stay on the 60 fps grid (p95 / median ≤ 1.04, ≤ 0.6 % off the grid). The picture
+itself is sent once: about 0.8 MB at 128×45 and 4 MB at 415×105 for the synthwave picture
+(1.1 / 6.5 MB for the Webb photo); the hi-res copy kept for patches is one byte per pixel at no
+more than the picture's own resolution (1.15 MB at 128×45, 2.3 MB at 4K).
 
 Binary: 979,432 bytes (`opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`,
 stripped; `"s"` is 13 KB larger and not measurably faster here, `2`/`3` exceed 1 MB). The memory

@@ -6,11 +6,11 @@
 //! the terminal shows, so a typical live frame touches a few hundred cells and writes a
 //! few hundred bytes in a single write(). Unchanged frames write nothing.
 
-use crate::color::{ch, contrast, mix, mix_lin, rgb, to_256, Rgb};
+use crate::color::{ch, contrast, lum, mix, mix_lin, rgb, to_256, Rgb};
 use crate::gfx;
 use crate::image::Indexed;
+use crate::mosaic::{Glyphs, Mos};
 use crate::theme::*;
-use std::io::Write;
 
 pub const BOLD: u32 = 1 << 24;
 /// fg is the `track` surface seen through glass (empty bar segments)
@@ -55,6 +55,10 @@ pub struct Out {
     pub fg: u32,
     pub bg: u32,
     pub bold: bool,
+    /// a blank cell showing the backdrop (a pixel patch may cover it)
+    pub pix: bool,
+    /// text whose background had to be darkened to be readable
+    pub plate: bool,
 }
 
 impl Out {
@@ -88,20 +92,27 @@ pub enum Look {
 /// 260 KB instead of 350).
 pub type Px2 = [u8; 6];
 
+#[cfg(test)]
 #[inline]
 pub fn px2(a: Rgb, b: Rgb) -> Px2 {
     let (a, b) = (ch(a), ch(b));
     [a[0], a[1], a[2], b[0], b[1], b[2]]
 }
 
-/// Background rendered for the current size: half-block canvas (2 px per cell) and,
-/// for pixel modes, a hi-res quantised copy at terminal pixel size.
+/// Background rendered for the current size: per cell the two half-block pixels and
+/// the best block-glyph mosaic, and for pixel modes a quantised copy at the terminal's
+/// pixel size (stored at no more than the picture's own resolution).
 pub struct Backdrop {
     pub w: usize,
     pub h: usize,
     /// per cell: [upper half pixel, lower half pixel] (interleaved for locality)
     pub sharp: Vec<Px2>,
     pub soft: Option<Vec<Px2>>,
+    /// per cell: two-colour glyph mosaic (empty: half blocks from `sharp`)
+    pub mos: Vec<Mos>,
+    /// per cell: the picture's average over ±3 cells of the row (text colour choice)
+    pub wide: Vec<Rgb>,
+    pub glyphs: Glyphs,
     pub glyph: Vec<(char, Rgb)>,
     pub has_glyphs: bool,
     pub hires: Option<Hires>,
@@ -110,19 +121,55 @@ pub struct Backdrop {
 pub struct Hires {
     pub cw: usize,
     pub ch: usize,
+    /// palette images; their size may be smaller than the screen's pixels
+    /// (`w·cw × h·ch`): patches then scale them up (nearest)
     pub sharp: Indexed,
-    pub soft: Indexed,
-    /// kitty: RGB data to transmit once (sharp, soft), dropped after sending
-    pub kitty: Option<(Vec<u8>, Vec<u8>)>,
+    pub soft: Option<Indexed>,
+    /// kitty: RGB data to transmit once, dropped after sending
+    pub kitty: Option<KittyData>,
+}
+
+pub struct KittyData {
+    pub rgb: Vec<u8>,
+    pub w: usize,
+    pub h: usize,
+    pub soft: Option<(Vec<u8>, usize, usize)>,
 }
 
 impl Backdrop {
+    /// Fill `wide` from `sharp`: a ±3-cell running average along each row.
+    pub fn widen(&mut self) {
+        let (w, h) = (self.w, self.h);
+        self.wide = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let row = &self.sharp[y * w..(y + 1) * w];
+            for x in 0..w {
+                let (x0, x1) = (x.saturating_sub(3), (x + 4).min(w));
+                let mut acc = [0u32; 3];
+                for p in &row[x0..x1] {
+                    for k in 0..3 {
+                        acc[k] += p[k] as u32 + p[k + 3] as u32;
+                    }
+                }
+                let n = 2 * (x1 - x0) as u32;
+                self.wide.push(rgb(
+                    (acc[0] / n) as u8,
+                    (acc[1] / n) as u8,
+                    (acc[2] / n) as u8,
+                ));
+            }
+        }
+    }
+
     pub fn empty(w: usize, h: usize) -> Backdrop {
         Backdrop {
             w,
             h,
             sharp: vec![[0; 6]; w * h],
             soft: None,
+            mos: Vec::new(),
+            wide: Vec::new(),
+            glyphs: Glyphs::Half,
             glyph: Vec::new(),
             has_glyphs: false,
             hires: None,
@@ -148,11 +195,14 @@ struct SurfF {
 
 pub struct Comp {
     pub look: Look,
+    glass: Glass,
     br: f32,
     min_c: f32,
     s: [SurfF; 8],
     solid: [Rgb; 8],
     track_solid: Rgb,
+    /// colour of the bars' track drawn into a pixel patch
+    pub track_ink: Rgb,
 }
 
 #[inline]
@@ -178,17 +228,21 @@ impl Comp {
                 tint_rgb: p.tint,
                 a: p.alpha,
                 ta: p.text_alpha,
-                adapt: soft_surface(i as u8) && i as u8 != S_TRACK,
+                // panel glass thickens over bright pixels: the frosted look only; the
+                // light / clear veils keep the picture as it is
+                adapt: soft_surface(i as u8) && i as u8 != S_TRACK && t.glass == Glass::Frosted,
             };
             solid[i] = t.solid(i as u8);
         }
         Comp {
             look,
+            glass: t.glass,
             br: t.brightness,
             min_c: t.min_contrast,
             s,
             solid,
             track_solid: t.track,
+            track_ink: t.track,
         }
     }
 
@@ -208,17 +262,70 @@ impl Comp {
         rgb(q(0), q(1), q(2))
     }
 
-    fn guarded(&self, fg: Rgb, px: Rgb, s: &SurfF, mut a: f32, cap: f32) -> Rgb {
+    /// Text over the backdrop: (fg, bg, plate). The cell shows the picture's colour
+    /// through the glass; where the text doesn't read on it, the light and clear veils
+    /// change the text instead (darker on a bright picture, lighter on a darker one,
+    /// same hue), so no dark plate breaks up the picture; failing that (and in the
+    /// built-in looks) the glass thickens until the text reads (`plate`: it had to).
+    fn guarded(
+        &self,
+        fg: Rgb,
+        px: Rgb,
+        s: &SurfF,
+        mut a: f32,
+        cap: f32,
+        wide: Rgb,
+    ) -> (Rgb, Rgb, bool) {
         // adaptive (panel) glass is already dark where the backdrop is bright: ask less of
         // the guard there, so dim labels do not get dark plates of their own
         let keep = if s.adapt { 0.75 } else { 0.9 };
         let target = self.min_c.min(cap).min(contrast(fg, s.tint_rgb) * keep);
         let mut bg = self.glass(px, s, a);
+        if self.glass != Glass::Frosted {
+            // the light / clear veils: decided on the picture around the cell (`wide`,
+            // ±3 cells of the row), so the letters of a word change together: on a
+            // bright area the text goes dark, on a darker one a dim label goes lighter
+            let wbg = self.glass(wide, s, a);
+            let fix = |bg: Rgb, dark: bool| -> Option<Rgb> {
+                let first = if dark { 0 } else { 0xffffff };
+                for to in [first, 0xffffff ^ first] {
+                    for k in 2..10 {
+                        let d = mix(fg, to, k as f32 / 10.0);
+                        if contrast(d, bg) >= target {
+                            return Some(d);
+                        }
+                    }
+                }
+                None
+            };
+            let near_ok = contrast(fg, wbg) >= target;
+            if !near_ok {
+                if let Some(d) = fix(wbg, lum(wbg) >= 0.2) {
+                    if contrast(d, bg) >= target * 0.8 {
+                        return (d, bg, false);
+                    }
+                }
+            } else if contrast(fg, bg) >= target {
+                return (fg, bg, false);
+            }
+            // (where the neighbours keep the text's colour, push this cell's text the
+            // same way: light text gets lighter, not dark)
+            let dark = if near_ok {
+                lum(fg) < lum(bg)
+            } else {
+                lum(wbg) >= 0.2
+            };
+            if let Some(d) = fix(bg, dark) {
+                return (d, bg, false);
+            }
+        } else if contrast(fg, bg) >= target {
+            return (fg, bg, false);
+        }
         while a < 1.0 && contrast(fg, bg) < target {
             a = (a + 0.1).min(1.0);
             bg = self.glass(px, s, a);
         }
-        bg
+        (fg, bg, true)
     }
 
     /// Composite one logical cell. `nb_blank`: both horizontal neighbours are blank
@@ -249,6 +356,8 @@ impl Comp {
                     fg,
                     bg,
                     bold,
+                    pix: false,
+                    plate: false,
                 }
             }
             Look::Glass | Look::KittyGlass => {
@@ -270,12 +379,21 @@ impl Comp {
                     let p = cv[y * bd.w + x];
                     (rgb(p[0], p[1], p[2]), rgb(p[3], p[4], p[5]))
                 };
+                // the picture around a text cell (±3 cells of its row) through the glass:
+                // bright → dark text (Comp::guarded)
+                // the picture around a text cell (Backdrop::wide)
+                let wide = bd.wide.get(y * bd.w + x).copied().unwrap_or_else(|| {
+                    let (t, b) = pix(sid);
+                    mix(t, b, 0.5)
+                });
                 let kitty = self.look == Look::KittyGlass;
                 let mut out = Out {
                     ch: c.ch,
                     fg: fg_rgb,
                     bg: c.bg & 0xFF_FFFF,
                     bold,
+                    pix: false,
+                    plate: false,
                 };
                 if sid != 0 {
                     let s = &self.s[sid as usize & 7];
@@ -287,6 +405,23 @@ impl Comp {
                         };
                         if c.ch == ' ' {
                             return out;
+                        }
+                        if out.bg == DEFAULT && c.fg & (TRACK | BLEND) == 0 {
+                            // text straight on the picture: its lightness adapts to the
+                            // picture (Comp::guarded), a plate only where that can't help
+                            let (top, bot) = pix(sid);
+                            let a = self.overlay(sid).1;
+                            if !matches!(c.ch, '\u{2800}'..='\u{28ff}' | '\u{2500}'..='\u{257f}' | '\u{2580}'..='\u{259f}')
+                            {
+                                let (f, b, plate) =
+                                    self.guarded(fg_rgb, mix(top, bot, 0.5), s, a, 99.0, wide);
+                                // dark text straight on the picture, or a plate
+                                out.fg = f;
+                                if plate {
+                                    out.bg = b;
+                                    out.plate = true;
+                                }
+                            }
                         }
                     } else {
                         let (top, bot) = pix(sid);
@@ -304,21 +439,50 @@ impl Comp {
                                             fg: mix(bgc, gc, 0.85 * (1.0 - s.a * 0.6)),
                                             bg: bgc,
                                             bold: false,
+                                            pix: false,
+                                            plate: false,
                                         };
                                     }
                                 }
+                            }
+                            // the picture drawn with block glyphs (soft surfaces of the
+                            // frosted look: blurred, half blocks are enough)
+                            let i = y * bd.w + x;
+                            if !bd.mos.is_empty() && !(bd.soft.is_some() && soft_surface(sid)) {
+                                let m = bd.mos[i];
+                                let bg = self.glass(rgb(m.bg[0], m.bg[1], m.bg[2]), s, s.a);
+                                if let (true, Some(g)) = (m.p != 0, bd.glyphs.char(m.p)) {
+                                    return Out {
+                                        ch: g,
+                                        fg: self.glass(rgb(m.fg[0], m.fg[1], m.fg[2]), s, s.a),
+                                        bg,
+                                        bold: false,
+                                        pix: true,
+                                        plate: false,
+                                    };
+                                }
+                                return Out {
+                                    ch: ' ',
+                                    fg: bg,
+                                    bg,
+                                    bold: false,
+                                    pix: true,
+                                    plate: false,
+                                };
                             }
                             return Out {
                                 ch: '▀',
                                 fg: self.glass(top, s, s.a),
                                 bg: self.glass(bot, s, s.a),
                                 bold: false,
+                                pix: true,
+                                plate: false,
                             };
                         }
                         out.bg = match c.ch {
                             '▄' => self.glass(top, s, s.a),
                             '▀' => self.glass(bot, s, s.a),
-                            '\u{2800}'..='\u{28ff}' | '\u{2500}'..='\u{257f}' => {
+                            '\u{2800}'..='\u{28ff}' | '\u{2500}'..='\u{257f}' | '·' => {
                                 // thin glyphs (graph dots, borders): no plate, so they don't
                                 // leave dark squares on bright backgrounds
                                 self.glass(mix(top, bot, 0.5), s, s.a)
@@ -326,13 +490,23 @@ impl Comp {
                             '\u{2581}'..='\u{2587}' => self.glass(top, s, s.a),
                             // text: the surface's own alpha (no plate), denser only where the
                             // contrast guard needs it; adaptive glass already darkens bright spots
-                            _ => self.guarded(
-                                fg_rgb,
-                                mix(top, bot, 0.5),
-                                s,
-                                if s.adapt { s.a } else { s.ta },
-                                99.0,
-                            ),
+                            _ => {
+                                let a = if s.adapt { s.a } else { s.ta };
+                                let (f, b, plate) =
+                                    self.guarded(fg_rgb, mix(top, bot, 0.5), s, a, 99.0, wide);
+                                out.fg = f;
+                                out.plate = plate;
+                                b
+                            }
+                        };
+                        // frames, grid lines and bars: a pixel patch draws them over the
+                        // picture itself (not a bar's anti-aliased end: a blend)
+                        out.pix = if c.fg & BLEND != 0 {
+                            false
+                        } else if c.fg & TRACK != 0 {
+                            matches!(c.ch, '▁'..='▄')
+                        } else {
+                            ink_glyph(c.ch) || matches!(c.ch, '▁'..='█')
                         };
                     }
                 }
@@ -362,8 +536,35 @@ impl Comp {
         pal.iter().map(|&p| self.glass(p, s, s.a)).collect()
     }
 
-    pub fn surf_tint(&self, sid: u8, text: bool) -> (Rgb, f32) {
+    /// Pixel-patch class of each surface: surfaces whose blank cells look alike (same
+    /// glass, same picture) share one, named by the lowest such surface id; 0 = never
+    /// patched (dialogs: the menu previews in half blocks).
+    pub fn classes(&self, bd: &Backdrop) -> [u8; 8] {
+        let key = |i: usize| {
+            let s = &self.s[i];
+            (
+                bd.soft.is_some() && soft_surface(i as u8),
+                s.tint_rgb,
+                s.a.to_bits(),
+                s.adapt,
+            )
+        };
+        let mut cl = [0u8; 8];
+        for (i, c) in cl.iter_mut().enumerate().skip(1) {
+            if i as u8 != S_DIALOG {
+                *c = (1..=i)
+                    .find(|&r| r as u8 != S_DIALOG && key(r) == key(i))
+                    .unwrap_or(i) as u8;
+            }
+        }
+        cl
+    }
+
+    /// kitty: tint and alpha of the overlay placed over a surface's rectangle (frosted
+    /// panels use their text alpha: no per-cell plates there)
+    pub fn overlay(&self, sid: u8) -> (Rgb, f32) {
         let s = &self.s[sid as usize & 7];
+        let text = matches!(sid, S_PANEL | S_DIALOG) && self.glass == Glass::Frosted;
         (s.tint_rgb, if text { s.ta } else { s.a })
     }
 }
@@ -375,6 +576,27 @@ pub enum Patch {
     Sixel,
     Iterm,
 }
+
+/// When cells that just turned blank get their pixel patch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum When {
+    /// in this flush (eco: few cells change, and rarely); also a tick for the cells
+    /// of busy areas (NOPATCH) that are waiting
+    Now,
+    /// not in this flush: remember them (smooth mode, between patch ticks)
+    Later,
+    /// a patch tick: patch the cells that have stayed blank since the previous tick
+    Tick,
+}
+
+/// Ticks a blank cell of a busy area (graphs, bars: NOPATCH) must stay unchanged
+/// before it gets pixels, and how many such cells one tick may patch (bounded cost).
+/// (Smooth: ticks 4 a second. Eco: every flush is a tick, and flushes are 1–10 s
+/// apart: a cell that stayed put through one whole sample goes at the next.)
+pub const BUSY_TICKS: u8 = 3;
+pub const BUSY_PER_TICK: usize = 96;
+pub const BUSY_TICKS_ECO: u8 = 1;
+pub const BUSY_PER_TICK_ECO: usize = 128;
 
 /// Append a decimal number (no core::fmt on the hot path).
 #[inline]
@@ -392,13 +614,286 @@ pub fn dec(out: &mut Vec<u8>, mut v: u32) {
     out.extend_from_slice(&b[i..]);
 }
 
+/// Palette index left unset (transparent) in full-screen pictures, and the ink colours
+/// (frames and bars drawn into patches): hi-res pictures have at most 190 colours,
+/// each picture or patch defines up to 65 inks of its own.
+pub const CLEAR: u8 = 255;
+pub const INK: u8 = 190;
+pub const PAL_MAX: usize = 190;
+const INK_SLOTS: usize = CLEAR as usize - INK as usize;
+
+/// The ink colours of one picture or patch.
+#[derive(Default)]
+struct Inks(Vec<Rgb>);
+
+impl Inks {
+    /// Palette index of colour `c`: added if there is room; else `None` (`near`:
+    /// the closest one there is).
+    fn idx(&mut self, c: Rgb, near: bool) -> Option<u8> {
+        if let Some(i) = self.0.iter().position(|&k| k == c) {
+            return Some(INK + i as u8);
+        }
+        if self.0.len() < INK_SLOTS {
+            self.0.push(c);
+            return Some(INK + self.0.len() as u8 - 1);
+        }
+        if !near {
+            return None;
+        }
+        let d = |k: Rgb| {
+            let (a, b) = (ch(k), ch(c));
+            (0..3)
+                .map(|j| (a[j] as i32 - b[j] as i32).pow(2))
+                .sum::<i32>()
+        };
+        let (i, _) = self.0.iter().enumerate().min_by_key(|(_, &k)| d(k))?;
+        Some(INK + i as u8)
+    }
+}
+
+/// Glyphs a pixel patch draws itself (lines and dots of the panels' frames).
+pub fn ink_glyph(c: char) -> bool {
+    matches!(
+        c,
+        '─' | '│'
+            | '╭'
+            | '╮'
+            | '╰'
+            | '╯'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '┃'
+            | '━'
+            | '╵'
+            | '·'
+            | '\u{2801}'..='\u{28ff}'
+    )
+}
+
+/// A character of text (not a blank, line, block or mosaic glyph).
+fn is_text(c: char) -> bool {
+    c != ' '
+        && !ink_glyph(c)
+        && !matches!(c, '\u{2580}'..='\u{259f}' | '\u{2800}'..='\u{28ff}' | '\u{1fb00}'..='\u{1fbff}' | '\u{1cd00}'..='\u{1cdff}')
+}
+
+/// Draw an ink glyph into a palette-indexed cell block (`w × h` at `(ox, oy)` of a
+/// buffer `stride` wide): a centred line one pixel per 10 wide (heavy: double), arcs
+/// for the rounded corners, small squares for dots and braille.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_glyph(
+    c: char,
+    ink: u8,
+    px: &mut [u8],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    w: usize,
+    h: usize,
+) {
+    let heavy = matches!(c, '┃' | '━');
+    let t = (w.div_ceil(10)).max(1) * if heavy { 2 } else { 1 };
+    let (x0, y0) = ((w - t.min(w)) / 2, (h - t.min(h)) / 2);
+    let mut set = |x: usize, y: usize| {
+        if x < w && y < h {
+            px[(oy + y) * stride + ox + x] = ink;
+        }
+    };
+    if let '\u{2801}'..='\u{28ff}' = c {
+        // braille (graph grid lines): dots on a 2 × 4 grid
+        const AT: [(usize, usize); 8] = [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (0, 3),
+            (1, 3),
+        ];
+        let bits = c as u32 - 0x2800;
+        let d = (w / 5).max(1);
+        for (k, &(gx, gy)) in AT.iter().enumerate() {
+            if bits >> k & 1 == 1 {
+                let x = (w * (1 + 2 * gx)) / 4 - d / 2;
+                let y = (h * (1 + 2 * gy)) / 8 - d / 2;
+                for yy in y..y + d {
+                    for xx in x..x + d {
+                        set(xx, yy);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if c == '·' {
+        let d = t + 1;
+        let (dx, dy) = ((w - d.min(w)) / 2, (h - d.min(h)) / 2);
+        for y in dy..dy + d {
+            for x in dx..dx + d {
+                set(x, y);
+            }
+        }
+        return;
+    }
+    // arms from the centre: left, right, up, down
+    let (l, r, u, d) = match c {
+        '─' | '━' => (true, true, false, false),
+        '│' | '┃' => (false, false, true, true),
+        '├' => (false, true, true, true),
+        '┤' => (true, false, true, true),
+        '┬' => (true, true, false, true),
+        '┴' => (true, true, true, false),
+        '┼' => (true, true, true, true),
+        '╵' => (false, false, true, false),
+        _ => (false, false, false, false),
+    };
+    let hline = |set: &mut dyn FnMut(usize, usize), a: usize, b: usize| {
+        for y in y0..y0 + t {
+            for x in a..b {
+                set(x, y);
+            }
+        }
+    };
+    let vline = |set: &mut dyn FnMut(usize, usize), a: usize, b: usize| {
+        for y in a..b {
+            for x in x0..x0 + t {
+                set(x, y);
+            }
+        }
+    };
+    if l {
+        hline(&mut set, 0, x0 + t);
+    }
+    if r {
+        hline(&mut set, x0, w);
+    }
+    if u {
+        vline(&mut set, 0, y0 + t);
+    }
+    if d {
+        vline(&mut set, y0, h);
+    }
+    // rounded corners: a quarter circle joining the two arms
+    let arc = match c {
+        '╭' => Some((true, true)),   // arms right and down
+        '╮' => Some((false, true)),  // left and down
+        '╰' => Some((true, false)),  // right and up
+        '╯' => Some((false, false)), // left and up
+        _ => None,
+    };
+    if let Some((right, down)) = arc {
+        let rad = (w / 2).max(2) as f32;
+        // the circle's centre, in pixel-centre coordinates of the line's middle
+        let mx = x0 as f32 + (t as f32 - 1.0) / 2.0;
+        let my = y0 as f32 + (t as f32 - 1.0) / 2.0;
+        let cx = if right { mx + rad } else { mx - rad };
+        let cy = if down { my + rad } else { my - rad };
+        // the straight parts beyond the arc
+        if right {
+            hline(&mut set, (cx.round() as usize).min(w), w);
+        } else {
+            hline(&mut set, 0, (cx.round().max(0.0) as usize + 1).min(w));
+        }
+        if down {
+            vline(&mut set, (cy.round() as usize).min(h), h);
+        } else {
+            vline(&mut set, 0, (cy.round().max(0.0) as usize + 1).min(h));
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32, y as f32);
+                let inq = (if right { fx <= cx } else { fx >= cx })
+                    && (if down { fy <= cy } else { fy >= cy });
+                if inq {
+                    let dd = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+                    if (dd - rad).abs() <= t as f32 / 2.0 + 0.3 {
+                        set(x, y);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The picture's colours through a class's glass, padded to the first ink.
+fn glass_pal(comp: &Comp, pal: &[Rgb], class: u8) -> Vec<Rgb> {
+    let mut p = comp.glass_palette(pal, class);
+    p.resize(INK as usize, 0);
+    p
+}
+
+/// What a pixel patch draws in cell `c` with ink `ix`: a bar or its track (the lower
+/// k/8 of the cell), else a frame / dot / braille glyph.
+#[allow(clippy::too_many_arguments)]
+fn ink_cell(
+    c: Cell,
+    ix: u8,
+    px: &mut [u8],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    cw: usize,
+    chh: usize,
+) {
+    if let '▁'..='█' = c.ch {
+        let k = (c.ch as u32 - 0x2580) as usize;
+        // a track is a thin line along the bar's base: the picture shows above it
+        let top = if c.fg & TRACK != 0 {
+            chh - (chh / 10).max(1)
+        } else {
+            chh - (chh * k).div_ceil(8)
+        };
+        for y in top..chh {
+            let r = (oy + y) * stride + ox;
+            px[r..r + cw].fill(ix);
+        }
+    } else {
+        draw_glyph(c.ch, ix, px, stride, ox, oy, cw, chh);
+    }
+}
+
+/// The pixels (x0, y0, w, h) of the screen's pixel grid (`pw × ph`) from `src`, which
+/// may be smaller (stored at the picture's own resolution): nearest-neighbour.
+pub fn crop(
+    src: &Indexed,
+    pw: usize,
+    ph: usize,
+    r: (usize, usize, usize, usize),
+    out: &mut Vec<u8>,
+) {
+    let (x0, y0, w, h) = r;
+    out.clear();
+    if src.w == 0 || src.h == 0 {
+        out.resize(w * h, 0);
+        return;
+    }
+    if src.w == pw && src.h == ph {
+        for y in y0..y0 + h {
+            let o = y * src.w + x0;
+            out.extend_from_slice(&src.idx[o..o + w]);
+        }
+        return;
+    }
+    let xm: Vec<usize> = (x0..x0 + w)
+        .map(|x| (x * src.w / pw.max(1)).min(src.w - 1))
+        .collect();
+    for y in y0..y0 + h {
+        let sy = (y * src.h / ph.max(1)).min(src.h - 1);
+        let row = &src.idx[sy * src.w..(sy + 1) * src.w];
+        out.extend(xm.iter().map(|&sx| row[sx]));
+    }
+}
+
 pub struct Screen {
     pub w: usize,
     pub h: usize,
     pub buf: Vec<Cell>,
     /// one bit per cell: logical content changed since the last flush
     dirty: Vec<u64>,
-    /// what the terminal shows, as a 64-bit hash per cell (8 bytes instead of 16)
     /// what the terminal shows, as 32-bit cell hashes (half the memory of 64-bit
     /// keys; a collision only delays one cell's repaint until it changes again)
     front: Vec<u32>,
@@ -406,25 +901,52 @@ pub struct Screen {
     pub out: Vec<u8>,
     sgr: Option<(u32, u32, bool)>,
     cur: (usize, usize),
-    marks: Vec<(u16, u16, u8)>,
+    /// cells to patch in this flush (scratch)
+    pm: Vec<u64>,
+    /// blank cells drawn with glyphs that still want their pixels, and the ticks each
+    /// has waited
+    want: Vec<u64>,
+    age: Vec<u8>,
+    /// round robin over `want` (the word to start the next tick at)
+    rr: usize,
+    rr_next: Option<usize>,
+    pub when: When,
+    /// patch palettes per class (the picture's colours through that glass, then the
+    /// inks), valid until the next full repaint
+    pals: [Option<Vec<Rgb>>; 8],
+    /// full repaint (sixel): the patch class of each cell under the picture (0: text)
+    img_cls: Vec<u8>,
     sixel: gfx::Sixel,
     pub patch_bytes: usize,
     pub tmux: bool,
 }
 
+#[inline]
+fn bit(v: &[u64], i: usize) -> bool {
+    v[i >> 6] >> (i & 63) & 1 == 1
+}
+
 impl Screen {
     pub fn new(w: usize, h: usize) -> Screen {
+        let words = (w * h).div_ceil(64) + 1;
         Screen {
             w,
             h,
             buf: vec![BLANK; w * h],
-            dirty: vec![0; (w * h).div_ceil(64) + 1],
+            dirty: vec![0; words],
             front: vec![u32::MAX; w * h],
             full: true,
             out: Vec::with_capacity(64 * 1024),
             sgr: None,
             cur: (usize::MAX, 0),
-            marks: Vec::new(),
+            pm: vec![0; words],
+            want: vec![0; words],
+            age: vec![0; w * h],
+            rr: 0,
+            rr_next: None,
+            when: When::Now,
+            pals: Default::default(),
+            img_cls: Vec::new(),
             sixel: gfx::Sixel::default(),
             patch_bytes: 0,
             tmux: false,
@@ -434,6 +956,7 @@ impl Screen {
     pub fn resize(&mut self, w: usize, h: usize) {
         *self = Screen {
             tmux: self.tmux,
+            when: self.when,
             ..Screen::new(w, h)
         };
     }
@@ -501,7 +1024,12 @@ impl Screen {
     }
 
     fn sgr(&mut self, o: &Out, x: usize, y: usize, depth: Depth) {
-        let want = (o.fg, o.bg, o.bold);
+        // a space shows no foreground: keep the current one (fewer bytes)
+        let fg = match self.sgr {
+            Some((f, _, _)) if o.ch == ' ' => f,
+            _ => o.fg,
+        };
+        let want = (fg, o.bg, o.bold);
         if self.sgr == Some(want) {
             return;
         }
@@ -514,7 +1042,7 @@ impl Screen {
             first = false;
         }
         for (is_bg, v, ov) in [
-            (false, o.fg, old.map(|s| s.0)),
+            (false, fg, old.map(|s| s.0)),
             (true, o.bg, old.map(|s| s.1)),
         ] {
             if ov == Some(v) {
@@ -543,6 +1071,46 @@ impl Screen {
         self.sgr = Some(want);
     }
 
+    /// Composite cell `i`. A single blank between two characters of text (the space
+    /// between words) gets the text's plate, so a label reads as one plate.
+    fn composite(&self, comp: &Comp, i: usize, bd: Option<&Backdrop>, stars: bool) -> Out {
+        let (x, y) = (i % self.w, i / self.w);
+        let c = self.buf[i];
+        if c.ch == ' '
+            && matches!(comp.look, Look::Glass | Look::KittyGlass)
+            && x > 0
+            && x + 1 < self.w
+        {
+            let (l, r) = (self.buf[i - 1], self.buf[i + 1]);
+            if is_text(l.ch) && is_text(r.ch) && l.bg == c.bg && r.bg == c.bg {
+                let mut o = comp.cell(
+                    Cell {
+                        ch: 'x',
+                        fg: l.fg,
+                        bg: c.bg,
+                    },
+                    x,
+                    y,
+                    bd,
+                    false,
+                );
+                if o.plate {
+                    o.ch = ' ';
+                    o.pix = false;
+                    return o;
+                }
+            }
+        }
+        comp.cell(c, x, y, bd, self.nb_blank(i, stars))
+    }
+
+    /// Both horizontal neighbours blank (a background star may be drawn here).
+    #[inline]
+    fn nb_blank(&self, i: usize, stars: bool) -> bool {
+        let x = i % self.w;
+        stars && x > 0 && x + 1 < self.w && self.buf[i - 1].ch == ' ' && self.buf[i + 1].ch == ' '
+    }
+
     /// Composite and emit every changed cell. Returns the bytes to write (may be empty).
     pub fn flush(
         &mut self,
@@ -553,8 +1121,8 @@ impl Screen {
     ) -> &[u8] {
         self.out.clear();
         self.out.extend_from_slice(b"\x1b[?2026h"); // synchronized update
-        self.marks.clear();
         let full = self.full;
+        let patching = patch != Patch::None && bd.is_some_and(|b| b.hires.is_some());
         if full {
             self.out.extend_from_slice(b"\x1b[0m");
             self.sgr = None;
@@ -563,21 +1131,86 @@ impl Screen {
                 // drop any old images (sixel/iterm) by clearing the screen
                 self.out.extend_from_slice(b"\x1b[2J");
             }
+            self.want.fill(0);
+            self.pals = Default::default();
         }
+        let classes = match bd {
+            Some(b) if patching => comp.classes(b),
+            _ => [0; 8],
+        };
         let stars = bd.is_some_and(|b| b.has_glyphs) && matches!(comp.look, Look::Glass);
-        let w = self.w;
+        let (w, h) = (self.w, self.h);
         let n = self.buf.len();
-        let patching = patch != Patch::None && bd.is_some_and(|b| b.hires.is_some());
+        // a blank cell showing the backdrop that a pixel patch may cover (cells of busy
+        // areas, NOPATCH, only once they have stayed blank a while)
+        let elig = |c: &Cell, o: &Out, y: usize| {
+            o.pix && classes[(c.bg >> 24) as usize & 7] != 0 && y + 2 < h
+        };
+        // sixel: a full repaint sends the whole picture first; text then erases it
+        // cell by cell (any write to a cell drops its image pixels)
+        // (not inside tmux: it drops an image as soon as text overwrites any of it)
+        let full_img = full && patching && patch == Patch::Sixel && !self.tmux;
+        if full_img {
+            self.emit_full(comp, bd.unwrap(), &classes, stars);
+        }
+
         if full {
             self.dirty.iter_mut().for_each(|d| *d = !0);
-        } else if stars {
-            // a background star depends on its neighbours being blank: re-check them too
+        } else if stars || matches!(comp.look, Look::Glass | Look::KittyGlass) {
+            // a background star depends on its neighbours being blank, a plate between
+            // two words on them being text: re-check them too
             let mut carry = 0u64;
             for k in 0..self.dirty.len() {
                 let d = self.dirty[k];
                 let next_lo = self.dirty.get(k + 1).map_or(0, |x| x & 1);
                 self.dirty[k] = d | d << 1 | d >> 1 | carry | next_lo << 63;
                 carry = d >> 63;
+            }
+        }
+        let mut any_pm = false;
+        if patching {
+            // cells waiting for pixels: every bit in `want` is a cell still showing its
+            // glyph mosaic (any repaint of it cleared the bit). A tick ages them; quiet
+            // cells go after a tick, cells of busy areas after BUSY_TICKS(_ECO), at most
+            // BUSY_PER_TICK(_ECO) of those per tick
+            if self.when != When::Later {
+                let (busy_ticks, busy_max) = if self.when == When::Now {
+                    (BUSY_TICKS_ECO, BUSY_PER_TICK_ECO)
+                } else {
+                    (BUSY_TICKS, BUSY_PER_TICK)
+                };
+                let mut busy = 0;
+                // round robin: start where the last tick's budget ran out, so cells
+                // that keep changing near the top can't starve the rest
+                let nw = self.want.len();
+                let start = self.rr % nw.max(1);
+                for kk in 0..nw {
+                    let k = (start + kk) % nw;
+                    if busy >= busy_max && self.rr_next.is_none() {
+                        self.rr_next = Some(k);
+                    }
+                    let mut bits = self.want[k];
+                    while bits != 0 {
+                        let b = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let i = k * 64 + b;
+                        let quiet = self.buf[i].fg & (NOPATCH | TRACK) == 0;
+                        self.age[i] = self.age[i].saturating_add(1);
+                        // (smooth: a full tick period blank, so short blinks never cost a patch)
+                        let ripe = if quiet {
+                            self.when == When::Now || self.age[i] >= 2
+                        } else {
+                            self.age[i] >= busy_ticks && busy < busy_max
+                        };
+                        if ripe {
+                            busy += !quiet as usize;
+                            self.want[k] &= !(1u64 << b);
+                            self.pm[k] |= 1 << b;
+                            any_pm = true;
+                        }
+                    }
+                }
+                self.rr = self.rr_next.take().unwrap_or(0);
             }
         }
         for k in 0..self.dirty.len() {
@@ -591,25 +1224,31 @@ impl Screen {
                 }
                 let (x, y) = (i % w, i / w);
                 let c = self.buf[i];
-                let nb = stars
-                    && x > 0
-                    && x + 1 < w
-                    && self.buf[i - 1].ch == ' '
-                    && self.buf[i + 1].ch == ' ';
-                let o = comp.cell(c, x, y, bd, nb);
-                let sid = (c.bg >> 24) as u8;
-                if patching
-                    && c.ch == ' '
-                    && o.ch == '▀'
-                    && c.fg & NOPATCH == 0
-                    && sid != 0
-                    && y + 2 < self.h
-                {
-                    self.marks.push((x as u16, y as u16, sid));
-                }
+                let o = self.composite(comp, i, bd, stars);
+                let mut e = patching && elig(&c, &o, y);
                 let ok = (o.key() >> 32) as u32 ^ o.key() as u32;
+                if full_img && e {
+                    if self.img_cls[i] != 0 {
+                        // the picture is already there
+                        self.front[i] = ok;
+                        continue;
+                    }
+                    // left out of the picture (no ink slot): text this time
+                    e = false;
+                }
                 if ok == self.front[i] && !full {
                     continue;
+                }
+                self.want[k] &= !(1u64 << b);
+                self.pm[k] &= !(1u64 << b);
+                if e {
+                    if full || self.when == When::Now && c.fg & (NOPATCH | TRACK) == 0 {
+                        self.pm[k] |= 1 << b;
+                        any_pm = true;
+                    } else {
+                        self.want[k] |= 1 << b;
+                        self.age[i] = 0;
+                    }
                 }
                 if self.cur.1 == y && x > self.cur.0 && self.cur.0 < w {
                     // same row, further right: a shorter relative move
@@ -634,8 +1273,9 @@ impl Screen {
             }
         }
         self.full = false;
-        if patching && !self.marks.is_empty() {
-            self.emit_patches(comp, bd.unwrap(), patch);
+        self.img_cls = Vec::new();
+        if patching && any_pm {
+            self.emit_patches(comp, bd.unwrap(), patch, &classes);
         }
         if self.out.len() == 8 {
             self.out.clear();
@@ -645,55 +1285,185 @@ impl Screen {
         &self.out
     }
 
-    fn emit_patches(&mut self, comp: &Comp, bd: &Backdrop, patch: Patch) {
+    /// The ink colour of cell `c` in a patch.
+    fn ink_col(comp: &Comp, c: Cell) -> Rgb {
+        if c.fg & TRACK != 0 {
+            comp.track_ink
+        } else {
+            c.fg & 0xFF_FFFF
+        }
+    }
+
+    /// The source picture of a patch class (frosted panels: the blurred copy).
+    fn src<'a>(bd: &Backdrop, hr: &'a Hires, class: u8) -> &'a Indexed {
+        match &hr.soft {
+            Some(s) if bd.soft.is_some() && soft_surface(class) => s,
+            _ => &hr.sharp,
+        }
+    }
+
+    /// Full repaint (sixel): one picture per patch class over the rows it covers, with
+    /// every cell that isn't that class's blank left transparent. Several pictures
+    /// compose: unset sixel pixels keep what is there.
+    fn emit_full(&mut self, comp: &Comp, bd: &Backdrop, classes: &[u8; 8], stars: bool) {
         let Some(hr) = &bd.hires else { return };
+        let (w, h) = (self.w, self.h);
+        let (cw, chh) = (hr.cw, hr.ch);
         let before = self.out.len();
-        let marks = std::mem::take(&mut self.marks);
-        let mut k = 0;
-        let mut crop: Vec<u8> = Vec::new();
-        while k < marks.len() {
-            let (x0, y, s) = marks[k];
-            let mut x1 = x0 + 1;
-            let mut j = k + 1;
-            while j < marks.len() && marks[j] == (x1, y, s) {
-                x1 += 1;
-                j += 1;
+        let mut cls = vec![0u8; w * h];
+        let mut seen = [false; 8];
+        for (i, cl) in cls.iter_mut().enumerate() {
+            let y = i / w;
+            let c = self.buf[i];
+            let o = self.composite(comp, i, Some(bd), stars);
+            let k = classes[(c.bg >> 24) as usize & 7];
+            if o.pix && k != 0 && y + 2 < h {
+                *cl = k;
+                seen[k as usize] = true;
             }
-            k = j;
-            let src = if soft_surface(s) { &hr.soft } else { &hr.sharp };
-            let (cw, chh) = (hr.cw, hr.ch);
-            let (px0, py0) = (x0 as usize * cw, y as usize * chh);
-            let pw = (x1 - x0) as usize * cw;
-            if px0 + pw > src.w || py0 + chh > src.h {
+        }
+        let mut px = Vec::new();
+        for k in 1..8u8 {
+            if !seen[k as usize] {
                 continue;
             }
-            crop.clear();
-            for yy in 0..chh {
-                let r = (py0 + yy) * src.w + px0;
-                crop.extend_from_slice(&src.idx[r..r + pw]);
+            let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
+            for (i, _) in cls.iter().enumerate().filter(|(_, &c)| c == k) {
+                let (x, y) = (i % w, i / w);
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
             }
-            let pal = comp.glass_palette(&src.pal, s);
-            let _ = write!(self.out, "\x1b[{};{}H", y + 1, x0 + 1);
+            let src = Self::src(bd, hr, k);
+            // inks: a cell whose colour finds no free slot is left to the text
+            let mut inks = Inks::default();
+            for cy in y0..=y1 {
+                for cx in x0..=x1 {
+                    let i = cy * w + cx;
+                    let c = self.buf[i];
+                    if cls[i] == k
+                        && c.ch != ' '
+                        && inks.idx(Self::ink_col(comp, c), false).is_none()
+                    {
+                        cls[i] = 0;
+                    }
+                }
+            }
+            let (rw, rh) = ((x1 + 1 - x0) * cw, (y1 + 1 - y0) * chh);
+            crop(src, w * cw, h * chh, (x0 * cw, y0 * chh, rw, rh), &mut px);
+            for cy in y0..=y1 {
+                for cx in x0..=x1 {
+                    let c = self.buf[cy * w + cx];
+                    let (ox, oy) = ((cx - x0) * cw, (cy - y0) * chh);
+                    if cls[cy * w + cx] != k {
+                        for yy in 0..chh {
+                            let r = (oy + yy) * rw + ox;
+                            px[r..r + cw].fill(CLEAR);
+                        }
+                    } else if c.ch != ' ' {
+                        let ix = inks.idx(Self::ink_col(comp, c), true).unwrap_or(CLEAR);
+                        ink_cell(c, ix, &mut px, rw, ox, oy, cw, chh);
+                    }
+                }
+            }
+            let mut pal = glass_pal(comp, &src.pal, k);
+            pal.extend_from_slice(&inks.0);
+            self.out.extend_from_slice(b"\x1b[");
+            dec(&mut self.out, y0 as u32 + 1);
+            self.out.push(b';');
+            dec(&mut self.out, x0 as u32 + 1);
+            self.out.push(b'H');
+            self.sixel
+                .encode(&px, rw, rh, &pal, Some(CLEAR), &mut self.out);
+        }
+        // the encoder's band buffers grew to the screen's width: give them back
+        self.sixel = gfx::Sixel::default();
+        // the cells under the picture, for the text pass that follows
+        self.img_cls = cls;
+        self.cur = (usize::MAX, 0);
+        self.patch_bytes += self.out.len() - before;
+    }
+
+    /// Patches for the cells marked in `pm`: one per run of adjacent cells of one class
+    /// in a row.
+    fn emit_patches(&mut self, comp: &Comp, bd: &Backdrop, patch: Patch, classes: &[u8; 8]) {
+        let Some(hr) = &bd.hires else { return };
+        let before = self.out.len();
+        let (w, h) = (self.w, self.h);
+        let (cw, chh) = (hr.cw, hr.ch);
+        let mut pals = std::mem::take(&mut self.pals);
+        let mut px: Vec<u8> = Vec::new();
+        let mut seq = Vec::new();
+        let n = self.buf.len();
+        let mut i = 0;
+        while i < n {
+            if self.pm[i >> 6] == 0 && i & 63 == 0 {
+                i += 64;
+                continue;
+            }
+            if !bit(&self.pm, i) {
+                i += 1;
+                continue;
+            }
+            let k = classes[(self.buf[i].bg >> 24) as usize & 7];
+            let (x0, y) = (i % w, i / w);
+            let mut x1 = x0 + 1;
+            while x1 < w
+                && bit(&self.pm, y * w + x1)
+                && classes[(self.buf[y * w + x1].bg >> 24) as usize & 7] == k
+            {
+                x1 += 1;
+            }
+            i = y * w + x1;
+            let src = Self::src(bd, hr, k);
+            let pw = (x1 - x0) * cw;
+            crop(src, w * cw, h * chh, (x0 * cw, y * chh, pw, chh), &mut px);
+            let mut inks = Inks::default();
+            for x in x0..x1 {
+                let c = self.buf[y * w + x];
+                if c.ch != ' ' {
+                    if let Some(ix) = inks.idx(Self::ink_col(comp, c), true) {
+                        ink_cell(c, ix, &mut px, pw, (x - x0) * cw, 0, cw, chh);
+                    }
+                }
+            }
+            let base = pals[k as usize].get_or_insert_with(|| glass_pal(comp, &src.pal, k));
+            let mut pal = base.clone();
+            pal.extend_from_slice(&inks.0);
+            let pal = &pal;
+            self.out.extend_from_slice(b"\x1b[");
+            dec(&mut self.out, y as u32 + 1);
+            self.out.push(b';');
+            dec(&mut self.out, x0 as u32 + 1);
+            self.out.push(b'H');
             match patch {
                 Patch::Sixel => {
-                    let mut seq = Vec::new();
-                    self.sixel.encode(&crop, pw, chh, &pal, None, &mut seq);
+                    seq.clear();
+                    self.sixel.encode(&px, pw, chh, pal, None, &mut seq);
                     self.out.extend_from_slice(&seq);
                 }
                 Patch::Iterm => {
-                    let mut rgbv = Vec::with_capacity(crop.len() * 3);
-                    for &i in &crop {
-                        rgbv.extend_from_slice(&ch(pal[i as usize]));
+                    let mut rgbv = Vec::with_capacity(px.len() * 3);
+                    for &c in &px {
+                        rgbv.extend_from_slice(&ch(pal[c as usize]));
                     }
                     let png = gfx::png_rgb(&rgbv, pw, chh);
-                    gfx::iterm_inline(&png, (x1 - x0) as usize, 1, &mut self.out, self.tmux);
+                    gfx::iterm_inline(&png, x1 - x0, 1, &mut self.out, self.tmux);
                 }
                 Patch::None => {}
             }
             self.cur = (usize::MAX, 0);
         }
-        self.marks = marks;
+        self.pm.fill(0);
+        self.pals = pals;
         self.patch_bytes += self.out.len() - before;
+    }
+
+    /// Cells still waiting for pixels (tests, diagnostics).
+    #[cfg(test)]
+    pub fn waiting(&self) -> usize {
+        self.want.iter().map(|a| a.count_ones() as usize).sum()
     }
 }
 
@@ -814,26 +1584,185 @@ mod tests {
         assert!(!o.contains("48;"));
     }
 
-    #[test]
-    fn sixel_patches_only_on_changed_blank_cells() {
-        let t = theme();
-        let comp = Comp::new(&t, Look::Glass);
-        let (w, h, cw, chh) = (4usize, 5usize, 2usize, 4usize);
+    fn sixel_fixture(w: usize, h: usize, cw: usize, chh: usize) -> Backdrop {
         let mut bd = Backdrop::empty(w, h);
         let n = w * cw * h * chh;
-        let ix = |k: usize| Indexed {
-            w: w * cw,
-            h: h * chh,
-            idx: (0..n).map(|i| (i % k) as u8).collect(),
-            pal: vec![0x102030, 0x405060, 0x708090],
-        };
         bd.hires = Some(Hires {
             cw,
             ch: chh,
-            sharp: ix(3),
-            soft: ix(2),
+            sharp: Indexed {
+                w: w * cw,
+                h: h * chh,
+                idx: (0..n).map(|i| (i % 3) as u8).collect(),
+                pal: vec![0x102030, 0x405060, 0x708090],
+            },
+            soft: None,
             kitty: None,
         });
+        bd
+    }
+
+    fn images(out: &str) -> Vec<&str> {
+        out.split("\x1bP0;1;0q").skip(1).collect()
+    }
+
+    #[test]
+    fn sixel_full_repaint_is_one_picture_then_patches() {
+        let t = theme();
+        let comp = Comp::new(&t, Look::Glass);
+        let (w, h, cw, chh) = (4usize, 5usize, 2usize, 4usize);
+        let bd = sixel_fixture(w, h, cw, chh);
+        let mut s = Screen::new(w, h);
+        let blank = Cell {
+            ch: ' ',
+            fg: 0,
+            bg: surf(S_PANEL),
+        };
+        s.fill(0, 0, w, h, blank);
+        s.put(1, 1, ' ', NOPATCH, surf(S_PANEL));
+        s.put(2, 0, 'x', 0xffffff, surf(S_PANEL));
+        let out = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
+        // one picture over rows 0..=2 (never the last two rows), sent before the text
+        let imgs = images(&out);
+        assert_eq!(imgs.len(), 1, "{out:?}");
+        assert!(out.contains("\x1b[1;1H\x1bP0;1;0q\"1;1;8;12"), "{out:?}");
+        let (pic, text) = out.split_at(out.find("\x1b\\").unwrap());
+        assert!(!pic.contains('x') && text.contains('x'));
+        // the text cell is left transparent in the picture, the busy blank is not
+        let seq = &out[out.find("\x1bP0;1;0q").unwrap()..];
+        let seq = &seq[..seq.find("\x1b\\").unwrap() + 2];
+        let (dw, dh, px) = crate::gfx::sixel_decode(seq.as_bytes());
+        assert_eq!((dw, dh), (8, 12));
+        let at = |x: usize, y: usize| px[y * dw + x];
+        assert!(at(4, 0).is_none() && at(5, 3).is_none());
+        assert!(at(2, 4).is_some() && at(0, 0).is_some() && at(7, 11).is_some());
+        // cells under the picture get no glyphs: after the picture, the first cell
+        // written on row 1 is the text, and rows 3 and 4 are drawn from the start
+        assert!(
+            text.contains("\x1b[1;3H") && !text.contains("\x1b[1;1H"),
+            "{text:?}"
+        );
+        assert!(text.contains("\x1b[4;1H"), "{text:?}");
+        // nothing changed: nothing sent
+        assert!(s
+            .flush(&comp, Some(&bd), Depth::True, Patch::Sixel)
+            .is_empty());
+        // text, then blank again: the cell gets its glyph and a one-cell patch
+        s.put(0, 2, '7', 0xffffff, surf(S_PANEL));
+        let o1 = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
+        assert!(o1.contains('7') && images(&o1).is_empty());
+        s.put(0, 2, ' ', 0, surf(S_PANEL));
+        let o2 = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
+        assert!(o2.contains("\x1b[3;1H\x1bP0;1;0q\"1;1;2;4"), "{o2:?}");
+        let seq = &o2[o2.find("\x1bP0;1;0q").unwrap()..];
+        let seq = &seq[..seq.find("\x1b\\").unwrap() + 2];
+        let (dw, dh, px) = crate::gfx::sixel_decode(seq.as_bytes());
+        assert_eq!((dw, dh), (2, 4));
+        assert!(px.iter().all(|p| p.is_some()));
+        // a busy cell (NOPATCH) that turns blank waits for the next flush (eco)
+        s.put(1, 1, '5', 0xffffff, surf(S_PANEL));
+        s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel);
+        s.put(1, 1, ' ', NOPATCH, surf(S_PANEL));
+        let mut got = Vec::new();
+        for _ in 0..BUSY_TICKS_ECO + 1 {
+            got.push(
+                images(&String::from_utf8_lossy(s.flush(
+                    &comp,
+                    Some(&bd),
+                    Depth::True,
+                    Patch::Sixel,
+                )))
+                .len(),
+            );
+        }
+        assert_eq!(got.iter().sum::<usize>(), 1, "{got:?}");
+        assert_eq!(got[BUSY_TICKS_ECO as usize], 1, "{got:?}");
+        assert_eq!(s.waiting(), 0);
+    }
+
+    #[test]
+    fn tmux_gets_runs_not_one_picture() {
+        let t = theme();
+        let comp = Comp::new(&t, Look::Glass);
+        let bd = sixel_fixture(4, 5, 2, 4);
+        let mut s = Screen::new(4, 5);
+        s.tmux = true;
+        s.fill(
+            0,
+            0,
+            4,
+            5,
+            Cell {
+                ch: ' ',
+                fg: 0,
+                bg: surf(S_PANEL),
+            },
+        );
+        s.put(2, 0, 'x', 0xffffff, surf(S_PANEL));
+        let out = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
+            .to_string();
+        // row 0 split by the text, rows 1 and 2 whole; the text comes first
+        assert_eq!(images(&out).len(), 4, "{out:?}");
+        assert!(out.find('x').unwrap() < out.find("\x1bP0;1;0q").unwrap());
+    }
+
+    #[test]
+    fn smooth_patches_wait_for_a_quiet_tick() {
+        let t = theme();
+        let comp = Comp::new(&t, Look::Glass);
+        let bd = sixel_fixture(4, 5, 2, 4);
+        let mut s = Screen::new(4, 5);
+        s.fill(
+            0,
+            0,
+            4,
+            5,
+            Cell {
+                ch: ' ',
+                fg: 0,
+                bg: surf(S_PANEL),
+            },
+        );
+        s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel);
+        let step = |s: &mut Screen, when: When| {
+            s.when = when;
+            images(&String::from_utf8_lossy(s.flush(
+                &comp,
+                Some(&bd),
+                Depth::True,
+                Patch::Sixel,
+            )))
+            .len()
+        };
+        s.put(1, 1, '9', 0xffffff, surf(S_PANEL));
+        assert_eq!(step(&mut s, When::Later), 0);
+        s.put(1, 1, ' ', 0, surf(S_PANEL));
+        assert_eq!(step(&mut s, When::Later), 0);
+        assert_eq!(s.waiting(), 1);
+        // the first tick only starts the clock; the second patches
+        assert_eq!(step(&mut s, When::Tick), 0);
+        assert_eq!(step(&mut s, When::Later), 0);
+        assert_eq!(step(&mut s, When::Tick), 1);
+        assert_eq!(s.waiting(), 0);
+        // a cell that blanks and returns between ticks never costs a patch
+        s.put(2, 2, '3', 0xffffff, surf(S_PANEL));
+        step(&mut s, When::Later);
+        s.put(2, 2, ' ', 0, surf(S_PANEL));
+        step(&mut s, When::Tick);
+        s.put(2, 2, '3', 0xffffff, surf(S_PANEL));
+        assert_eq!(step(&mut s, When::Tick), 0);
+        assert_eq!(s.waiting(), 0);
+    }
+
+    #[test]
+    fn borders_and_bars_are_drawn_into_patches() {
+        let t = theme();
+        let comp = Comp::new(&t, Look::Glass);
+        let (w, h) = (80usize, 5usize);
+        let bd = sixel_fixture(w, h, 10, 20);
         let mut s = Screen::new(w, h);
         s.fill(
             0,
@@ -846,41 +1775,167 @@ mod tests {
                 bg: surf(S_PANEL),
             },
         );
-        s.put(1, 1, ' ', NOPATCH, surf(S_PANEL));
-        s.put(2, 0, 'x', 0xffffff, surf(S_PANEL));
+        s.put(1, 0, '─', t.border, surf(S_PANEL));
+        // a bar: the lower quarter in its colour; an anti-aliased end stays text
+        s.put(2, 0, '▂', 0x123456, surf(S_PANEL));
+        s.put(3, 0, '▂', 0x654321 | 8 << BLEND_SHIFT, surf(S_PANEL));
+        // 70 more colours on row 1: the inks run out, the rest stay text
+        for x in 0..70 {
+            s.put(x, 1, '▄', 0x100000 + x as u32, surf(S_PANEL));
+        }
         let out = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
             .to_string();
-        // rows 0..=2 get patches (h - 2 = 3 rows); row 0 is split by the 'x'
-        let patches: Vec<&str> = out.split("\x1bP0;1;0q").skip(1).collect();
-        assert_eq!(patches.len(), 5, "{out:?}"); // row0: [0..2) and [3..4); row1: [0..1) and [2..4); row2: [0..4)
-        assert!(out.contains("\x1b[1;1H\x1bP0;1;0q\"1;1;4;4"));
-        assert!(out.contains("\x1b[2;3H\x1bP0;1;0q\"1;1;4;4"));
-        assert!(out.contains("\x1b[3;1H\x1bP0;1;0q\"1;1;8;4"));
-        assert!(
-            !out.contains("\x1b[4;1H\x1bP"),
-            "never patch the last two rows"
-        );
-        // nothing changed: nothing sent
-        assert!(s
-            .flush(&comp, Some(&bd), Depth::True, Patch::Sixel)
-            .is_empty());
-        // text then blank again: the cell gets its half-block and a new patch
-        s.put(0, 2, '7', 0xffffff, surf(S_PANEL));
-        let o1 = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
-            .to_string();
-        assert!(!o1.contains("\x1bP0;1;0q"));
-        s.put(0, 2, ' ', 0, surf(S_PANEL));
-        let o2 = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
-            .to_string();
-        assert!(
-            o2.contains("▀") && o2.contains("\x1b[3;1H\x1bP0;1;0q\"1;1;2;4"),
-            "{o2:?}"
-        );
-        // the patch itself decodes to the right size
-        let seq = &o2[o2.find("\x1bP0;1;0q").unwrap()..];
+        let seq = &out[out.find("\x1bP0;1;0q").unwrap()..];
         let seq = &seq[..seq.find("\x1b\\").unwrap() + 2];
-        let (dw, dh, px) = crate::gfx::sixel_decode(seq.as_bytes());
-        assert_eq!((dw, dh), (2, 4));
-        assert!(px.iter().all(|p| p.is_some()));
+        // the border colour is the first ink of the picture, the bar's the second
+        let def = |c: u32, ix: u8| {
+            let [r, g, b] = crate::color::ch(c);
+            let p = |v: u8| (v as u32 * 100 + 127) / 255;
+            format!("#{};2;{};{};{}", ix, p(r), p(g), p(b))
+        };
+        assert!(seq.contains(&def(t.border, INK)), "{seq:?}");
+        assert!(seq.contains(&def(0x123456, INK + 1)));
+        let (dw, _, px) = crate::gfx::sixel_decode(seq.as_bytes());
+        // the line: a row of ink across cell 1, picture above and below
+        assert!((10..20).all(|x| px[9 * dw + x] == Some(INK)));
+        assert!(px[2 * dw + 15] != Some(INK) && px[2 * dw + 15].is_some());
+        // the bar: rows 15..20 of cell 2
+        assert!(px[16 * dw + 25] == Some(INK + 1) && px[14 * dw + 25] != Some(INK + 1));
+        // the blend cell is transparent (written as text afterwards)
+        assert!(px[16 * dw + 35].is_none());
+        // row 1: 63 inks left, so 63 bar cells in the picture and 7 written as text
+        let row1 = (0..w)
+            .filter(|&x| px[(20 + 16) * dw + x * 10].is_some_and(|v| v >= INK))
+            .count();
+        assert_eq!(row1, 63);
+        let text = &out[out.find("\x1b\\").unwrap()..];
+        assert_eq!(text.matches('─').count(), 0);
+        assert_eq!(text.matches('▄').count(), 7);
+    }
+
+    #[test]
+    fn glyph_drawing() {
+        let (w, h) = (10usize, 20usize);
+        let draw = |c: char| {
+            let mut px = vec![0u8; w * h];
+            draw_glyph(c, 9, &mut px, w, 0, 0, w, h);
+            px
+        };
+        let on = |px: &[u8], x: usize, y: usize| px[y * w + x] == 9;
+        let hl = draw('─');
+        assert!((0..w).all(|x| on(&hl, x, 9)) && !on(&hl, 0, 8) && !on(&hl, 0, 10));
+        let vl = draw('│');
+        assert!((0..h).all(|y| on(&vl, 4, y)) && !on(&vl, 3, 0));
+        // a rounded corner reaches the right and bottom edges and not the others
+        let c = draw('╭');
+        assert!(on(&c, w - 1, 9) && on(&c, 4, h - 1));
+        assert!(!(0..h).any(|y| on(&c, 0, y)) && !(0..w).any(|x| on(&c, x, 0)));
+        // braille: dot 1 top left, dot 8 bottom right
+        let b = draw('\u{2881}');
+        assert!(on(&b, 2, 2) && on(&b, 7, 17) && !on(&b, 7, 2));
+        assert_eq!(draw('·').iter().filter(|&&v| v == 9).count(), 4);
+    }
+
+    #[test]
+    fn crop_scales_a_smaller_picture() {
+        let src = Indexed {
+            w: 2,
+            h: 2,
+            idx: vec![1, 2, 3, 4],
+            pal: vec![0; 5],
+        };
+        let mut out = Vec::new();
+        crop(&src, 4, 4, (1, 1, 3, 3), &mut out);
+        assert_eq!(out, vec![1, 2, 2, 3, 4, 4, 3, 4, 4]);
+        crop(&src, 2, 2, (1, 0, 1, 2), &mut out);
+        assert_eq!(out, vec![2, 4]);
+    }
+
+    #[test]
+    fn light_glass_is_one_patch_class() {
+        let mut t = theme();
+        let comp = Comp::new(&t, Look::Glass);
+        let bd = Backdrop::empty(1, 1);
+        let cl = comp.classes(&bd);
+        // the default theme's surfaces differ: separate pictures
+        assert_ne!(cl[S_PANEL as usize], cl[S_SCREEN as usize]);
+        assert_eq!(cl[S_DIALOG as usize], 0);
+        for sid in [S_SCREEN, S_BAR, S_PANEL] {
+            t.surf[sid as usize] = Surf {
+                tint: 0x101010,
+                alpha: 0.2,
+                text_alpha: 0.4,
+            };
+        }
+        t.glass = Glass::Light;
+        let cl = Comp::new(&t, Look::Glass).classes(&bd);
+        assert_eq!(cl[S_SCREEN as usize], S_SCREEN);
+        assert_eq!(cl[S_BAR as usize], S_SCREEN);
+        assert_eq!(cl[S_PANEL as usize], S_SCREEN);
+    }
+
+    #[test]
+    fn mosaic_blank_cells_and_word_plates() {
+        let t = theme();
+        let comp = Comp::new(&t, Look::Glass);
+        let mut bd = Backdrop::empty(5, 1);
+        bd.glyphs = Glyphs::Octant;
+        bd.mos = vec![
+            Mos {
+                p: 0b0101_0101,
+                fg: [255, 0, 0],
+                bg: [0, 0, 255],
+            };
+            5
+        ];
+        let c = Cell {
+            ch: ' ',
+            fg: 0,
+            bg: surf(S_SCREEN),
+        };
+        let o = comp.cell(c, 0, 0, Some(&bd), false);
+        // screen alpha 0: the colours come through; 0b01010101 = left half
+        assert_eq!((o.ch, o.fg, o.bg, o.pix), ('▌', 0xff0000, 0x0000ff, true));
+        // a blank between two words on a dark picture stays picture
+        let mut s = Screen::new(5, 1);
+        s.fill(0, 0, 5, 1, c);
+        s.text(0, 0, "ab cd", 0xffffff, surf(S_SCREEN), 5);
+        assert!(s.composite(&comp, 2, Some(&bd), false).pix);
+        // on a bright one the words get plates (the built-in look), and the blank
+        // between them takes the words' plate
+        bd.sharp = vec![px2(0xf0e0a0, 0xf0e0a0); 5];
+        let o = s.composite(&comp, 2, Some(&bd), false);
+        let word = s.composite(&comp, 1, Some(&bd), false);
+        assert!(word.plate);
+        assert_eq!((o.ch, o.bg, o.pix), (' ', word.bg, false));
+    }
+
+    #[test]
+    fn light_glass_turns_text_dark_on_bright_pictures() {
+        let mut t = theme();
+        t.glass = Glass::Light;
+        for sid in [S_SCREEN, S_BAR, S_PANEL] {
+            t.surf[sid as usize] = Surf {
+                tint: 0x101010,
+                alpha: 0.2,
+                text_alpha: 0.2,
+            };
+        }
+        let comp = Comp::new(&t, Look::Glass);
+        let mut bd = Backdrop::empty(1, 1);
+        let c = Cell {
+            ch: 'A',
+            fg: 0xe0e0f0,
+            bg: surf(S_PANEL),
+        };
+        // a bright sun: the cell keeps the picture's colour, the text goes dark
+        bd.sharp = vec![px2(0xffd060, 0xffc050)];
+        let o = comp.cell(c, 0, 0, Some(&bd), false);
+        assert!(!o.plate && crate::color::lum(o.fg) < 0.1, "{o:?}");
+        assert!(crate::color::lum(o.bg) > 0.3 && contrast(o.fg, o.bg) >= 4.4);
+        // a dark sky: light text, no plate either
+        bd.sharp = vec![px2(0x101830, 0x101830)];
+        let o = comp.cell(c, 0, 0, Some(&bd), false);
+        assert!(!o.plate && o.fg == 0xe0e0f0);
     }
 }

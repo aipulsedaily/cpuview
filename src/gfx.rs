@@ -10,6 +10,8 @@ pub struct Sixel {
     lines: Vec<u8>,
     slot: Vec<u16>,
     order: Vec<u8>,
+    /// per colour of the band: first and last column it appears in
+    ext: Vec<(u32, u32)>,
 }
 
 impl Sixel {
@@ -25,7 +27,11 @@ impl Sixel {
         transparent: Option<u8>,
         out: &mut Vec<u8>,
     ) {
-        let _ = write!(out, "\x1bP0;1;0q\"1;1;{w};{h}");
+        use crate::screen::dec;
+        out.extend_from_slice(b"\x1bP0;1;0q\"1;1;");
+        dec(out, w as u32);
+        out.push(b';');
+        dec(out, h as u32);
         let mut used = [false; 256];
         for &c in idx {
             used[c as usize] = true;
@@ -37,65 +43,82 @@ impl Sixel {
             if u {
                 let [r, g, b] = ch(*pal.get(c).unwrap_or(&0));
                 let p = |v: u8| (v as u32 * 100 + 127) / 255;
-                let _ = write!(out, "#{};2;{};{};{}", c, p(r), p(g), p(b));
+                out.push(b'#');
+                dec(out, c as u32);
+                out.extend_from_slice(b";2;");
+                dec(out, p(r));
+                out.push(b';');
+                dec(out, p(g));
+                out.push(b';');
+                dec(out, p(b));
             }
         }
         if self.slot.len() < 256 {
             self.slot = vec![u16::MAX; 256];
+            self.ext = vec![(0, 0); 256];
+        }
+        // one line of sixel bits per colour; kept all-zero between bands
+        if self.lines.len() < 256 * w {
+            self.lines = vec![0; 256 * w];
         }
         let mut y0 = 0;
         while y0 < h {
             let rows = (h - y0).min(6);
-            // collect colours present in this band and give each a line buffer
             self.order.clear();
-            for k in 0..rows {
-                for &c in &idx[(y0 + k) * w..(y0 + k + 1) * w] {
-                    if self.slot[c as usize] == u16::MAX && Some(c) != transparent {
-                        self.slot[c as usize] = self.order.len() as u16;
-                        self.order.push(c);
-                    }
-                }
-            }
-            let n = self.order.len();
-            self.lines.clear();
-            self.lines.resize(n * w, 0);
             for k in 0..rows {
                 let row = &idx[(y0 + k) * w..(y0 + k + 1) * w];
                 for (x, &c) in row.iter().enumerate() {
-                    let s = self.slot[c as usize];
-                    if s != u16::MAX {
-                        self.lines[s as usize * w + x] |= 1 << k;
+                    if Some(c) == transparent {
+                        continue;
                     }
+                    let mut s = self.slot[c as usize];
+                    let x32 = x as u32;
+                    if s == u16::MAX {
+                        s = self.order.len() as u16;
+                        self.slot[c as usize] = s;
+                        self.order.push(c);
+                        self.ext[s as usize] = (x32, x32);
+                    } else {
+                        let e = &mut self.ext[s as usize];
+                        e.0 = e.0.min(x32);
+                        e.1 = e.1.max(x32);
+                    }
+                    self.lines[s as usize * w + x] |= 1 << k;
                 }
             }
             for (si, &c) in self.order.iter().enumerate() {
                 if si > 0 {
                     out.push(b'$');
                 }
-                let _ = write!(out, "#{c}");
-                let line = &self.lines[si * w..(si + 1) * w];
-                let mut end = w;
-                while end > 0 && line[end - 1] == 0 {
-                    end -= 1;
+                out.push(b'#');
+                dec(out, c as u32);
+                let (x0, x1) = (self.ext[si].0 as usize, self.ext[si].1 as usize);
+                if x0 >= 4 {
+                    out.push(b'!');
+                    dec(out, x0 as u32);
+                    out.push(b'?');
+                } else {
+                    out.extend(std::iter::repeat_n(b'?', x0));
                 }
-                let mut x = 0;
-                while x < end {
+                let line = &mut self.lines[si * w..si * w + w];
+                let mut x = x0;
+                while x <= x1 {
                     let v = line[x];
                     let mut run = 1;
-                    while x + run < end && line[x + run] == v {
+                    while x + run <= x1 && line[x + run] == v {
                         run += 1;
                     }
                     let chr = 63 + v;
                     if run >= 4 {
-                        let _ = write!(out, "!{run}");
+                        out.push(b'!');
+                        dec(out, run as u32);
                         out.push(chr);
                     } else {
-                        for _ in 0..run {
-                            out.push(chr);
-                        }
+                        out.extend(std::iter::repeat_n(chr, run));
                     }
                     x += run;
                 }
+                line[x0..=x1].fill(0);
             }
             for &c in &self.order {
                 self.slot[c as usize] = u16::MAX;

@@ -1,5 +1,6 @@
 //! Terminal capability probe and image-mode selection (port of docs/reference/termgfx.py).
 
+use crate::mosaic::Glyphs;
 use std::os::raw::c_int;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +156,9 @@ pub fn parse_replies(buf: &[u8]) -> Caps {
     c
 }
 
-const KITTY_UNDER_TEXT: [&str; 3] = ["kitty", "ghostty", "wezterm"];
+// WezTerm speaks the kitty protocol but text written over an image erases it there
+// (wezterm#7222): it gets sixel, which it handles like the other sixel terminals
+const KITTY_UNDER_TEXT: [&str; 2] = ["kitty", "ghostty"];
 const ITERM_INLINE: [&str; 4] = ["iterm2", "wezterm", "mintty", "vscode"];
 const MODERN: [&str; 15] = [
     "kitty",
@@ -280,6 +283,78 @@ pub fn choose_mode(c: &Caps, e: &Env, req: Mode) -> (Mode, String) {
     (Mode::Off, "no graphics and fewer than 256 colours".into())
 }
 
+/// Windows Terminal (and conhost) answer DA1 with this list (4 = sixel, 52 = clipboard
+/// are optional) and don't answer XTVERSION.
+pub fn windows_terminal(c: &Caps) -> bool {
+    c.name.is_empty()
+        && c.da1.first() == Some(&61)
+        && [6, 7, 14, 21, 22, 23, 24, 28, 32, 42]
+            .iter()
+            .all(|v| c.da1.contains(v))
+}
+
+/// First number in a version string ("kitty(0.40.1)" → 0.40, "WezTerm 20250208-…" →
+/// 20250208), as (major, minor).
+fn version(name: &str) -> (u32, u32) {
+    let s = name.trim_start_matches(|ch: char| !ch.is_ascii_digit());
+    let mut it = s
+        .split(|ch: char| !ch.is_ascii_digit())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// Block glyphs for pictures drawn with characters: the finest set this terminal
+/// draws itself (pixel-exact, whatever the font), else one its fonts are known to have.
+pub fn choose_glyphs(c: &Caps, e: &Env, req: Option<Glyphs>) -> (Glyphs, String) {
+    if let Some(g) = req {
+        return (g, "requested explicitly".into());
+    }
+    let n = c.name.to_ascii_lowercase();
+    let v = version(&n);
+    let at_least = |a: (u32, u32)| v >= a;
+    let (g, why) = if n.starts_with("kitty") {
+        if at_least((0, 40)) {
+            (Glyphs::Octant, "kitty ≥ 0.40 draws octants")
+        } else {
+            (Glyphs::Sextant, "kitty draws sextants")
+        }
+    } else if n.starts_with("foot") {
+        if at_least((1, 20)) {
+            (Glyphs::Octant, "foot ≥ 1.20 draws octants")
+        } else {
+            (Glyphs::Sextant, "foot draws sextants")
+        }
+    } else if n.starts_with("ghostty") {
+        (Glyphs::Octant, "Ghostty draws octants")
+    } else if n.starts_with("wezterm") {
+        if at_least((20250208, 0)) {
+            (Glyphs::Octant, "WezTerm (2025 builds) draws octants")
+        } else {
+            (Glyphs::Sextant, "WezTerm draws sextants")
+        }
+    } else if n.starts_with("vte") {
+        if at_least((7800, 0)) {
+            (Glyphs::Octant, "VTE ≥ 0.78 draws octants")
+        } else {
+            (Glyphs::Sextant, "VTE draws sextants")
+        }
+    } else if n.starts_with("konsole") {
+        (Glyphs::Sextant, "Konsole draws sextants")
+    } else if windows_terminal(c) {
+        // 1.25+ draws U+1FB00..1FB94 itself; older versions take them from the bundled
+        // Cascadia font. Octants would come from the font only.
+        (Glyphs::Sextant, "Windows Terminal draws sextants")
+    } else if c.answered || e.colorterm == "truecolor" || e.colorterm == "24bit" {
+        (
+            Glyphs::Quadrant,
+            "quadrants: in every common monospace font",
+        )
+    } else {
+        (Glyphs::Half, "half blocks: unknown terminal")
+    };
+    (g, why.into())
+}
+
 /// Cell size in pixels: CSI 16 t, CSI 14 t / grid, TIOCGWINSZ pixels / grid,
 /// else 10×20 when sixel is available (VT340 cell, Windows Terminal's sixel cell).
 pub fn cell_size(
@@ -376,7 +451,7 @@ mod tests {
         (
             "wezterm",
             b"\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?65;4;6;18;22c",
-            Mode::Kitty,
+            Mode::Sixel,
         ),
         ("konsole", b"\x1bP>|Konsole 24.02.1\x1b\\\x1b_Gi=31;OK\x1b\\\x1b[?62;4;22c", Mode::Sixel),
         ("iterm2", b"\x1bP>|iTerm2 3.5.0\x1b\\\x1b[?62;22;52c", Mode::Iterm),
@@ -478,5 +553,32 @@ mod tests {
         assert_eq!(choose_mode(&k, &env(true), Mode::Auto).0, Mode::Blocks);
         // DECRPM-like CSI ? … y must not count as DA1
         assert!(!parse_replies(b"\x1b[?2026;2$y").answered);
+    }
+
+    #[test]
+    fn glyph_sets() {
+        let g = |buf: &[u8]| choose_glyphs(&parse_replies(buf), &env(false), None).0;
+        assert_eq!(g(b"\x1bP>|kitty(0.40.1)\x1b\\\x1b[?62;c"), Glyphs::Octant);
+        assert_eq!(g(b"\x1bP>|kitty(0.36.4)\x1b\\\x1b[?62;c"), Glyphs::Sextant);
+        assert_eq!(
+            g(b"\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\\x1b[?65;4;6c"),
+            Glyphs::Sextant
+        );
+        assert_eq!(
+            g(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[?62;4;22c"),
+            Glyphs::Octant
+        );
+        // Windows Terminal: no XTVERSION, its DA1 fingerprint
+        let wt = b"\x1b[6;20;10t\x1b[4;900;1280t\x1bP1$r0;48:2::1:2:3m\x1b\\\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c";
+        assert!(windows_terminal(&parse_replies(wt)));
+        assert_eq!(g(wt), Glyphs::Sextant);
+        assert_eq!(g(b"\x1bP>|XTerm(390)\x1b\\\x1b[?65;1;9c"), Glyphs::Quadrant);
+        assert_eq!(g(b""), Glyphs::Half);
+        let c = parse_replies(wt);
+        assert_eq!(
+            choose_glyphs(&c, &env(false), Some(Glyphs::Half)).0,
+            Glyphs::Half
+        );
+        assert_eq!(version("wezterm 20250208-1"), (20250208, 1));
     }
 }

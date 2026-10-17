@@ -52,6 +52,10 @@ pub enum Action {
     Dim(f32),
     Blur,
     Mode,
+    /// picture: contain ↔ cover
+    Fit,
+    /// picture: light → clear → frosted
+    Glass,
     Import(String),
 }
 
@@ -180,6 +184,8 @@ impl Menu {
             Key::Right | Key::Char('l') => Action::Dim(0.1),
             Key::Char('b') => Action::Blur,
             Key::Char('m') => Action::Mode,
+            Key::Char('f') => Action::Fit,
+            Key::Char('g') => Action::Glass,
             Key::Char('a') => {
                 self.input = Some(String::new());
                 Action::None
@@ -360,7 +366,16 @@ impl App {
                 } else {
                     f!("   blur off")
                 };
-                scr.text(x, y, bl.s(), th.fg, bg, maxx);
+                x = scr.text(x, y, bl.s(), th.fg, bg, maxx);
+                let fit = if self.t.place.fit == crate::image::Fit::Contain {
+                    "whole"
+                } else {
+                    "fill"
+                };
+                x = scr.text(x, y, "   fit ", th.dim, bg, maxx);
+                x = scr.text(x, y, fit, th.fg, bg, maxx);
+                x = scr.text(x, y, "   glass ", th.dim, bg, maxx);
+                scr.text(x, y, self.t.glass.name(), th.fg, bg, maxx);
                 y += 1;
                 let cr = credit(file)
                     .map(|c| c.1.to_string())
@@ -455,6 +470,10 @@ impl App {
                     (" blur  ", th.dim),
                     ("m", th.accent | BOLD),
                     (" mode  ", th.dim),
+                    ("f", th.accent | BOLD),
+                    (" fit  ", th.dim),
+                    ("g", th.accent | BOLD),
+                    (" glass  ", th.dim),
                     ("a", th.accent | BOLD),
                     (" add", th.dim),
                 ],

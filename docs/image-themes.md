@@ -14,10 +14,10 @@ Status is at the end: what was verified headlessly and what still needs a real t
 
 | mode | what the user sees | where it works |
 |---|---|---|
-| `kitty` | full-resolution picture **under** the text (kitty z-index layering), panels tinted with translucent overlays | kitty, Ghostty, WezTerm (kitty graphics protocol) |
-| `sixel` | half-block background everywhere, plus full-resolution sixel patches over every *blank* wallpaper cell | Windows Terminal ≥ 1.22, foot, WezTerm, Konsole, mlterm, contour, xterm `-ti vt340`, mintty, VS Code (sixel enabled), tmux ≥ 3.4 built with sixel |
+| `kitty` | full-resolution picture **under** the text (kitty z-index layering), panels tinted with translucent overlays, a plate under text only where the picture is too bright to read on | kitty, Ghostty (WezTerm implements the protocol but erases images under text, wezterm#7222: auto picks sixel there) |
+| `sixel` | the whole picture at the window's pixel resolution in every cell without text (blank cells, panel interiors, graph grid lines, panel frames and bar tracks drawn into it); text cells take the picture's colour | Windows Terminal ≥ 1.22, foot, WezTerm, Konsole, mlterm, contour, xterm `-ti vt340`, mintty, VS Code (sixel enabled), tmux ≥ 3.4 built with sixel |
 | `iterm` | like sixel, with PNG patches via OSC 1337 | iTerm2, WezTerm, mintty, VS Code |
-| `blocks` | the picture drawn with `▀` half-blocks: 2 pixels per cell, truecolor | any truecolor terminal (the guaranteed path) |
+| `blocks` | the picture drawn with block glyphs, the best two-colour split of each cell: octants (2×4 pixels), sextants (2×3), quadrants (2×2) or `▀` half blocks (1×2), truecolor | any truecolor terminal (the guaranteed path) |
 | `blocks256` | the same, ordered-dithered to the xterm-256 palette | 256-colour terminals |
 | `terminal` | cpuview draws **no** background: surface cells use the terminal's default background, so the terminal's own background image shows through | Windows Terminal `backgroundImage`, kitty `background_image`, WezTerm `background`, iTerm2 profile image, any translucent terminal |
 | `off` | solid palette colours | everything, including 16-colour terminals |
@@ -72,7 +72,7 @@ images.
 ```
 explicit --image-mode / config              → use it (sixel/kitty/iterm inside GNU screen → blocks)
 no replies at all                           → blocks if COLORTERM=truecolor|24bit, blocks256 if TERM *256color*, else off
-kitty OK and name ∈ {kitty, ghostty, wezterm} and not tmux   → kitty
+kitty OK and name ∈ {kitty, ghostty} and not tmux   → kitty
 DA1 has 4                                   → sixel   (inside tmux: tmux ≥ 3.4 renders sixel itself)
 kitty OK (other terminals), not tmux        → kitty
 name ∈ {iTerm2, WezTerm, mintty, vscode}    → iterm
@@ -169,38 +169,60 @@ front-buffer diff.
 
 ### sixel (the Windows Terminal path)
 
-Sixel has no z-order. A sixel image is painted into the cells and **text written to a cell
-replaces the image there** (VT340 semantics, and what Windows Terminal implements). So:
+Sixel has no z-order. What Windows Terminal does (microsoft/terminal source, v1.22 to 1.26;
+the same in other sixel terminals unless noted):
 
-1. Render everything in `blocks` mode first, so every cell is already a half-block
-   approximation.
-2. Add sixel **patches** only on **blank wallpaper cells** (spaces on a surface). A patch
-   covers a maximal run of horizontally adjacent blank cells of one surface in one row:
-   `run_len·cw × ch` pixels cropped from the hi-res composite (picture × glass of that surface),
-   positioned with `CSI row;col H` then `DCS 0;1;0 q "1;1;w;h … ST`.
-3. The **front-buffer diff** never re-sends unchanged cells, so the sixel pixels on blank cells
-   survive every live frame. A cell that turns into text gets overwritten, which is correct.
-   A cell that turns blank gets its half-block **and** a new patch in the same frame.
-4. Keep `P2=1` (transparent background). A row is `ch` pixels and sixel bands are 6 pixels,
-   so when `ch % 6 ≠ 0` the last band of a patch spills into the next row. Those pixels are
-   left unset (transparent) and must not paint anything.
-5. **Never patch the last screen row** (keep the footer opaque). Drawing a sixel there can
-   scroll the whole screen.
-6. Pre-quantise each surface's hi-res composite once (256 colours, Floyd–Steinberg, cached per
-   size). A patch is then a crop of indices plus its own palette definitions (only the colours
-   it uses). Cache encoded patches by (surface, row, x0, x1) in a small LRU: bars growing and
-   shrinking keep producing the same runs.
-7. Cost, measured with the Python reference encoder on the Webb photo (256 colours,
-   Floyd–Steinberg, the worst case): a whole 1720×800 px screen encodes in 0.51 s to
-   **2.06 MB**; one 30-cell patch (300×20 px) in 2.2 ms to 13 KB. A full repaint (start, resize,
-   theme change) therefore sends about 2 MB once. Live frames send only the patches for cells
-   that just turned blank, usually a few KB. To cut the full repaint for slow links, use 64
-   colours with ordered dithering (fewer colour lines per band and longer runs), or skip
-   patches on `panel` blank cells (keep half-blocks there) and patch only `screen`/`bar`.
+- **Any write to a cell erases the image pixels in that cell**, a space with the default
+  background included (`TextBuffer::Replace` → `ImageSlice::EraseCells`); ECH/EL/ED and other
+  fills too. A cell shows either pixels or a character, never both.
+- **Images are painted over the text** and never erase it (`renderer.cpp`: "Paint any image
+  content on top of the text"). Unset pixels (P2 = 1) keep whatever was there, earlier images
+  included, so several images compose.
+- **A fixed 10×20 px virtual cell** whatever the font: `CSI 16 t` answers 10×20 and `CSI 14 t`
+  answers cols·10 × rows·20; each row's image slice is scaled to the real cell with linear
+  filtering. A 128×45 window is a 1280×900 canvas; the SSH ioctl pixel size (often 640×480)
+  is meaningless. XTSMGRAPHICS is not implemented.
+- **256 colour registers**, not reset between images, but each image's colour numbers map
+  afresh: every image must define its colours. RGB 0..100 per channel.
+- **Scrolling mode** (DECSDM reset, the default): the image starts at the cursor; it scrolls
+  the screen once a 6-px band doesn't fit. `?80h` puts images at the top-left and never
+  scrolls.
 
-Windows Terminal specifics: sixel since **1.22**. It reports `4` in DA1, uses a 10×20 virtual
-cell and scales images to the real font size, and answers DECRQSS. Legacy conhost has no
-sixel; it gets `blocks` (truecolor works there).
+So, per frame:
+
+1. **Full repaint** (start, resize, theme change): `ED 2`, then **one picture for the whole
+   window** (rows 0 … h-3: the last two rows never get pixels, so a band can't scroll the
+   screen), then the text. Writing the text erases the picture under each character; every
+   other cell keeps its pixels and is never written. When surfaces have different glass
+   (the built-in themes' darker panels), one picture per glass, each covering only its own
+   cells (the rest unset), composed by P2 = 1.
+2. **Cells that turn blank** get their block-glyph mosaic at once and a **pixel patch** (one
+   per run of adjacent cells in a row) when they are quiet: in eco in the same flush; in smooth
+   at the next patch tick (4 a second) after a full tick blank. Cells of busy areas (graph
+   interiors, the per-core heat map, bars and their tracks: `NOPATCH` / `TRACK`) wait three
+   ticks, at most 96 a tick (eco: one sample, at most 128), so a moving graph line or bar end
+   never costs more than a few patches.
+3. **Ink glyphs**: panel frames (`─│╭╮╰╯├┤┬┴┼┃━╵`), dots (`·`) and braille grid lines, bars
+   (`▁`…`█`, the lower k/8 of the cell in the bar's colour) and their tracks (a thin line at the
+   base) are drawn into the patches themselves, so the picture continues through and above
+   them. Each picture or patch defines its own ink colours as palette entries 190..254 (the
+   picture is quantised to 190 colours; 255 = unset); a cell whose colour finds no free entry is
+   written as text instead. Anti-aliased bar ends (blends) stay text.
+4. **Text cells**: background = the picture's average there, through the same veil as the
+   blank cells. Where the text doesn't read on it, the light and clear veils change the text,
+   not the background: darker text on a bright area, lighter text on a darker one (same hue),
+   judged on the picture ±3 cells around, so a word changes together. Only if that can't reach
+   the contrast does the cell get a darker plate (the built-in themes always use plates), and
+   a single blank between two plated words takes the plate, so a label reads as one.
+5. The hi-res picture is stored at the screen's pixel size, but no larger than the picture
+   itself (a 1080p picture in a 4K window is kept at 1080p and scaled up per patch).
+
+Fit: `contain` (default) shows the whole picture; the margins are a cover-crop of the picture at
+1/24 scale, blurred and dimmed to 70 %, enlarged, with the picture's edges feathered over 3 %
+of its short side. `cover` crops around `image.<file>.focus`.
+
+**tmux** removes an image when text overwrites it, so inside tmux the full repaint sends
+patches per run of blank cells instead of one picture.
 
 ### iTerm2 inline images
 

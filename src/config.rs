@@ -1,6 +1,9 @@
 //! ~/.config/cpuview/config: a tiny `key = value` file, plus image import (copy / curl).
 
+use crate::image::Fit;
+use crate::mosaic::Glyphs;
 use crate::probe::Mode;
+use crate::theme::Glass;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -8,6 +11,27 @@ pub struct ImgOpt {
     pub file: String,
     pub dim: f32,
     pub blur: f32,
+    pub fit: Fit,
+    /// focus point (0..1, 0..1): kept in view when cropping (cover)
+    pub focus: (f32, f32),
+}
+
+impl ImgOpt {
+    pub fn new(file: &str) -> ImgOpt {
+        ImgOpt {
+            file: file.to_string(),
+            dim: 0.9,
+            blur: 0.0,
+            fit: Fit::Contain,
+            focus: (0.5, 0.5),
+        }
+    }
+    pub fn place(&self) -> crate::image::Place {
+        crate::image::Place {
+            fit: self.fit,
+            focus: self.focus,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +44,10 @@ pub struct Config {
     /// 0 CPU, 1 memory & storage, 2 network & system, 3 processes, 4 sensors & power
     /// (ui::page_name)
     pub page: usize,
+    /// picture themes: veil over the picture
+    pub glass: Glass,
+    /// block glyphs for drawing pictures with characters (None = auto)
+    pub glyphs: Option<Glyphs>,
     pub imgs: Vec<ImgOpt>,
 }
 
@@ -32,6 +60,8 @@ impl Default for Config {
             view: 0,
             speed: 0,
             page: 0,
+            glass: Glass::Light,
+            glyphs: None,
             imgs: Vec::new(),
         }
     }
@@ -132,10 +162,14 @@ impl Config {
     }
 
     pub fn load() -> Config {
+        match std::fs::read_to_string(Self::path()) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Config::default(),
+        }
+    }
+
+    pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
-        let Ok(text) = std::fs::read_to_string(Self::path()) else {
-            return c;
-        };
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
@@ -152,6 +186,8 @@ impl Config {
                 "view" => c.view = crate::ui::VIEWS.iter().position(|s| *s == v).unwrap_or(0),
                 "speed" => c.speed = crate::ui::speed_index(v),
                 "page" => c.page = crate::ui::page_index(v).unwrap_or(0),
+                "glass" => c.glass = Glass::parse(v).unwrap_or(Glass::Light),
+                "glyphs" => c.glyphs = Glyphs::parse(v),
                 _ => {
                     // image.<file>.dim / image.<file>.blur
                     if let Some(rest) = k.strip_prefix("image.") {
@@ -160,6 +196,22 @@ impl Config {
                             match opt {
                                 "dim" => o.dim = parse_f(v, 0.9).clamp(0.2, 1.0),
                                 "blur" => o.blur = parse_f(v, 0.0).clamp(0.0, 8.0),
+                                "fit" => {
+                                    o.fit = if v == "cover" {
+                                        Fit::Cover
+                                    } else {
+                                        Fit::Contain
+                                    }
+                                }
+                                "focus" => {
+                                    // "x,y" in 0..1 (e.g. 0.5,0.3 keeps the upper middle)
+                                    if let Some((a, b)) = v.split_once(',') {
+                                        o.focus = (
+                                            parse_f(a.trim(), 0.5).clamp(0.0, 1.0),
+                                            parse_f(b.trim(), 0.5).clamp(0.0, 1.0),
+                                        );
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -175,26 +227,27 @@ impl Config {
             .iter()
             .find(|o| o.file == file)
             .cloned()
-            .unwrap_or(ImgOpt {
-                file: file.to_string(),
-                dim: 0.9,
-                blur: 0.0,
-            })
+            .unwrap_or(ImgOpt::new(file))
     }
 
     pub fn img_mut(&mut self, file: &str) -> &mut ImgOpt {
         if let Some(i) = self.imgs.iter().position(|o| o.file == file) {
             return &mut self.imgs[i];
         }
-        self.imgs.push(ImgOpt {
-            file: file.to_string(),
-            dim: 0.9,
-            blur: 0.0,
-        });
+        self.imgs.push(ImgOpt::new(file));
         self.imgs.last_mut().unwrap()
     }
 
     pub fn save(&self) {
+        let s = self.render();
+        let _ = std::fs::create_dir_all(config_dir());
+        let tmp = Self::path().with_extension("tmp");
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(tmp, Self::path());
+        }
+    }
+
+    pub fn render(&self) -> String {
         let mut s = String::from("# cpuview settings (written by cpuview)\n");
         s += &format!("theme = {}\n", self.theme);
         s += &format!("image_mode = {}\n", self.image_mode.name());
@@ -202,6 +255,12 @@ impl Config {
         s += &format!("view = {}\n", crate::ui::VIEWS[self.view]);
         s += &format!("speed = {}\n", crate::ui::SPEEDS[self.speed].0);
         s += &format!("page = {}\n", crate::ui::page_name(self.page).1);
+        if self.glass != Glass::Light {
+            s += &format!("glass = {}\n", self.glass.name());
+        }
+        if let Some(g) = self.glyphs {
+            s += &format!("glyphs = {}\n", g.name());
+        }
         for o in &self.imgs {
             s += &format!(
                 "image.{}.dim = {}.{}\nimage.{}.blur = {}\n",
@@ -211,12 +270,23 @@ impl Config {
                 o.file,
                 o.blur as u32
             );
+            if o.fit == Fit::Cover {
+                s += &format!("image.{}.fit = cover\n", o.file);
+            }
+            if o.focus != (0.5, 0.5) {
+                let p = |v: f32| (v * 100.0).round() as u32;
+                let (x, y) = (p(o.focus.0), p(o.focus.1));
+                s += &format!(
+                    "image.{}.focus = {}.{:02},{}.{:02}\n",
+                    o.file,
+                    x / 100,
+                    x % 100,
+                    y / 100,
+                    y % 100
+                );
+            }
         }
-        let _ = std::fs::create_dir_all(config_dir());
-        let tmp = Self::path().with_extension("tmp");
-        if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(tmp, Self::path());
-        }
+        s
     }
 }
 
@@ -389,6 +459,31 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn picture_options_round_trip() {
+        let mut c = Config::default();
+        assert_eq!(c.glass, Glass::Light);
+        assert_eq!(c.img("a.jpg").fit, Fit::Contain);
+        c.glass = Glass::Frosted;
+        c.glyphs = Some(Glyphs::Sextant);
+        let o = c.img_mut("lofi-synthwave.jpg");
+        o.fit = Fit::Cover;
+        o.focus = (0.5, 0.3);
+        let text = c.render();
+        assert!(
+            text.contains("image.lofi-synthwave.jpg.focus = 0.50,0.30"),
+            "{text}"
+        );
+        let d = Config::parse(&text);
+        assert_eq!(d.glass, Glass::Frosted);
+        assert_eq!(d.glyphs, Some(Glyphs::Sextant));
+        let o = d.img("lofi-synthwave.jpg");
+        assert_eq!((o.fit, o.focus), (Fit::Cover, (0.5, 0.3)));
+        // the defaults are not written
+        let text = Config::default().render();
+        assert!(!text.contains("glass") && !text.contains("glyphs"));
+    }
+
     #[test]
     fn sanitize_names() {
         assert_eq!(sanitize("my pic (1)"), "mypic1");
