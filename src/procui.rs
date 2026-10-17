@@ -186,7 +186,8 @@ pub struct PV {
     /// the selected row's key, its index, the first row shown
     pub sel: u64,
     pub sel_i: usize,
-    /// the user picked the selected row (else it follows the top row)
+    /// `f`: the selection follows its process when the order changes (else it stays
+    /// on its row: the table never moves by itself)
     pub pinned: bool,
     pub scroll: usize,
     /// tree: collapsed processes; grouped: expanded programs (row keys)
@@ -445,14 +446,15 @@ impl App {
     /// One sample while the page is shown (main loop). Smooth: tracked rows every
     /// sample, a new order 2.5 times a second, a full scan about every second (more
     /// rarely if scans are slow: ≤ 0.2 % of a thread). Eco: tracked rows every 4 s, a
-    /// full scan every 30 s or more.
+    /// full scan every minute or more.
     pub fn procs_sample(&mut self, now: i64, eco: bool, smooth: bool, tick: i64, push: u32) {
         const SEC: i64 = 1_000_000_000;
         let Some(d) = self.pv.d.as_mut() else {
             return;
         };
         let scan_gap = if eco {
-            (30 * SEC).max(d.cost * 20_000)
+            // (eco: a minute apart or more, so scans take at most ~17 µs/s)
+            (60 * SEC).max(d.cost * 60_000)
         } else {
             SEC.max(d.cost * 2500)
         };
@@ -784,22 +786,25 @@ impl App {
         self.pv.d = Some(d);
         self.pv.rows = rows;
         self.pv.aggs = aggs;
-        // selection: the same process (or group) if it is still there, else the row
-        // now at its place
-        // (until the user picks one, the selection stays on the top row)
+        // selection: stays on its row, so a new order never moves the table; with
+        // `f` (follow) it stays on its process, which may then leave the screen (the
+        // table still doesn't move; Home or Esc come back)
+        let nrows = self.pv.rows.len();
         let found = if self.pv.pinned {
             self.pfind(self.pv.sel)
         } else {
-            Some(0)
+            None
         };
-        let nrows = self.pv.rows.len();
+        if self.pv.pinned && found.is_none() {
+            self.pv.pinned = false; // the followed process is gone
+        }
         self.pv.sel_i = found.unwrap_or(self.pv.sel_i.min(nrows.saturating_sub(1)));
         if let Some(r) = self.pv.rows.get(self.pv.sel_i).copied() {
             self.pv.sel = self.row_key(&r);
         }
         let vh = self.prows_vis();
         self.pv.scroll = self.pv.scroll.min(nrows.saturating_sub(vh.max(1)));
-        if found.is_none() || snap {
+        if snap && !self.pv.pinned {
             self.pfollow();
         }
         self.psync(snap);
@@ -1128,6 +1133,12 @@ impl App {
         let n = self.pv.rows.len();
         let vh = self.prows_vis().max(1);
         let i = self.pv.sel_i;
+        // a followed process off screen: arrows start again from the rows shown
+        let i = if i < self.pv.scroll || i >= self.pv.scroll + vh {
+            self.pv.scroll
+        } else {
+            i
+        };
         let to = match k {
             Key::Up => i.saturating_sub(1),
             Key::Down => i + 1,
@@ -1138,10 +1149,19 @@ impl App {
             _ => usize::MAX,
         };
         if to != usize::MAX {
-            self.psel(to);
+            self.psel(to, false);
             return true;
         }
         match k {
+            Key::Char('f') => {
+                // follow the selected process (or stop following)
+                self.pv.pinned = !self.pv.pinned;
+                if !self.pv.pinned {
+                    let s = self.pv.scroll;
+                    self.pv.sel_i = self.pv.sel_i.clamp(s, (s + vh).min(n).max(s + 1) - 1);
+                    self.psel(self.pv.sel_i, false);
+                }
+            }
             Key::Char('o') => {
                 self.pv.sort = (self.pv.sort + 1) % NSORT;
                 self.pv.rev = false;
@@ -1156,6 +1176,8 @@ impl App {
             }
             Key::Esc => {
                 if self.pv.filter.is_empty() {
+                    // back to the top, not following anything
+                    self.psel(0, false);
                     return true;
                 }
                 self.pv.filter.clear();
@@ -1193,10 +1215,11 @@ impl App {
         true
     }
 
-    /// Select row `to` (clamped), keep it on screen, read its details.
-    fn psel(&mut self, to: usize) {
+    /// Select row `to` (clamped), keep it on screen, read its details. `follow`: keep
+    /// following its process when the order changes.
+    fn psel(&mut self, to: usize, follow: bool) {
         self.pv.sel_i = to.min(self.pv.rows.len().saturating_sub(1));
-        self.pv.pinned = true;
+        self.pv.pinned = follow;
         if let Some(r) = self.pv.rows.get(self.pv.sel_i).copied() {
             self.pv.sel = self.row_key(&r);
         }
@@ -1231,7 +1254,7 @@ impl App {
                     .rev()
                     .find(|&j| self.pv.rows.get(j).is_some_and(|q| q.depth < r.depth))
                     .unwrap_or(0);
-                self.psel(i);
+                self.psel(i, false);
             }
             return;
         }
@@ -1377,8 +1400,23 @@ impl App {
             return false;
         }
         match btn {
-            64 => return self.proc_key(Key::Up),
-            65 => return self.proc_key(Key::Down),
+            // the wheel scrolls the table (3 rows); the selection keeps its screen row
+            64 | 65 => {
+                let vh = self.prows_vis().max(1);
+                let max = self.pv.rows.len().saturating_sub(vh);
+                let s = self.pv.scroll;
+                let ns = if btn == 64 {
+                    s.saturating_sub(3)
+                } else {
+                    (s + 3).min(max)
+                };
+                if ns != s {
+                    let off = self.pv.sel_i.saturating_sub(s).min(vh - 1);
+                    self.pv.scroll = ns;
+                    self.psel(ns + off, false);
+                }
+                return true;
+            }
             0 => {}
             _ => return false,
         }
@@ -1393,7 +1431,7 @@ impl App {
                     if i == self.pv.sel_i {
                         self.pfold(Key::Enter);
                     } else {
-                        self.psel(i);
+                        self.psel(i, false);
                     }
                 }
             }
@@ -1480,7 +1518,11 @@ impl App {
                 l.detail,
                 &[("selected", t.title | BOLD)],
                 if l.detail.w >= 70 {
-                    "enter/←→ fold · k signal · n nice"
+                    if self.pv.pinned {
+                        "following · f stop · enter/←→ fold · k signal · n nice"
+                    } else {
+                        "f follow · enter/←→ fold · k signal · n nice"
+                    }
                 } else {
                     ""
                 },

@@ -189,13 +189,13 @@ fn trim_heap() {
 }
 
 /// Half-block canvas (w × 2h RGB) → per-cell [upper, lower] pixel pairs.
-fn to_cells(b: &[u8], w: usize, h: usize) -> Vec<[color::Rgb; 2]> {
-    let px = |x: usize, y: usize| {
-        let o = (y * w + x) * 3;
-        color::rgb(b[o], b[o + 1], b[o + 2])
-    };
-    (0..h)
-        .flat_map(|y| (0..w).map(move |x| [px(x, 2 * y), px(x, 2 * y + 1)]))
+fn to_cells(b: &[u8], w: usize, h: usize) -> Vec<screen::Px2> {
+    (0..w * h)
+        .map(|i| {
+            let o = (i / w * 2 * w + i % w) * 3;
+            let p = o + 3 * w;
+            [b[o], b[o + 1], b[o + 2], b[p], b[p + 1], b[p + 2]]
+        })
         .collect()
 }
 
@@ -282,13 +282,10 @@ fn build_backdrop(
     } else {
         let cv = bg::render(t.layers, t.bg, w, 2 * h, w, h, false);
         let mut bd = Backdrop::empty(w, h);
-        bd.sharp = (0..h)
-            .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .map(|(x, y)| {
-                [
-                    color::from_f(cv.px[2 * y * w + x]),
-                    color::from_f(cv.px[(2 * y + 1) * w + x]),
-                ]
+        bd.sharp = (0..w * h)
+            .map(|i| {
+                let o = i / w * 2 * w + i % w;
+                screen::px2(color::from_f(cv.px[o]), color::from_f(cv.px[o + w]))
             })
             .collect();
         bd.has_glyphs = cv.glyph.iter().any(|g| g.0 != '\0');
@@ -314,9 +311,6 @@ fn look_for(t: &Theme, g: &Gfx) -> Look {
 
 struct State {
     full: bool,
-    /// CPU time spent on non-steady-state work (full repaints, rebuilds): not
-    /// charged to the sampling budget
-    excluded: i64,
     app: App,
     scr: Screen,
     g: Gfx,
@@ -326,12 +320,6 @@ struct State {
 impl State {
     /// (Re)build background + compositor for the current theme, size and mode.
     fn rebuild(&mut self, img: Option<image::Img>) {
-        let c0 = term::cpu_ns();
-        self.rebuild_inner(img);
-        self.excluded += term::cpu_ns() - c0;
-    }
-
-    fn rebuild_inner(&mut self, img: Option<image::Img>) {
         self.kitty_clear();
         let (w, h) = (self.app.w, self.app.h);
         let preview = self.app.menu.is_some();
@@ -485,14 +473,6 @@ impl State {
     }
 
     fn render(&mut self) {
-        let c0 = if self.full { term::cpu_ns() } else { 0 };
-        self.render_inner();
-        if c0 != 0 {
-            self.excluded += term::cpu_ns() - c0;
-        }
-    }
-
-    fn render_inner(&mut self) {
         self.render_with(false);
     }
 
@@ -1037,10 +1017,13 @@ fn die(msg: &str) -> ! {
 fn main() {
     // Large buffers (screen, backdrop canvases, decoded pictures) go to their own
     // mappings and back to the kernel when freed: without a fixed threshold glibc
-    // raises it after the first big free and later big buffers pin the heap.
+    // raises it after the first big free and later big buffers pin the heap. Free
+    // memory at the top of the heap goes back too, without padding.
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 64 * 1024);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 64 * 1024);
+        libc::mallopt(libc::M_TOP_PAD, 0);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = Config::load();
@@ -1205,7 +1188,6 @@ fn main() {
     };
     let mut st = State {
         full: true,
-        excluded: 0,
         app,
         scr: Screen::new(cols as usize, rows as usize),
         g,
@@ -1236,12 +1218,18 @@ fn main() {
     // graphs still get one point per second. Eco (the default) is adaptive:
     //
     // Sampling is paced by a CPU-time token bucket. Tokens accrue at BUDGET ns per
-    // second (capped at CAP); every wakeup spends its own measured CPU time
-    // (CLOCK_PROCESS_CPUTIME_ID, input handling excluded). Samples are taken every
-    // second while loads are changing and every IDLE_GAP seconds when they are
-    // stable, but never before the bucket can pay for one. So the long-run average
-    // stays under BUDGET whatever the machine (cold caches, many CPUs, busy system),
-    // and any 60 s window stays under BUDGET + CAP / 60 (< 100 µs/s).
+    // second (capped at CAP); every wakeup spends all of the process's CPU time
+    // since the last one (CLOCK_PROCESS_CPUTIME_ID: every thread, nothing left
+    // out), debt included. Samples are taken every second while loads are changing
+    // and every IDLE_GAP seconds when they are stable, but only once the bucket
+    // holds the expected cost of one (`est`, a slowly decaying peak of the recent
+    // sample wakeups, so the dear ones every few samples are paid in advance). So
+    // the long-run average stays under BUDGET and any 60 s window under BUDGET +
+    // CAP / 60 (85 µs/s, plus a misjudged wakeup) whatever the machine (cold caches,
+    // many CPUs, a busy system), the page or the terminal size. When a sample costs
+    // more than CAP, the bucket holds one but fills slower, which keeps that bound.
+    // User-initiated work (keys, resize, resume) is charged too, but may only use
+    // up saved tokens: it never puts sampling in debt.
     //
     // Smooth samples 10 times a second (sys::dual) and draws on a fixed frame grid
     // (anim::FPS, aligned with the samples): every frame advances the springs by
@@ -1250,7 +1238,7 @@ fn main() {
     // write each, nothing when nothing changed. Should frames cost more than SM_BUDGET
     // on average over ~5 s (huge screens), the frame rate is halved, and stays constant.
     const SEC: i64 = 1_000_000_000;
-    const BUDGET: i64 = 70_000;
+    const BUDGET: i64 = 65_000;
     const CAP: i64 = 1_200_000;
     const IDLE_GAP: i64 = 2;
     const SM_BUDGET: i64 = 5_000_000;
@@ -1261,9 +1249,10 @@ fn main() {
     let mut offset = term::now_ns(libc::CLOCK_REALTIME) - term::mono();
     let mut tokens = CAP;
     let mut refill_t = term::mono();
-    let mut est: i64 = 120_000;
+    let mut est: i64 = CAP / 2;
+    let mut nsamp = 0u32;
     let mut cpu_mark = term::cpu_ns();
-    let mut input_cpu: i64 = 0;
+    let mut user = false;
     let mut active_left: u32 = 5;
     let wall_sec = |mono: i64, offset: i64| (mono + offset) / SEC;
     let last_sample_sec = wall_sec(term::mono(), offset);
@@ -1306,13 +1295,14 @@ fn main() {
         if term::QUIT.load(Ordering::Relaxed) {
             break;
         }
-        // speed changed: re-grid; the budget only applies to eco, so start it full
+        // speed changed: re-grid; the budget only applies to eco, so start it half full
+        // (start-up costs more than a sample: first scans, every job once)
         if st.app.speed != speed || last_tick == i64::MIN {
             speed = st.app.speed;
             let hz = ui::SPEEDS[speed].1;
             period = fixed.unwrap_or(if hz > 0 { SEC / hz } else { SEC });
             last_tick = (term::mono() + offset) / period;
-            tokens = CAP;
+            tokens = CAP / 2;
             cpu_mark = term::cpu_ns();
             let smooth = st.app.smooth();
             st.app.s.dual = smooth;
@@ -1334,15 +1324,19 @@ fn main() {
         // account the CPU time of the wakeup that just finished (eco only: reading
         // the process clock is a syscall, which faster speeds needn't pay per frame)
         let c = if eco { term::cpu_ns() } else { cpu_mark };
-        tokens = (tokens - (c - cpu_mark - input_cpu - st.excluded).max(0)).max(-CAP);
+        let now = term::mono();
+        // (a wakeup that handled keys, a resize or a resume is the user's: it may use
+        // up saved tokens, never borrow)
+        tokens = (tokens - (c - cpu_mark)).max(if user { tokens.min(0) } else { i64::MIN });
         if !eco {
             tokens = CAP;
         }
         cpu_mark = c;
-        input_cpu = 0;
-        st.excluded = 0;
-        let now = term::mono();
-        tokens = (tokens + BUDGET * (now - refill_t) / SEC).min(CAP);
+        user = false;
+        // wakeups dearer than CAP: the bucket holds one, and fills slower by the excess
+        // over a minute (so any minute still stays under BUDGET + CAP / 60)
+        let over = (est - CAP).max(0);
+        tokens = (tokens + (BUDGET - over / 60) * (now - refill_t) / SEC).min(CAP + over);
         refill_t = now;
         // next sample: eco = whole wall-clock seconds, gap by activity, paid by
         // tokens; fixed speed = the next tick of the 1/hz grid
@@ -1350,7 +1344,7 @@ fn main() {
             let gap = if active_left > 0 { 1 } else { IDLE_GAP };
             let mut t = (last_tick + gap) * SEC - offset;
             if tokens < est {
-                t = t.max(now + (est - tokens) * SEC / BUDGET);
+                t = t.max(now + (est - tokens) * SEC / (BUDGET - over / 60));
                 t = (wall_sec(t, offset) + 1) * SEC - offset;
             }
             t
@@ -1381,9 +1375,10 @@ fn main() {
             term::write_all(OUT, term::ENTER.as_bytes());
             st.rebuild(None);
             dirty = true;
+            user = true;
         }
         if readable {
-            let c0 = term::cpu_ns();
+            user = true;
             let n = term::read(0, &mut buf);
             if n <= 0 {
                 break; // terminal gone
@@ -1394,34 +1389,31 @@ fn main() {
             } else {
                 None
             };
-            for ev in std::mem::take(&mut evs) {
-                running &= st.handle(ev);
-                dirty = true;
-                st.full = true;
-            }
-            if dirty && running {
-                st.render();
-                dirty = false;
-            }
             settled = false;
-            input_cpu += term::cpu_ns() - c0;
         }
         let now = term::mono();
         if esc_at.is_some_and(|t| now >= t) {
+            user = true;
             esc_at = None;
             parser.flush_timeout(&mut evs);
-            for ev in std::mem::take(&mut evs) {
-                running &= st.handle(ev);
-                dirty = true;
-                st.full = true;
-            }
         }
         if winch_at.is_some_and(|t| now >= t) {
+            user = true;
             winch_at = None;
             st.resize();
             dirty = true;
             fps = fps0;
             sm_avg = 0;
+        }
+        // keys (a lone Esc after its timeout too)
+        for ev in std::mem::take(&mut evs) {
+            running &= st.handle(ev);
+            dirty = true;
+            st.full = true;
+        }
+        if user && dirty && running {
+            st.render();
+            dirty = false;
         }
         // wakeups land a little after the deadline: round to the intended tick
         let slack = (period / 5).min(if smooth { 2_000_000 } else { 20_000_000 });
@@ -1505,8 +1497,10 @@ fn main() {
                 } else if pvis && now - m.last_top >= live - SEC / 20 {
                     m.last_top = now;
                     m.refresh_procs();
-                    // eco: a full scan early when a big newcomer appeared
-                    if eco && m.need_scan() {
+                    // eco: a full scan early when a big newcomer appeared (at most
+                    // once a minute: on a busy machine there always is one, and a
+                    // scan costs ~1 ms)
+                    if eco && now - m.last_proc >= 60 * SEC && m.need_scan() {
                         m.scan_procs();
                     }
                 }
@@ -1549,9 +1543,17 @@ fn main() {
                 st.render();
                 dirty = false;
             }
-            if eco {
-                let spent = term::cpu_ns() - cpu_mark - input_cpu - st.excluded;
-                est = ((est * 3 + spent) / 4).clamp(20_000, 2_000_000);
+            nsamp += 1;
+            if eco && nsamp > 2 {
+                // a slowly decaying peak: the dearer wakeups (scans, refreshes) every
+                // few samples keep it up (not the first samples: start-up, first scans)
+                let spent = term::cpu_ns() - cpu_mark;
+                est = if spent > est {
+                    spent
+                } else {
+                    est - (est - spent) / 16
+                };
+                est = est.clamp(20_000, 4 * CAP);
             }
         } else if st.app.paused && sec > last_push_sec {
             last_push_sec = sec;

@@ -425,6 +425,8 @@ pub struct App {
     pub pv: PV,
     /// colour of the series in `vals2` that `graph` draws under its own (0: none)
     pub under: std::cell::Cell<u32>,
+    /// `col_chart`: the geometry drawn last and the rows each column filled
+    ctop: std::cell::Cell<(u64, Vec<u16>)>,
 }
 
 impl App {
@@ -506,6 +508,7 @@ impl App {
             ncache: Vec::new(),
             pv: PV::new(),
             under: std::cell::Cell::new(0),
+            ctop: Default::default(),
         }
         .with_bars()
     }
@@ -1788,6 +1791,58 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Columns of stacked eighths (newest at the right, `cols[c]` = (total, lower part,
+    /// has data)) in rows `cy..cy + ch` from `gx`, lower part in `ca`, the rest in `cb`,
+    /// a dotted line at `half`. Only the rows a column fills now or filled the last
+    /// time are drawn (the ones above are blank already) unless `full`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn col_chart(
+        &self,
+        scr: &mut Screen,
+        gx: usize,
+        cy: usize,
+        ch: usize,
+        cols: &[(u16, u16, bool)],
+        (ca, cb): (u32, u32),
+        half: usize,
+        full: bool,
+    ) {
+        let bg = surf(S_PANEL);
+        let gw = cols.len();
+        let mut m = self.ctop.take();
+        let key = (gx | gw << 16) as u64 | ((cy | ch << 16) as u64) << 32;
+        let hrow = if half < ch { ch - 1 - half } else { usize::MAX };
+        if full || m.0 != key {
+            m = (key, vec![u16::MAX; gw]);
+        }
+        for ((c, &(t8, a8, has)), prev) in cols.iter().enumerate().zip(m.1.iter_mut()) {
+            let (t8, a8) = (t8 as usize, a8 as usize);
+            let x = gx + gw - 1 - c;
+            let rows = t8.div_ceil(8).max(1);
+            let top = rows.max(*prev as usize).min(ch);
+            *prev = rows as u16;
+            for row in 0..ch {
+                if row >= top && row != hrow {
+                    continue;
+                }
+                let lo = row * 8;
+                let inc = t8.saturating_sub(lo).min(8);
+                let (g, fg) = if inc > 0 {
+                    let ap = a8.saturating_sub(lo).min(inc);
+                    (BLOCKS[inc - 1], if ap * 2 >= inc { ca } else { cb })
+                } else if row == 0 && has {
+                    ('▁', TRACK)
+                } else if row == hrow && c % 2 == 0 {
+                    ('·', self.t.border)
+                } else {
+                    (' ', NOPATCH)
+                };
+                scr.put(x, cy + ch - 1 - row, g, fg, bg);
+            }
+        }
+        self.ctop.set(m);
     }
 
     /// Graph with a y-axis label gutter.

@@ -839,6 +839,7 @@ impl App {
                 ch - 2,
                 (gx, gw, b),
                 v[2].x.max(1.0),
+                full,
             );
         }
     }
@@ -856,8 +857,8 @@ impl App {
         ch: usize,
         geo: (usize, usize, usize),
         sc: f32,
+        full: bool,
     ) {
-        const BL: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let (gx, gw, b) = geo;
         let th = &self.t;
         let bg = surf(S_PANEL);
@@ -892,8 +893,9 @@ impl App {
             );
         }
         let e8 = (ch * 8) as f32;
-        for c in 0..gw {
-            let x = gx + gw - 1 - c;
+        let mut cols = [(0, 0, false); 512];
+        let n = gw.min(512);
+        for (c, slot) in cols.iter_mut().enumerate().take(n) {
             let col = self.link_col(m, c, b);
             let (d, u) = col.unwrap_or((0.0, 0.0));
             let tot = d + u;
@@ -907,25 +909,9 @@ impl App {
             } else {
                 0
             };
-            for row in 0..ch {
-                let y = cy + ch - 1 - row;
-                let lo = row * 8;
-                if t8 <= lo {
-                    let (g, fg) = if row == 0 && col.is_some() {
-                        ('▁', TRACK)
-                    } else if half != usize::MAX && row == ch - 1 - half && c % 2 == 0 {
-                        ('·', th.border)
-                    } else {
-                        (' ', NOPATCH)
-                    };
-                    scr.put(x, y, g, fg, bg);
-                    continue;
-                }
-                let inc = (t8 - lo).min(8);
-                let dp = d8.saturating_sub(lo).min(inc);
-                scr.put(x, y, BL[inc - 1], if dp * 2 >= inc { cd } else { cu }, bg);
-            }
+            *slot = (t8 as u16, d8 as u16, col.is_some());
         }
+        self.col_chart(scr, gx + gw - n, cy, ch, &cols[..n], (cd, cu), half, full);
         // the rates now at the right edge
         if gx + gw < maxx {
             let v = self.link_vals(&self.n.ifs[m].name);

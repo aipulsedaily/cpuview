@@ -4,7 +4,7 @@
 //! of a process's `stat` 1.6 µs (2.7 µs with cold caches); a pread of one kept open
 //! 0.7 µs. So a *full scan* (list /proc, read every process's `stat`) runs only every
 //! second or so (smooth; spaced further by its measured cost on big machines) or every
-//! half minute (eco), while the processes on screen and the selected one are *tracked*:
+//! minute (eco), while the processes on screen and the selected one are *tracked*:
 //! their `stat` and `io` stay open and are re-read with pread on every sample, which
 //! gives their CPU % over the last second. Kernel threads are recognised once and then
 //! skipped while hidden.

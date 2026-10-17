@@ -9,7 +9,7 @@ download and upload per link now and over the last minutes, the listening ports 
 them, connections, containers and services; and a **Processes** page (`4`):
 every process with its CPU, memory and disk use, as a list, grouped by program or as a tree, with
 signals and nice. Native Rust, one 1.1 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
-thread** (≈ 70–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
+thread** (≈ 45–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
 60 updates per second.
@@ -178,7 +178,7 @@ every rate is in MB/s, so all of them compare directly.
 - **Live and smooth**: in smooth mode the rows on screen are re-read 2.5 times a second (their
   `stat` and `statm` stay open), CPU % is over the last second, digits count and bars glide,
   rows *slide* to a new place over ~0.3 s instead of jumping, new processes fade in and exited
-  ones fade out. In eco the rows shown are re-read every 4 s and the whole list every 30 s
+  ones fade out. In eco the rows shown are re-read every 4 s and the whole list every minute
 
 ### Network & System
 
@@ -452,7 +452,7 @@ Processes page, smooth, 60 s at 128×45 · 172×40 with a load average of 7: 2.8
 KB/s, frames on the 60 fps grid (the base Memory & Storage page under the same load: 3.2 ms/s).
 With 5,400 processes it stays at 4.7 MB of RAM (128×45). A full scan of every process's `stat`
 costs ~1–1.5 ms here, so smooth does one about every 1–4 s (spaced by its measured cost), eco
-every 30 s or more; nothing is read for the page while it isn't shown.
+every minute or more; nothing is read for the page while it isn't shown.
 
 (The rows above were measured while other monitors and builds kept the load average at 3.6–3.8.)
 
@@ -483,10 +483,10 @@ a process (names are read once per pid, kernel threads remembered and skipped), 
 4 s (eco: 2 minutes); in between the 32 biggest processes are followed live through their open
 `statm` (one `pread`, ~1 µs each) 2.5 times a second (eco: every 10 s), and eco re-scans early
 when RAM in use changes by more than those processes explain or, every 30 s, when a new pid of
-64 MB or more appears. DIMM (`spd5118`, SMBus)
-and NVMe temperatures cost 40–65 µs of CPU and 1–20 ms of *wall* time per read, so a helper
-thread reads them every 60 s in eco (5 s otherwise) and only while they're shown: the main loop
-never waits for a sensor, and smooth frames stay on time.
+64 MB or more appears (at most one early scan a minute: on a busy machine there always is one).
+DIMM (`spd5118`, SMBus) and NVMe temperatures cost 40–65 µs of CPU and 1–20 ms of *wall* time
+per read, so a helper thread reads them every 60 s in eco (5 s otherwise) and only while they're
+shown: the main loop never waits for a sensor, and smooth frames stay on time.
 
 **Network & System data** costs what the machine makes it cost, so it is read as rarely as
 it can be. `/proc/net/dev` (40–55 µs here: the r8169 driver fetches the NIC's hardware
@@ -535,12 +535,18 @@ What makes that possible:
   `/proc/stat` ~45 µs (the kernel sums every IRQ counter of every CPU) and each
   `scaling_cur_freq` ~1.4 µs. So a full sample once per second would already cost ~110 µs/s.
   The sample rate is therefore paced by a **CPU-time budget**: a token bucket refills at
-  70 µs per second (capped at 1.2 ms), each wakeup pays its measured CPU time, and samples come
-  every second while loads change and every 2 s when they are stable — never faster than the
-  budget allows. So the average stays at or below 70 µs/s on any machine and any 60 s window
-  stays below 90 µs/s. In the runs above that was one update every ~2 s on average, with 1 s
-  bursts when something changes (start-up, load spikes). Key presses are answered immediately
-  and full repaints after input are not charged to the budget.
+  65 µs per second (capped at 1.2 ms) and every wakeup pays *all* the CPU time the process used
+  since the last one (`CLOCK_PROCESS_CPUTIME_ID`: every thread, the minute clock, scans and
+  refreshes included; debt is carried, never forgiven). Samples come every second while loads
+  change and every 2 s when they are stable, but only once the bucket holds what a sample is
+  expected to cost (a decaying peak of the recent ones, so the dearer samples with a process
+  scan or a filesystem refresh are paid for in advance); a page whose samples cost more than
+  1.2 ms gets a slower refill instead. So the average stays at or below 65 µs/s and any 60 s
+  window below ~85 µs/s on any machine, page and terminal size: a bigger screen or a busier
+  machine means fewer updates, never more CPU. In the runs above that was one update every
+  ~2 s on average at 128×45 (every 5–12 s at 415×105), with 1 s bursts when something changes.
+  Key presses are answered immediately; their CPU time is charged too, but may only use up
+  saved tokens.
 - The process is pinned to the physical core the scheduler uses least (lowest amd-pstate
   preferred-core rank, else the last core) among the CPUs it may use — a single-core
   `taskset` is left alone (`CPUVIEW_PIN=off` disables): that core's private L2 usually still holds cpuview's code and

@@ -1617,7 +1617,7 @@ impl App {
         if chart && (graphs || full) {
             let sk = mixk(&[self.body_key(0), self.m.hist_n, iw as u64, ih as u64]);
             if self.mmemo(K_DGRAPH, sk) || full {
-                self.disk_chart(scr, ir, ir.y + top + 1, ir.y + ih);
+                self.disk_chart(scr, ir, ir.y + top + 1, ir.y + ih, full);
             }
         }
     }
@@ -1700,7 +1700,7 @@ impl App {
     /// The disk activity chart in rows y0..y1 of the panel: caption, legend, stacked
     /// columns (reading below, writing on top) on a round MB/s scale with the current
     /// rates at the right edge, then the totals and the peak in words.
-    fn disk_chart(&self, scr: &mut Screen, ir: Rect, y0: usize, y1: usize) {
+    fn disk_chart(&self, scr: &mut Screen, ir: Rect, y0: usize, y1: usize, full: bool) {
         let (gx, gw, spc) = self.dchart_geo(ir);
         let b = spc as usize;
         let th = &self.t;
@@ -1813,9 +1813,8 @@ impl App {
         }
         // columns (newest at the right), stacked in eighths: reading below writing
         let e8 = (ch * 8) as f32;
-        let mut idle_run = 0usize;
+        let mut h8 = [(0, 0, false); 256];
         for (c, v) in cols.iter().enumerate().take(n) {
-            let x = gx + gw - 1 - c;
             let tot = v.rd + v.wr;
             let t8 = if c < have && tot >= IDLE_BPS {
                 ((tot / sc).min(1.0) * e8).round().max(1.0) as usize
@@ -1827,32 +1826,19 @@ impl App {
             } else {
                 0
             };
-            for row in 0..ch {
-                let y = cy + ch - 1 - row;
-                let lo = row * 8;
-                if t8 <= lo {
-                    let ch_ = if row == 0 && c < have {
-                        ('▁', TRACK)
-                    } else if half != usize::MAX && row == ch - 1 - half && c % 2 == 0 {
-                        ('·', th.border)
-                    } else {
-                        (' ', NOPATCH)
-                    };
-                    scr.put(x, y, ch_.0, ch_.1, bg);
-                    continue;
-                }
-                let inc = (t8 - lo).min(8);
-                let rp = r8.saturating_sub(lo).min(inc);
-                let col = if rp * 2 >= inc { rc } else { wc };
-                scr.put(x, y, BLOCKS[inc - 1], col, bg);
-            }
-            // "idle" over long quiet stretches
-            if c < have && t8 == 0 {
+            h8[c] = (t8 as u16, r8 as u16, c < have);
+        }
+        self.col_chart(scr, gx, cy, ch, &h8[..n], (rc, wc), half, full);
+        // "idle" over long quiet stretches
+        let mut idle_run = 0usize;
+        for (c, &(t8, _, has)) in h8.iter().enumerate().take(n) {
+            if has && t8 == 0 {
                 idle_run += 1;
             } else {
                 idle_run = 0;
             }
             if idle_run == 10 && ch >= 3 {
+                let x = gx + gw - 1 - c;
                 scr.text(x + 3, cy + ch - 1, "idle", th.dim, bg, x + 7);
             }
         }

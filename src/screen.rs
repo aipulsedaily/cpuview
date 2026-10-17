@@ -84,14 +84,24 @@ pub enum Look {
     KittyGlass,
 }
 
+/// A cell's two half-block pixels (upper, lower) in 6 bytes (a 4K screen's canvas:
+/// 260 KB instead of 350).
+pub type Px2 = [u8; 6];
+
+#[inline]
+pub fn px2(a: Rgb, b: Rgb) -> Px2 {
+    let (a, b) = (ch(a), ch(b));
+    [a[0], a[1], a[2], b[0], b[1], b[2]]
+}
+
 /// Background rendered for the current size: half-block canvas (2 px per cell) and,
 /// for pixel modes, a hi-res quantised copy at terminal pixel size.
 pub struct Backdrop {
     pub w: usize,
     pub h: usize,
     /// per cell: [upper half pixel, lower half pixel] (interleaved for locality)
-    pub sharp: Vec<[Rgb; 2]>,
-    pub soft: Option<Vec<[Rgb; 2]>>,
+    pub sharp: Vec<Px2>,
+    pub soft: Option<Vec<Px2>>,
     pub glyph: Vec<(char, Rgb)>,
     pub has_glyphs: bool,
     pub hires: Option<Hires>,
@@ -111,7 +121,7 @@ impl Backdrop {
         Backdrop {
             w,
             h,
-            sharp: vec![[0; 2]; w * h],
+            sharp: vec![[0; 6]; w * h],
             soft: None,
             glyph: Vec::new(),
             has_glyphs: false,
@@ -258,7 +268,7 @@ impl Comp {
                         _ => &bd.sharp,
                     };
                     let p = cv[y * bd.w + x];
-                    (p[0], p[1])
+                    (rgb(p[0], p[1], p[2]), rgb(p[3], p[4], p[5]))
                 };
                 let kitty = self.look == Look::KittyGlass;
                 let mut out = Out {
@@ -748,7 +758,7 @@ mod tests {
         let t = theme();
         let comp = Comp::new(&t, Look::Glass);
         let mut bd = Backdrop::empty(2, 1);
-        bd.sharp = vec![[0xff0000, 0x0000ff], [0x00ff00, 0xffffff]];
+        bd.sharp = vec![px2(0xff0000, 0x0000ff), px2(0x00ff00, 0xffffff)];
         let o = comp.cell(
             Cell {
                 ch: ' ',
