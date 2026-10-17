@@ -2231,7 +2231,11 @@ impl App {
             };
             let cnt = if n > 1 { f!(" ×{}", n) } else { F::new() };
             let keep = nw.saturating_sub(cnt.n + 1);
-            let nm = &name[..name.char_indices().nth(keep).map_or(name.len(), |c| c.0)];
+            // (cut: the last kept letter becomes "…", the count stays)
+            let cut = name.chars().count() > keep && keep >= 4;
+            let nm = &name[..name.char_indices().nth(if cut { keep - 1 } else { keep }).map_or(name.len(), |c| c.0)];
+            let nmf = if cut { fc(&[nm, "…"]) } else { fc(&[nm]) };
+            let nm = nmf.s();
             let first = p.pos.to < 0.5;
             let mut x = Self::spans(
                 scr,

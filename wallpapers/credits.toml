@@ -1,45 +1,55 @@
 # Machine-readable credits for the bundled wallpapers (human version: CREDITS.md).
 # `credit` is the one-line string the theme menu shows for the selected image.
+# `focus` = [x, y] (0..1): the subject, kept in view when the picture is cropped to
+# fill the window (fit = cover).
 
 ["nasa-webb-cosmic-cliffs.jpg"]
+focus = [0.5, 0.42]
 title = "Cosmic Cliffs, Carina Nebula (JWST NIRCam)"
 credit = "NASA, ESA, CSA, and STScI · public domain"
 source = "https://commons.wikimedia.org/wiki/File:NASA%E2%80%99s_Webb_Reveals_Cosmic_Cliffs,_Glittering_Landscape_of_Star_Birth.jpg"
 license = "public-domain"
 
 ["nasa-iss-aurora.jpg"]
+focus = [0.55, 0.45]
 title = "Aurora australis from the ISS"
 credit = "NASA / ISS Expedition 23 crew · public domain"
 source = "https://commons.wikimedia.org/wiki/File:Aurora_Australis_From_ISS.JPG"
 license = "public-domain"
 
 ["nasa-apollo8-earthrise.jpg"]
+focus = [0.62, 0.34]
 title = "Earthrise, Apollo 8"
 credit = "NASA / Bill Anders · public domain"
 source = "https://commons.wikimedia.org/wiki/File:NASA-Apollo8-Dec24-Earthrise.jpg"
 license = "public-domain"
 
 ["lofi-night-city.png"]
+focus = [0.6, 0.42]
 title = "Night city (pixel art)"
 credit = "cpuview · CC0"
 license = "CC0-1.0"
 
 ["lofi-synthwave.jpg"]
+focus = [0.5, 0.47]
 title = "Synthwave sunset"
 credit = "cpuview · CC0"
 license = "CC0-1.0"
 
 ["lofi-rainy-window.jpg"]
+focus = [0.5, 0.5]
 title = "Rainy window"
 credit = "cpuview · CC0"
 license = "CC0-1.0"
 
 ["lofi-dusk-mountains.png"]
+focus = [0.55, 0.5]
 title = "Dusk mountains (pixel art)"
 credit = "cpuview · CC0"
 license = "CC0-1.0"
 
 ["lofi-cozy-desk.png"]
+focus = [0.5, 0.45]
 title = "Cozy desk (pixel art)"
 credit = "cpuview · CC0"
 license = "CC0-1.0"

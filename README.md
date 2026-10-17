@@ -88,8 +88,8 @@ and every driver with what it shows.*
 | ![4K, 275x70](docs/screenshots/rust-4k-275x70.webp) 275×70 (4K at 150 %): per-core history grid, memory column | ![172x40](docs/screenshots/rust-default.webp) 172×40, Midnight |
 | ![60x20](docs/screenshots/rust-60x20.webp) 60×20: one row per core, live summary in the title | ![40x12](docs/screenshots/rust-40x12.webp) 40×12, Nebula: all 16 cores |
 | ![Nebula](docs/screenshots/rust-nebula.webp) Nebula | ![Synthwave](docs/screenshots/rust-synthwave.webp) Synthwave Sunset |
-| ![Synthwave picture, sixel, 128x45](docs/screenshots/rust-picture-128x45.webp) Picture theme (synthwave sunset), 128×45 in Windows Terminal (sixel): the whole picture at 1280×720 of the window's 1280×900 pixels¹ | ![Night city picture, sixel](docs/screenshots/rust-city.webp) Picture theme (pixel night city), sixel mode¹ |
-| ![ISS aurora picture, sixel](docs/screenshots/rust-iss.webp) Picture theme (ISS aurora), 172×40, sixel mode¹ | ![Synthwave picture, 4K](docs/screenshots/rust-picture-4k.webp) The same picture at 415×105 (4K): whole, the side margins continue it softly¹ |
+| ![Synthwave picture, sixel, 128x45](docs/screenshots/rust-picture-128x45.webp) Picture theme (synthwave sunset), 128×45 in Windows Terminal (sixel): the picture fills the window's 1280×900 pixels, cropped around the sun; highlights dimmed so every number reads¹ | ![Night city picture, sixel](docs/screenshots/rust-city.webp) Picture theme (pixel night city), sixel mode¹ |
+| ![ISS aurora picture, sixel](docs/screenshots/rust-iss.webp) Picture theme (ISS aurora), 172×40, sixel mode¹ | ![Synthwave picture, 4K](docs/screenshots/rust-picture-4k.webp) The same picture at 415×105 (4K), overview page: it fills the window at any shape¹ |
 | ![Theme menu](docs/screenshots/rust-menu.webp) Theme menu with live preview | ![Smooth](docs/screenshots/rust-smooth.webp) `smooth` speed, mid-animation |
 | ![120x30 Night Forest](docs/screenshots/rust-c120.webp) 120×30, Night Forest | ![80x24 compact](docs/screenshots/rust-compact.webp) 80×24 compact, Space |
 
@@ -479,24 +479,32 @@ A picture theme takes its palette from the picture (load and temperature colours
 meaning). The theme menu shows the credit of the bundled pictures (`wallpapers/CREDITS.md`: NASA
 public-domain photos and CC0 scenes).
 
-**The whole picture, at the window's resolution.** By default the picture is shown whole
-(`fit = contain`): a 16:9 picture in a 128×45 window (1280×900 px in Windows Terminal) is
-1280×720, and the margins above and below continue it with a soft, dimmed enlargement of
-the picture instead of black bars (side margins in wide windows). In sixel and kitty mode
-every cell without text shows real pixels, including the empty space inside the panels,
-the graph grid and the bars' tracks; panel frames and graph grid lines are drawn into the
-picture. Text cells can't hold pixels in sixel terminals (writing a character erases the
-picture in that cell), so they get the picture's colour there, darkened only as far as the
-text needs to stay readable (a label reads as one plate). In `blocks` mode, and for cells
-that change too often for a pixel patch, the picture is drawn with block glyphs: octants
-(2×4 per cell), sextants (2×3), quadrants or half blocks, whichever the terminal draws
-itself (`glyphs = auto`, see `--doctor`).
+**The picture fills the window, at the window's resolution.** By default the picture covers
+the whole window (`fit = cover`), cropped around its subject: each bundled wallpaper names its
+own (the synthwave sun and horizon, the earth over the moon, …), and for your own pictures
+cpuview finds what stands out (edges, contrast and colour, weighted to the middle) when the
+picture loads. `image.<file>.focus = x,y` sets it by hand; `fit = contain` shows the whole
+picture instead, with soft margins. In sixel and kitty mode every cell without text shows real
+pixels, including the empty space inside the panels, the graph grid and the bars' tracks;
+panel frames and graph grid lines are drawn into the picture. Text cells can't hold pixels in
+sixel terminals (writing a character erases the picture in that cell), so they get the
+picture's colour there. In `blocks` mode, and for cells that change too often for a pixel
+patch, the picture is drawn with block glyphs: octants (2×4 per cell), sextants (2×3),
+quadrants or half blocks, whichever the terminal draws itself (`glyphs = auto`, see `--doctor`).
+
+**Data stands out from the picture.** The light glass (the default) dims the picture's
+highlights — a soft knee caps its luminance at 7 % (a sun turns deep amber, a night sky stays
+as it is) — and every text colour is made at least 4.5:1 against that, every frame, bar and graph
+stroke 3:1 (WCAG AA), in the picture's own hues: labels, frames and graphs take the picture's
+accent colours, made light enough to read. Each cell is checked again against what is really
+behind it; text only ever gets lighter, never dark (dark text sinks into a picture).
+The built-in themes get the same guarantee against their own panels.
 
 | setting | values | |
 |---|---|---|
-| `glass = ` / `--glass` / `g` in the menu | `light` (default), `clear`, `frosted` | light: an even light veil; clear: the picture as it is; frosted: blurred, darker panels |
-| `image.<file>.fit = ` / `--fit` / `f` in the menu | `contain` (default), `cover` | the whole picture, or fill the window and crop |
-| `image.<file>.focus = x,y` | 0..1 each, e.g. `0.5,0.3` | what stays in view when cropping (`cover`), where the picture sits in the margins (`contain`) |
+| `glass = ` / `--glass` / `g` in the menu | `light` (default), `clear`, `frosted` | light: highlights dimmed so every colour reads (above); clear: the picture as it is (text gets plates where it must); frosted: blurred, darker panels |
+| `image.<file>.fit = ` / `--fit` / `f` in the menu | `cover` (default), `contain` | fill the window around the subject, or the whole picture with soft margins |
+| `image.<file>.focus = x,y` | 0..1 each, e.g. `0.5,0.3` | what stays in view when cropping (default: the wallpaper's own, or found in the picture); where the picture sits in the margins (`contain`) |
 | `glyphs = ` / `--glyphs` | `auto`, `octant`, `sextant`, `quadrant`, `half` | block glyphs for pictures drawn with characters |
 | `image.<file>.dim` / `.blur` | ←→ / `b` in the menu | brightness, blur |
 Pictures stay on disk; the binary embeds only the theme definitions (`themes/*.toml`, compiled in
@@ -629,6 +637,28 @@ Windows Terminal's replies, 60 s runs, load average 1.5–3.6 from other work):
 | eco, the build before (cropped, blurred, half blocks) | 67.3 · 89.4 µs/s | 54.1 · 115.6 µs/s | 73 · 302 µs/s |
 | RSS (eco, CPU view), before → now | 6.5 → 5.5 MB | 8.8 → 6.8 MB | 22.8 → 8.1 MB |
 | smooth, CPU view · overview | 4.2 · 3.8 ms/s, 73 · 14 KB/s | 4.4–4.7 · 4.8 ms/s, 67 · 36 KB/s | |
+
+**Pictures that fill the window, legible everywhere** (cover with a focus point, the light
+glass's highlight cap and the 4.5:1 / 3:1 palette; synthwave picture, sixel with Windows
+Terminal's replies, 60 s runs, load average 1.2–2.5 from other work):
+
+| | 128×45 | 209×51 | 415×105 |
+|---|---|---|---|
+| eco, CPU view · overview, picture | 56.8 · 66.4 µs/s | 57.0 · 65.7 µs/s | 54.8 · 71.5 µs/s |
+| eco, CPU view · overview, Midnight | 64.1 · 62.4 µs/s | 68.5 · 66.7 µs/s | 60.0 · 66.5 µs/s |
+| RSS, picture (CPU view) | 4.3 MB | 5.6 MB | 6.5 MB |
+| RSS, Midnight (CPU view · overview) | 3.0 · 3.3 MB | 3.3 · 3.3 MB | 4.1 · 3.7 MB |
+| smooth, picture, CPU view · overview | 4.4 · 4.6 ms/s, 95 · 26 KB/s | 4.8 · 4.7 ms/s, 88 · 36 KB/s | |
+
+Smooth frames stay on the 60 fps grid (p95 / median ≤ 1.04, ≤ 0.42 % off the grid), no blinks.
+The resident size dropped by about a megabyte everywhere: a few seconds after start (and after
+a page or theme change) cpuview drops its code pages from its resident set (`madvise`, they stay
+in the page cache and the ones in use come straight back), so start-up code — argument
+parsing, terminal probing, picture decoding — no longer counts for as long as it runs.
+Contrast, measured cell by cell on the captures against what is really behind each one (the
+cell's colour, or the picture's pixels around a frame or bar drawn into it): text ≥ 4.5:1 in
+100 % of cells, frames, bars and graph strokes ≥ 3:1 in ≥ 99.5 % (the build before: 63–69 % and
+10–21 %).
 
 NASA ISS photo, eco CPU view: 57.0 (128×45) · 56.5 (172×40) · 77.9 (209×51) · 47.1 µs/s (415×105).
 Smooth frames stay on the 60 fps grid (p95 / median ≤ 1.04, ≤ 0.6 % off the grid). The picture

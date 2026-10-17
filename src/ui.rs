@@ -1556,7 +1556,7 @@ impl App {
     /// Width of the sensors panel's meters.
     fn sensors_bw(&self) -> usize {
         let w = self.lay.sensors.inner().w;
-        let tsw = if w >= 32 { 8 } else { 0 };
+        let tsw = if w >= 32 { 9 } else { 0 };
         w.saturating_sub(13 + if tsw > 0 { tsw + 2 } else { 0 })
             .max(4)
     }
@@ -1618,6 +1618,13 @@ impl App {
         let brand = (" ◆ cpuview ", t.bg | BOLD);
         let spd = f!(" {}", SPEEDS[self.speed].0);
         let state_live: [(&str, u32); 3] = [("● ", t.good), ("live", t.mid), (spd.s(), t.dim)];
+        // (where there is room, say what the speed means: eco is the low-power default)
+        let spd_long = match SPEEDS[self.speed] {
+            (_, 0) => f!(" · eco: every 1–2 s"),
+            _ if self.speed == SMOOTH => f!(" · smooth: 60 fps"),
+            (_, n) => f!(" · {n} updates/s"),
+        };
+        let state_long: [(&str, u32); 3] = [("● ", t.good), ("live", t.mid), (spd_long.s(), t.dim)];
         let drv_sp = if s.driver.is_empty() {
             ("", 0)
         } else {
@@ -1719,16 +1726,22 @@ impl App {
                 (&[], true),
             ]
         };
-        let state_len = if self.paused {
-            8
-        } else {
-            Self::spans_len(&state_live)
-        };
-        for (i, &(left, short_tail)) in lefts.iter().enumerate() {
+        let n = lefts.len();
+        // saying what the speed means is worth one level of detail on the left
+        let mut order: Vec<(usize, bool)> = vec![(0, true), (1, true), (0, false), (1, false)];
+        order.extend((2..n).flat_map(|i| [(i, true), (i, false)]));
+        for (k, &(i, long)) in order.iter().enumerate() {
+            let (left, short_tail) = lefts[i];
+            let state: &[(&str, u32)] = if long { &state_long } else { &state_live };
+            let state_len = if self.paused {
+                8
+            } else {
+                Self::spans_len(state)
+            };
             let tl: &[(&str, u32)] = if short_tail { &tail_short } else { &tail };
             let ll = 11 + Self::spans_len(left);
             let rl = state_len + Self::spans_len(tl);
-            if ll + rl + 2 <= w || i == lefts.len() - 1 {
+            if ll + rl + 2 <= w || k == order.len() - 1 {
                 self.title_short.set(short_tail);
                 let mut x = scr.text(0, 0, brand.0, brand.1, t.accent, w);
                 x = Self::spans(scr, x, 0, w, bar, left);
@@ -1740,7 +1753,7 @@ impl App {
                 let rx = if self.paused {
                     scr.text(rx0, 0, " PAUSED ", t.bg | BOLD, t.crit, w)
                 } else {
-                    Self::spans(scr, rx0, 0, w, bar, &state_live)
+                    Self::spans(scr, rx0, 0, w, bar, state)
                 };
                 Self::line(scr, rx, 0, w, bar, tl);
                 break;
@@ -1826,13 +1839,18 @@ impl App {
                     } else {
                         col
                     };
-                    scr.put(
-                        x0 + i,
-                        y0 + r,
-                        char::from_u32(0x2800 + code).unwrap(),
-                        c,
-                        bg,
-                    );
+                    // the fill under the curve is solid (a full block in the soft
+                    // colour: braille ⣿ would read as a hatched texture); the edge
+                    // keeps braille's two columns of resolution
+                    // (a full cell is a block whether the curve's edge or its fill: a
+                    // value wavering at a cell boundary changes the colour, never the
+                    // glyph)
+                    let g = if code == 0xff && mine {
+                        '█'
+                    } else {
+                        char::from_u32(0x2800 + code).unwrap()
+                    };
+                    scr.put(x0 + i, y0 + r, g, c, bg);
                 } else if let (Some(k), true) = (grid_bit, i % 2 == 0) {
                     scr.put(
                         x0 + i,
@@ -1983,7 +2001,7 @@ impl App {
             &vals,
             1.0,
             &self.t.load,
-            &[(1.0, "100%"), (0.5, "50"), (0.0, "0")],
+            &[(1.0, "100%"), (0.5, "50%"), (0.0, "0%")],
         );
         self.vals = vals;
     }
@@ -2024,8 +2042,8 @@ impl App {
             self.time_axis(
                 scr,
                 r,
-                ir.x + 5,
-                ir.w.saturating_sub(5),
+                ir.x + 6,
+                ir.w.saturating_sub(6),
                 2.0,
                 "average clock over time",
             );
@@ -2047,7 +2065,7 @@ impl App {
             &vals,
             maxf,
             &self.t.freq,
-            &[(1.0, m1.s()), (0.5, m2.s()), (0.0, "0")],
+            &[(1.0, m1.s()), (0.5, m2.s()), (0.0, "0 GHz")],
         );
         self.vals = vals;
     }
@@ -2130,7 +2148,7 @@ impl App {
         let bg = surf(S_PANEL);
         let s = &self.s;
         // wide enough: bar + value + a history strip (4 s per cell) per sensor
-        let tsw = if ir.w >= 32 { 8 } else { 0 };
+        let tsw = if ir.w >= 32 { 9 } else { 0 };
         let bw = self.sensors_bw();
         let nt = s.temps.len().max(1);
         let skip_blank = nt + 5 > ir.h;
@@ -2182,7 +2200,7 @@ impl App {
             if tsw > 0 {
                 // the hottest reading in the history window, after the value
                 let mx = sn.max.max(val);
-                let m = num("", mx, 0, "°");
+                let m = num("", mx, 0, "°C");
                 let fm = ((mx - 30.0) / 65.0).clamp(0.0, 1.0);
                 Self::line(
                     scr,
@@ -3263,7 +3281,11 @@ impl App {
                 // quantised so a steady load gives identical neighbours (no repaint)
                 Some(v) if v >= 0.03 => {
                     let q = (v * 16.0).round() / 16.0;
-                    crate::color::mix(track, th.temp.at(q), 0.45 + 0.55 * q.min(1.0))
+                    // (light loads stay close to the track: the palette's colours are
+                    // made bright enough for text, a heat map needs its low end quiet)
+                    // (picture themes: in the picture's own colours, low to high)
+                    let ramp = if picture { &th.freq } else { &th.temp };
+                    crate::color::mix(track, ramp.at(q), 0.3 + 0.7 * q.min(1.0))
                 }
                 Some(_) => track,
                 None => crate::color::mix(track, th.panel, 0.6),
@@ -3788,7 +3810,8 @@ impl App {
         let keys: &[(char, &str, Option<&str>, &str)] = match self.page {
             PG_OVERVIEW => &ov_keys,
             PG_MEM => &mem_keys,
-            PG_NET | PG_SENS => &mem_keys[..3],
+            // (every page offers the theme: it applies to all of them)
+            PG_NET | PG_SENS => &ov_keys[..4],
             PG_PROC => &proc_keys,
             _ => &cpu_keys,
         };
@@ -3808,24 +3831,29 @@ impl App {
             }
         };
         let w = w.saturating_sub(tx);
-        // variants, most detailed first: (desc 0 long / 1 short / 2 none, pad, sep, theme name)
-        for (dv, pad, sep, tn) in [
-            (0, true, 2, true),
-            (1, true, 2, true),
-            (1, true, 1, true),
-            (1, false, 1, true),
-            (1, false, 1, false),
-            (2, false, 1, false),
-        ] {
+        // keys a narrow footer leaves out (last first) rather than lose every label:
+        // all but quit, pause, speed and theme
+        let droppable = |k: char| !matches!(k, 'q' | ' ' | 's' | 't');
+        let nd = keys.iter().filter(|kk| droppable(kk.0)).count();
+        let shown = |i: usize, drop: usize| {
+            let k = keys[i].0;
+            !droppable(k) || keys[i + 1..].iter().filter(|kk| droppable(kk.0)).count() >= drop
+        };
+        // variants, most detailed first: (desc 0 long / 1 short / 2 none, pad, sep,
+        // theme name, keys dropped)
+        let mut variants = vec![(0, true, 2, true, 0), (1, true, 2, true, 0), (1, true, 1, true, 0)];
+        variants.extend((1..=nd).map(|d| (1, true, 1, true, d)));
+        variants.extend([(1, false, 1, true, nd), (1, false, 1, false, nd), (2, false, 1, false, 0)]);
+        for (dv, pad, sep, tn, drop) in variants {
             let st = |k: char| if k == 't' && !tn { "" } else { state(k) };
             let mut len = 0;
-            for &(k, long, short, lab) in keys {
+            for (i, &(k, long, short, lab)) in keys.iter().enumerate() {
                 let d = match dv {
                     0 => long,
                     1 => short.unwrap_or(""),
                     _ => "",
                 };
-                if dv > 0 && short.is_none() {
+                if dv > 0 && short.is_none() || !shown(i, drop) {
                     continue;
                 }
                 len += lab.chars().count() + if pad { 2 } else { 0 };
@@ -3844,13 +3872,13 @@ impl App {
             self.zones.truncate(ntab);
             let w = w + tx;
             let mut x = tx;
-            for &(k, long, short, lab) in keys {
+            for (i, &(k, long, short, lab)) in keys.iter().enumerate() {
                 let d = match dv {
                     0 => long,
                     1 => short.unwrap_or(""),
                     _ => "",
                 };
-                if dv > 0 && short.is_none() {
+                if dv > 0 && short.is_none() || !shown(i, drop) {
                     continue;
                 }
                 let x0 = x;

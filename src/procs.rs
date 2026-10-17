@@ -233,6 +233,65 @@ fn clean(b: &[u8], max: usize, out: &mut String) {
     }
 }
 
+/// Hide secrets in a command line (from `at` on): the value after a flag like
+/// `--authtoken`, `--token`, `--password`, `--secret`, `--api-key` (or in `--flag=value`),
+/// of `NAME_TOKEN=` / `_KEY=` / `PASSWORD=` / `SECRET=` assignments, and the password in
+/// `scheme://user:password@host` — shown as `••••`. A screen (or a screenshot of it) must
+/// not hand out credentials.
+pub fn mask_secrets(s: &mut String, at: usize) {
+    const DOTS: &str = "••••";
+    let secret = |k: &str| {
+        let k = k.trim_start_matches('-').to_ascii_lowercase().replace('_', "-");
+        k.ends_with("token")
+            || k.ends_with("password")
+            || k.ends_with("passwd")
+            || k.ends_with("secret")
+            || k.ends_with("api-key")
+            || k.ends_with("apikey")
+            || k.ends_with("access-key")
+            || k.ends_with("private-key")
+            || k == "pass"
+            || k.ends_with("-key") && !k.starts_with("key")
+    };
+    let Some(tail) = s.get(at..) else { return };
+    if !tail.contains(['=', ':', '-']) {
+        return;
+    }
+    let mut out = String::with_capacity(tail.len());
+    let mut hide_next = false;
+    for (i, w) in tail.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if hide_next && !w.is_empty() {
+            out.push_str(DOTS);
+            hide_next = false;
+            continue;
+        }
+        if let Some((k, v)) = w.split_once('=').filter(|(k, v)| !v.is_empty() && secret(k)) {
+            let _ = v;
+            out.push_str(k);
+            out.push('=');
+            out.push_str(DOTS);
+        } else if let (Some(p), Some(a)) = (w.find("://"), w.find('@')) {
+            // scheme://user:password@host
+            match w[p + 3..a.max(p + 3)].find(':') {
+                Some(c) if a > p + 3 => {
+                    out.push_str(&w[..p + 3 + c + 1]);
+                    out.push_str(DOTS);
+                    out.push_str(&w[a..]);
+                }
+                _ => out.push_str(w),
+            }
+        } else {
+            out.push_str(w);
+            hide_next = w.starts_with('-') && secret(w);
+        }
+    }
+    s.truncate(at);
+    s.push_str(&out);
+}
+
 /// The cgroup path of a process (/proc/<pid>/cgroup): the v2 entry, else the v1
 /// systemd (or first) hierarchy.
 pub fn parse_cgroup(b: &[u8]) -> String {
@@ -615,7 +674,9 @@ impl Procs {
         s.push('\0');
         if whole {
             // (the overview, `statm` off, shows names only)
+            let at = s.len();
             clean(c, CMD_MAX + s.len(), &mut s);
+            mask_secrets(&mut s, at);
         }
         // (the offset counts bytes of the raw command line: right while it's ASCII)
         let aoff = if c.get(..aoff).is_some_and(|a| a.is_ascii()) {
@@ -1022,6 +1083,7 @@ impl Procs {
         };
         if let Some(c) = self.read_file(pid, "cmdline") {
             clean(c, 4096, &mut d.cmd);
+            mask_secrets(&mut d.cmd, 0);
         }
         let mut p = [0u8; 48];
         path(pid, "cwd", &mut p);
@@ -1337,5 +1399,18 @@ mod tests {
         // a wrong start time is never signalled
         assert_eq!(p.signal(me, start + 1, 0), Err(libc::ESRCH));
         assert_eq!(p.signal(me, start, 0), Ok(()));
+    }
+
+    #[test]
+    fn secrets_are_masked() {
+        let mut c = String::from("ngrok http 80 --authtoken 2abcSECRET --log stdout");
+        mask_secrets(&mut c, 0);
+        assert_eq!(c, "ngrok http 80 --authtoken •••• --log stdout");
+        let mut c = String::from("app --password=hunter2 API_KEY=xyz psql postgres://bob:pw@db/x --keyboard us");
+        mask_secrets(&mut c, 0);
+        assert_eq!(c, "app --password=•••• API_KEY=•••• psql postgres://bob:••••@db/x --keyboard us");
+        let mut c = String::from("node server.js --port 3000");
+        mask_secrets(&mut c, 0);
+        assert_eq!(c, "node server.js --port 3000");
     }
 }

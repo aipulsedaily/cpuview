@@ -755,7 +755,7 @@ fn overview_alerts() {
         let k = a.z.rd.iter().position(|r| r.raw == "SYSTIN").unwrap();
         a.z.rd[k].val = 96.0;
     });
-    assert!(t.lines().nth(1).unwrap().contains("motherboard hot: 96 °C"), "{t}");
+    assert!(t.lines().nth(1).unwrap().contains("motherboard warm: 96 °C"), "{t}");
     // (the SSD and the RAM sticks come from the memory page's helper thread, not read here)
     let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), 128, 45, &|a| {
         let k = a.z.rd.iter().position(|r| r.raw == "Composite").unwrap();

@@ -209,17 +209,25 @@ So, per frame:
    picture is quantised to 190 colours; 255 = unset); a cell whose colour finds no free entry is
    written as text instead. Anti-aliased bar ends (blends) stay text.
 4. **Text cells**: background = the picture's average there, through the same veil as the
-   blank cells. Where the text doesn't read on it, the light and clear veils change the text,
-   not the background: darker text on a bright area, lighter text on a darker one (same hue),
-   judged on the picture ±3 cells around, so a word changes together. Only if that can't reach
-   the contrast does the cell get a darker plate (the built-in themes always use plates), and
-   a single blank between two plated words takes the plate, so a label reads as one.
+   blank cells. The light glass first dims the picture (`image::tone`: luminance through a soft
+   knee `L / (1 + (L/0.07)³)^⅓`, colour kept, +15 % saturation, yellows leaning away from
+   olive), and the palette is made 4.5:1 (text) / 3:1 (frames, bars) against a grey at that
+   cap (`theme::guarantee`), so the colours read everywhere as designed. The compositor still
+   checks every cell against what is behind it (`color::lighten_to`: lighter in eighths, same
+   hue, never darker; inks in patches too), judged for text on the picture ±3 cells around as
+   well, so a word changes together. Only where even white can't reach 4.5:1 (clear glass on a
+   bright picture) does the cell get a darker plate, and a single blank between two plated
+   words takes the plate, so a label reads as one.
 5. The hi-res picture is stored at the screen's pixel size, but no larger than the picture
    itself (a 1080p picture in a 4K window is kept at 1080p and scaled up per patch).
 
-Fit: `contain` (default) shows the whole picture; the margins are a cover-crop of the picture at
-1/24 scale, blurred and dimmed to 70 %, enlarged, with the picture's edges feathered over 3 %
-of its short side. `cover` crops around `image.<file>.focus`.
+Fit: `cover` (default) fills the window, cropping around the focus: `image.<file>.focus` if
+set, else the bundled wallpaper's (`wallpapers/credits.toml` `focus = [x, y]`), else
+`image::auto_focus` (once at load: on a 48-px-wide copy, the centroid of edge energy +
+contrast with the mean + colourfulness, squared, times a centre prior of σ 0.3, pulled a
+quarter back to the middle). `contain` shows the whole picture; the margins are a cover-crop
+of the picture at 1/24 scale, blurred and dimmed to 70 %, enlarged, with the picture's edges
+feathered over 3 % of its short side.
 
 **tmux** removes an image when text overwrites it, so inside tmux the full repaint sends
 patches per run of blank cells instead of one picture.

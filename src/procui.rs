@@ -2240,15 +2240,28 @@ impl App {
             let n = self.s.f.len().max(1) as f32;
             cpu.iter_mut().for_each(|c| *c /= n);
         }
-        let cmax = cpu.iter().copied().fold(0.0, f32::max);
+        let secs = nf("   last ", pts.min(procs::HN) as u32, " s … now");
+        // (nothing followed yet — just selected, or not one of the followed: say so
+        // rather than show a 0 the table contradicts)
+        let wait = have == 0;
+        // the headline numbers are the table's (a group: all its members; the chart
+        // follows up to 24 of them)
+        let div = if self.pv.total { self.s.f.len().max(1) as f32 } else { 1.0 };
+        let (now_c, now_m) = match agg {
+            Some(a) => (a.cpu * 100.0 / div, a.rss as f32),
+            None => (cpu[pts - 1], mem[pts - 1]),
+        };
+        let wait = wait && agg.is_none();
+        // (the scales hold the headline numbers too)
+        let cmax = cpu.iter().copied().fold(now_c, f32::max);
         let cscale = if self.pv.total {
             100.0
         } else {
             (cmax / 100.0).ceil().max(1.0) * 100.0
         };
-        let mmax = mem.iter().copied().fold(1.0, f32::max);
+        let mmax = mem.iter().copied().fold(now_m.max(1.0), f32::max);
         let mscale = nice_bytes(mmax);
-        let secs = nf("   last ", pts.min(procs::HN) as u32, " s … now");
+        let secs = if wait { fc(&["   collecting…"]) } else { secs };
         #[allow(clippy::type_complexity)]
         let charts: [(&[f32], &str, F, f32, F, &crate::color::Ramp); 2] = [
             (
@@ -2258,7 +2271,7 @@ impl App {
                 } else {
                     "CPU % of 1 CPU"
                 },
-                cpct(cpu[pts - 1]),
+                if wait { F::new() } else { cpct(now_c) },
                 cscale,
                 cpct(cscale),
                 &t.load,
@@ -2266,7 +2279,7 @@ impl App {
             (
                 mem,
                 "memory",
-                bsize(mem[pts - 1], false),
+                if wait { F::new() } else { bsize(now_m, false) },
                 mscale,
                 bsize(mscale, false),
                 &t.freq,

@@ -165,6 +165,10 @@ pub struct Theme {
     pub glass: Glass,
     /// Image themes: fit and focus of the picture.
     pub place: crate::image::Place,
+    /// Image themes (light glass): the picture's luminance is compressed to at most
+    /// this (soft knee), so the palette, made legible against it, reads everywhere.
+    /// 0: the picture as it is.
+    pub cap: f32,
 }
 
 impl Theme {
@@ -245,7 +249,7 @@ pub fn load(name: &str) -> Option<Theme> {
         }
     }
     let freq = ramp_of(pal, "freq", &["#3d59a1", "#7aa2f7", "#bb9af7", "#ff7ac6"]);
-    Some(Theme {
+    let mut t = Theme {
         id: name.to_string(),
         label: t.s("label").unwrap_or(name).to_string(),
         desc: t.s("description").unwrap_or("").to_string(),
@@ -282,13 +286,74 @@ pub fn load(name: &str) -> Option<Theme> {
         soft_blur: 0.0,
         glass: Glass::Frosted,
         place: crate::image::Place::default(),
-    })
+        cap: 0.0,
+    };
+    let bg = lightest_surface(&t);
+    guarantee(&mut t, bg);
+    Some(t)
 }
 
 /// Recompute derived colours after palette edits (image themes).
 pub fn refresh_derived(t: &mut Theme) {
     t.freq_idle = t.freq.shade(t.panel, 0.5);
     t.load_one = t.load.shade(t.panel, 0.45);
+}
+
+/// Make every colour of the palette legible on `bg` (the lightest surface text and
+/// marks are drawn on): text colours — the ramps too, they colour numbers — get 4.5:1,
+/// frames and the bars' one-thread shade 3:1. Colours only get lighter, in the same hue.
+/// (The compositor checks each cell against what is really behind it as well.)
+pub fn guarantee(t: &mut Theme, bg: Rgb) {
+    use crate::color::{lighten_to, MARK_MIN, TEXT_MIN};
+    for c in [
+        &mut t.title,
+        &mut t.accent,
+        &mut t.accent2,
+        &mut t.fg,
+        &mut t.text,
+        &mut t.mid,
+        &mut t.dim,
+        &mut t.good,
+        &mut t.warn,
+        &mut t.crit,
+    ] {
+        *c = lighten_to(*c, bg, TEXT_MIN);
+    }
+    for c in [&mut t.border, &mut t.border_hi] {
+        *c = lighten_to(*c, bg, MARK_MIN);
+    }
+    refresh_derived(t);
+    for (r, min) in [
+        (&mut t.freq, TEXT_MIN),
+        (&mut t.load, TEXT_MIN),
+        (&mut t.temp, TEXT_MIN),
+        (&mut t.freq_idle, TEXT_MIN),
+        (&mut t.load_one, MARK_MIN),
+    ] {
+        for c in r.0.iter_mut() {
+            *c = lighten_to(*c, bg, min);
+        }
+    }
+}
+
+/// The lightest of a theme's own surfaces (what `guarantee` measures against).
+pub fn lightest_surface(t: &Theme) -> Rgb {
+    let mut best = t.bg;
+    for c in [t.panel, t.bar, t.select, t.chip] {
+        if crate::color::lum(c) > crate::color::lum(best) {
+            best = c;
+        }
+    }
+    best
+}
+
+/// A bundled wallpaper's focus point (credits.toml `focus = [x, y]`): what stays in
+/// view when it is cropped to fill the window.
+pub fn wallpaper_focus(file: &str) -> Option<(f32, f32)> {
+    match CREDITS.get(file)?.arr("focus") {
+        [x, y] => Some((x.as_n() as f32, y.as_n() as f32)),
+        _ => None,
+    }
 }
 
 /// Credit line for a bundled wallpaper file name.
@@ -318,5 +383,10 @@ mod tests {
             credit("nasa-iss-aurora.jpg").unwrap().1,
             "NASA / ISS Expedition 23 crew · public domain"
         );
+        // every bundled wallpaper names what to keep when cropped
+        for f in ["lofi-synthwave.jpg", "nasa-apollo8-earthrise.jpg", "lofi-night-city.png"] {
+            let (x, y) = wallpaper_focus(f).unwrap();
+            assert!((0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y), "{f}");
+        }
     }
 }

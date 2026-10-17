@@ -50,6 +50,31 @@ fn lin_table() -> &'static [f32; 256] {
     })
 }
 
+/// Linear-light value of an sRGB byte.
+#[inline]
+pub fn lin8(v: u8) -> f32 {
+    lin_table()[v as usize]
+}
+
+/// The sRGB byte nearest to a linear-light value (the table's inverse).
+pub fn enc8(v: f32) -> u8 {
+    let t = lin_table();
+    let (mut lo, mut hi) = (0usize, 255usize);
+    while lo < hi {
+        let m = (lo + hi).div_ceil(2);
+        if t[m] <= v {
+            lo = m;
+        } else {
+            hi = m - 1;
+        }
+    }
+    if lo < 255 && (t[lo + 1] - v) < (v - t[lo]) {
+        lo as u8 + 1
+    } else {
+        lo as u8
+    }
+}
+
 /// `mix` in linear light: an anti-aliased edge covering `t` of a cell emits `t` of
 /// the colour's light, so a bar end moves at an even perceived speed across a cell.
 pub fn mix_lin(a: Rgb, b: Rgb, t: f32) -> Rgb {
@@ -78,6 +103,32 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
     let (la, lb) = (lum(a), lum(b));
     let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
     (hi + 0.05) / (lo + 0.05)
+}
+
+/// Minimum contrast of text (letters, digits) and of non-text marks (frames, bars,
+/// graph strokes) against what is right behind them: WCAG AA (1.4.3 / 1.4.11).
+pub const TEXT_MIN: f32 = 4.5;
+pub const MARK_MIN: f32 = 3.0;
+
+/// `fg` lightened (mixed towards white in eighths, so the hue stays and only a few
+/// variants of a colour ever exist) until it has `target` contrast with `bg`. The
+/// first eighth that does it; white if none does (the caller may then need a plate).
+pub fn lighten_to(fg: Rgb, bg: Rgb, target: f32) -> Rgb {
+    let lb = lum(bg) + 0.05;
+    let ok = |c: Rgb| {
+        let l = lum(c) + 0.05;
+        l.max(lb) / l.min(lb) >= target && l >= lb
+    };
+    if contrast(fg, bg) >= target {
+        return fg;
+    }
+    for k in 1..=8 {
+        let c = mix(fg, 0xffffff, k as f32 / 8.0);
+        if ok(c) {
+            return c;
+        }
+    }
+    0xffffff
 }
 
 /// A gradient sampled into 65 steps (like the Python version's `ramp`).
@@ -233,6 +284,31 @@ pub fn to_256(c: Rgb, x: usize, y: usize) -> u8 {
     }
 }
 
+/// The colour of an xterm-256 index from `to_256` (cube or grey ramp).
+pub fn from_256(i: u8) -> Rgb {
+    if i >= 232 {
+        let v = 8 + 10 * (i - 232);
+        rgb(v, v, v)
+    } else {
+        let k = i.saturating_sub(16);
+        rgb(LV[(k / 36) as usize % 6], LV[(k / 6 % 6) as usize], LV[(k % 6) as usize])
+    }
+}
+
+/// `fg` for a 256-colour terminal: lighter where rounding both colours to the palette
+/// would cost the contrast (`target`) they have.
+pub fn keep_256(fg: Rgb, bg: Rgb, target: f32) -> Rgb {
+    let b = from_256(to_256(bg, 0, 0));
+    let mut f = fg;
+    for _ in 0..6 {
+        if contrast(from_256(to_256(f, 0, 0)), b) >= target {
+            break;
+        }
+        f = mix(f, 0xffffff, 0.2);
+    }
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +319,22 @@ mod tests {
         assert_eq!(r.at(0.0), 0);
         assert_eq!(r.at(1.0), 0xffffff);
         assert_eq!(to_256(0xff0000, 1, 1), 196);
+        assert_eq!(from_256(196), 0xff0000);
+        assert_eq!(from_256(to_256(0x808080, 0, 0)), 0x808080);
+        // a dim label on a dark panel keeps 4.5:1 after both are rounded to the palette
+        let f = keep_256(0x7d86ad, 0x1d2235, TEXT_MIN);
+        assert!(contrast(from_256(to_256(f, 0, 0)), from_256(to_256(0x1d2235, 0, 0))) >= TEXT_MIN);
+        // a dim label on a dark panel: lightened just enough, same hue family
+        let d = lighten_to(0x525a7c, 0x0e121b, TEXT_MIN);
+        assert!(contrast(d, 0x0e121b) >= TEXT_MIN && contrast(d, 0x0e121b) < 6.0, "{d:06x}");
+        for v in [0u8, 1, 10, 100, 200, 255] {
+            assert_eq!(enc8(lin8(v)), v);
+        }
+        let [r, g, b] = ch(d);
+        assert!(b > r && b > g);
+        // already fine: unchanged; impossible: white
+        assert_eq!(lighten_to(0xd6dcf5, 0x0a0d14, TEXT_MIN), 0xd6dcf5);
+        assert_eq!(lighten_to(0x808080, 0xc0c0c0, TEXT_MIN), 0xffffff);
         let h = rgb_to_hsv([0.2, 0.4, 0.8]);
         let b = hsv_to_rgb(h);
         assert!((b[0] - 0.2).abs() < 1e-5 && (b[2] - 0.8).abs() < 1e-5);

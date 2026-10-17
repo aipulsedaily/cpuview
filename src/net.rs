@@ -1281,7 +1281,11 @@ impl Net {
             self.last[j] = now - j as i64 * SEC / 3;
         }
         self.read_dev(now);
-        // CPU % needs a second reading: soon
+        // (the containers were found by the walk, after their job ran: read them now,
+        // so they are listed at once; their CPU % needs a second reading: soon)
+        if !self.ctrs.is_empty() {
+            self.read_ctrs(now);
+        }
         self.last[J_CTRS] = now - 8 * SEC;
         self.last[J_SVCS] = now - 28 * SEC;
         while self.scan.is_some() {
@@ -1319,16 +1323,14 @@ impl Net {
         // for sockets' owners before them), so no sample costs much; at other speeds
         // the cheap ones whenever due, and one other
         let (nc, ns) = (self.ctrs.len() as i64, self.svcs.len() as i64);
-        if self.scan.is_some() {
+        let scanning = self.scan.is_some();
+        if scanning {
             self.scan_step(24);
             if self.scan.is_none() {
                 self.resolve_owners();
             }
-            if eco {
-                return;
-            }
         }
-        let mut best = None;
+        let mut best: Option<(usize, i64, i64)> = None;
         for (j, p) in PERIOD.iter().enumerate() {
             let p = (if eco { p.0 } else { p.1 }) * 1_000_000;
             let p = match j {
@@ -1345,11 +1347,17 @@ impl Net {
             if !eco && j <= J_SVCS {
                 self.last[j] = now;
                 self.job(j, now);
-            } else if best.is_none_or(|(_, l)| late > l) {
-                best = Some((j, late));
+            } else if best.is_none_or(|(_, l, _)| late > l) {
+                best = Some((j, late, p));
             }
         }
-        if let Some((j, _)) = best {
+        if let Some((j, late, p)) = best {
+            // eco: a socket scan (many connections: it can take minutes of steps)
+            // has the sample, unless a job is a whole period late — the containers'
+            // numbers must not wait for it
+            if eco && scanning && late < p {
+                return;
+            }
             self.last[j] = now;
             self.job(j, now);
         }
@@ -1890,6 +1898,9 @@ impl Net {
         self.cread += 1;
         let stat = if self.cread % 2 == 1 { 2 } else { 0 };
         for c in &mut self.ctrs {
+            // (a container not shown yet reads its memory at once: it is listed only
+            // with both numbers)
+            let stat = if c.ok { stat } else { 2 };
             if let Some((us, m)) = cg_read(v2, &c.fd, stat) {
                 c.cpu = cpu_pct(c.prev, now, us);
                 c.prev = (now, us);

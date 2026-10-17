@@ -6,7 +6,7 @@
 //! the terminal shows, so a typical live frame touches a few hundred cells and writes a
 //! few hundred bytes in a single write(). Unchanged frames write nothing.
 
-use crate::color::{ch, contrast, lum, mix, mix_lin, rgb, to_256, Rgb};
+use crate::color::{ch, contrast, keep_256, lighten_to, lum, mix, mix_lin, rgb, to_256, Rgb, MARK_MIN, TEXT_MIN};
 use crate::gfx;
 use crate::image::Indexed;
 use crate::mosaic::{Glyphs, Mos};
@@ -263,69 +263,62 @@ impl Comp {
     }
 
     /// Text over the backdrop: (fg, bg, plate). The cell shows the picture's colour
-    /// through the glass; where the text doesn't read on it, the light and clear veils
-    /// change the text instead (darker on a bright picture, lighter on a darker one,
-    /// same hue), so no dark plate breaks up the picture; failing that (and in the
-    /// built-in looks) the glass thickens until the text reads (`plate`: it had to).
-    fn guarded(
-        &self,
-        fg: Rgb,
-        px: Rgb,
-        s: &SurfF,
-        mut a: f32,
-        cap: f32,
-        wide: Rgb,
-    ) -> (Rgb, Rgb, bool) {
-        // adaptive (panel) glass is already dark where the backdrop is bright: ask less of
-        // the guard there, so dim labels do not get dark plates of their own
-        let keep = if s.adapt { 0.75 } else { 0.9 };
-        let target = self.min_c.min(cap).min(contrast(fg, s.tint_rgb) * keep);
+    /// through the glass, and the text keeps its colour where that reads (4.5:1); where
+    /// it doesn't, the text gets lighter (same hue, in eighths) — decided on the
+    /// picture around the cell too (`wide`, ±3 cells of the row: the lighter of the
+    /// two), so the letters of a word change together. Text never turns dark: dark text
+    /// takes on the picture's look and sinks into it. Only where even white can't
+    /// read (a bright picture without the light glass's cap) the glass thickens
+    /// behind it (`plate`).
+    fn guarded(&self, fg: Rgb, px: Rgb, s: &SurfF, mut a: f32, wide: Rgb) -> (Rgb, Rgb, bool) {
+        let target = self.min_c;
         let mut bg = self.glass(px, s, a);
-        if self.glass != Glass::Frosted {
-            // the light / clear veils: decided on the picture around the cell (`wide`,
-            // ±3 cells of the row), so the letters of a word change together: on a
-            // bright area the text goes dark, on a darker one a dim label goes lighter
-            let wbg = self.glass(wide, s, a);
-            let fix = |bg: Rgb, dark: bool| -> Option<Rgb> {
-                let first = if dark { 0 } else { 0xffffff };
-                for to in [first, 0xffffff ^ first] {
-                    for k in 2..10 {
-                        let d = mix(fg, to, k as f32 / 10.0);
-                        if contrast(d, bg) >= target {
-                            return Some(d);
-                        }
-                    }
-                }
-                None
-            };
-            let near_ok = contrast(fg, wbg) >= target;
-            if !near_ok {
-                if let Some(d) = fix(wbg, lum(wbg) >= 0.2) {
-                    if contrast(d, bg) >= target * 0.8 {
-                        return (d, bg, false);
-                    }
-                }
-            } else if contrast(fg, bg) >= target {
-                return (fg, bg, false);
-            }
-            // (where the neighbours keep the text's colour, push this cell's text the
-            // same way: light text gets lighter, not dark)
-            let dark = if near_ok {
-                lum(fg) < lum(bg)
+        let near = if self.glass != Glass::Frosted {
+            let w = self.glass(wide, s, a);
+            if lum(w) > lum(bg) {
+                w
             } else {
-                lum(wbg) >= 0.2
-            };
-            if let Some(d) = fix(bg, dark) {
-                return (d, bg, false);
+                bg
             }
-        } else if contrast(fg, bg) >= target {
-            return (fg, bg, false);
+        } else {
+            bg
+        };
+        let f = lighten_to(fg, near, target);
+        if contrast(f, bg) >= target {
+            return (f, bg, false);
         }
-        while a < 1.0 && contrast(fg, bg) < target {
+        while a < 1.0 && contrast(f, bg) < target {
             a = (a + 0.1).min(1.0);
             bg = self.glass(px, s, a);
         }
-        (fg, bg, true)
+        (f, bg, true)
+    }
+
+    /// A mark (frame, graph dot, bar) over the picture: lightened to 3:1 against it.
+    #[inline]
+    fn mark(&self, fg: Rgb, bg: Rgb) -> Rgb {
+        lighten_to(fg, bg, MARK_MIN)
+    }
+
+    /// The ink colour of cell `c` drawn into a pixel patch: a bar's track as it is
+    /// (decoration), anything else made 3:1 against the picture behind the cell.
+    pub fn ink(&self, c: Cell, x: usize, y: usize, bd: &Backdrop) -> Rgb {
+        if c.fg & TRACK != 0 {
+            return self.track_ink;
+        }
+        let fg = c.fg & 0xFF_FFFF;
+        if c.fg & BLEND != 0 || x >= bd.w || y >= bd.h {
+            return fg;
+        }
+        let sid = (c.bg >> 24) as u8;
+        let s = &self.s[sid as usize & 7];
+        let cv = match (&bd.soft, soft_surface(sid)) {
+            (Some(v), true) => v,
+            _ => &bd.sharp,
+        };
+        let p = cv[y * bd.w + x];
+        let px = mix(rgb(p[0], p[1], p[2]), rgb(p[3], p[4], p[5]), 0.5);
+        self.mark(fg, self.glass(px, s, s.a))
     }
 
     /// Composite one logical cell. `nb_blank`: both horizontal neighbours are blank
@@ -347,7 +340,22 @@ impl Comp {
                 let fg = if c.fg & TRACK != 0 {
                     self.track_solid
                 } else if c.fg & BLEND != 0 {
-                    mix_lin(self.track_solid, fg_rgb, blend_k(c.fg))
+                    let m = mix_lin(self.track_solid, fg_rgb, blend_k(c.fg));
+                    if c.ch == '█' {
+                        // a graph's fill: a quiet tint of the curve's colour (mixed in
+                        // sRGB: a linear-light mix of a light colour stays bright)
+                        mix(self.track_solid, fg_rgb, blend_k(c.fg))
+                    } else if bg & DEFAULT != 0 {
+                        m
+                    } else {
+                        // a bar's partly covered end: as clear as the bar (3:1), its
+                        // coverage still showing in how strong it is above that
+                        lighten_to(m, bg, MARK_MIN)
+                    }
+                } else if sid != 0 && c.ch != ' ' && bg & DEFAULT == 0 {
+                    // legible on its surface (the palette already is, on the plain
+                    // surfaces; this catches the rest)
+                    lighten_to(fg_rgb, bg, if is_text(c.ch) { self.min_c } else { MARK_MIN })
                 } else {
                     fg_rgb
                 };
@@ -411,16 +419,17 @@ impl Comp {
                             // picture (Comp::guarded), a plate only where that can't help
                             let (top, bot) = pix(sid);
                             let a = self.overlay(sid).1;
-                            if !matches!(c.ch, '\u{2800}'..='\u{28ff}' | '\u{2500}'..='\u{257f}' | '\u{2580}'..='\u{259f}')
-                            {
+                            if is_text(c.ch) {
                                 let (f, b, plate) =
-                                    self.guarded(fg_rgb, mix(top, bot, 0.5), s, a, 99.0, wide);
-                                // dark text straight on the picture, or a plate
+                                    self.guarded(fg_rgb, mix(top, bot, 0.5), s, a, wide);
+                                // text straight on the picture, or a plate
                                 out.fg = f;
                                 if plate {
                                     out.bg = b;
                                     out.plate = true;
                                 }
+                            } else {
+                                out.fg = self.mark(fg_rgb, self.glass(mix(top, bot, 0.5), s, a));
                             }
                         }
                     } else {
@@ -493,12 +502,16 @@ impl Comp {
                             _ => {
                                 let a = if s.adapt { s.a } else { s.ta };
                                 let (f, b, plate) =
-                                    self.guarded(fg_rgb, mix(top, bot, 0.5), s, a, 99.0, wide);
+                                    self.guarded(fg_rgb, mix(top, bot, 0.5), s, a, wide);
                                 out.fg = f;
                                 out.plate = plate;
                                 b
                             }
                         };
+                        if !is_text(c.ch) && c.fg & (TRACK | BLEND) == 0 {
+                            // frames, graph dots, bars: 3:1 against the picture
+                            out.fg = self.mark(fg_rgb, out.bg);
+                        }
                         // frames, grid lines and bars: a pixel patch draws them over the
                         // picture itself (not a bar's anti-aliased end: a blend)
                         out.pix = if c.fg & BLEND != 0 {
@@ -522,7 +535,18 @@ impl Comp {
                     out.fg = if c.fg & TRACK != 0 {
                         trk
                     } else {
-                        mix_lin(trk, fg_rgb, blend_k(c.fg))
+                        let m = mix_lin(trk, fg_rgb, blend_k(c.fg));
+                        if c.ch == '█' {
+                            // a graph's fill: a quiet tint of the curve's colour (mixed
+                            // in sRGB: a linear-light mix of a light colour stays bright)
+                            mix(trk, fg_rgb, blend_k(c.fg))
+                        } else if out.bg & DEFAULT != 0 {
+                            m
+                        } else {
+                            // a bar's partly covered end: 3:1 like the bar, its coverage
+                            // still showing in how strong it is above that
+                            self.mark(m, out.bg)
+                        }
                     };
                 }
                 out
@@ -715,6 +739,20 @@ pub fn draw_glyph(
             (1, 3),
         ];
         let bits = c as u32 - 0x2800;
+        if bits.count_ones() > 1 {
+            // a graph's edge: each dot fills its eighth of the cell, so the area
+            // under the curve is solid (single dots are grid lines: dots)
+            for (k, &(gx, gy)) in AT.iter().enumerate() {
+                if bits >> k & 1 == 1 {
+                    for y in h * gy / 4..h * (gy + 1) / 4 {
+                        for x in w * gx / 2..w * (gx + 1) / 2 {
+                            set(x, y);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let d = (w / 5).max(1);
         for (k, &(gx, gy)) in AT.iter().enumerate() {
             if bits >> k & 1 == 1 {
@@ -1013,11 +1051,19 @@ impl Screen {
         if y >= self.h {
             return x;
         }
+        let x0 = x;
+        let mut last = ' ';
         for c in s.chars() {
             if x >= lim {
+                // cut inside a word: end it with an ellipsis, so it reads as cut
+                // ("/dev/mapp…", not "/dev/mappe")
+                if x - x0 >= 4 && is_text(c) && is_text(last) && c != ' ' && last != ' ' {
+                    self.set(y * self.w + x - 1, Cell { ch: '…', fg, bg });
+                }
                 break;
             }
             self.set(y * self.w + x, Cell { ch: c, fg, bg });
+            last = c;
             x += 1;
         }
         x
@@ -1027,6 +1073,10 @@ impl Screen {
         // a space shows no foreground: keep the current one (fewer bytes)
         let fg = match self.sgr {
             Some((f, _, _)) if o.ch == ' ' => f,
+            // (256 colours: rounding can eat the contrast the compositor made)
+            _ if depth == Depth::C256 && !o.pix && (o.fg | o.bg) & DEFAULT == 0 && o.fg != o.bg => {
+                keep_256(o.fg, o.bg, if is_text(o.ch) { TEXT_MIN } else { MARK_MIN }.min(contrast(o.fg, o.bg)))
+            }
             _ => o.fg,
         };
         let want = (fg, o.bg, o.bold);
@@ -1285,14 +1335,6 @@ impl Screen {
         &self.out
     }
 
-    /// The ink colour of cell `c` in a patch.
-    fn ink_col(comp: &Comp, c: Cell) -> Rgb {
-        if c.fg & TRACK != 0 {
-            comp.track_ink
-        } else {
-            c.fg & 0xFF_FFFF
-        }
-    }
 
     /// The source picture of a patch class (frosted panels: the blurred copy).
     fn src<'a>(bd: &Backdrop, hr: &'a Hires, class: u8) -> &'a Indexed {
@@ -1344,7 +1386,7 @@ impl Screen {
                     let c = self.buf[i];
                     if cls[i] == k
                         && c.ch != ' '
-                        && inks.idx(Self::ink_col(comp, c), false).is_none()
+                        && inks.idx(comp.ink(c, cx, cy, bd), false).is_none()
                     {
                         cls[i] = 0;
                     }
@@ -1362,7 +1404,7 @@ impl Screen {
                             px[r..r + cw].fill(CLEAR);
                         }
                     } else if c.ch != ' ' {
-                        let ix = inks.idx(Self::ink_col(comp, c), true).unwrap_or(CLEAR);
+                        let ix = inks.idx(comp.ink(c, cx, cy, bd), true).unwrap_or(CLEAR);
                         ink_cell(c, ix, &mut px, rw, ox, oy, cw, chh);
                     }
                 }
@@ -1423,7 +1465,7 @@ impl Screen {
             for x in x0..x1 {
                 let c = self.buf[y * w + x];
                 if c.ch != ' ' {
-                    if let Some(ix) = inks.idx(Self::ink_col(comp, c), true) {
+                    if let Some(ix) = inks.idx(comp.ink(c, x, y, bd), true) {
                         ink_cell(c, ix, &mut px, pw, (x - x0) * cw, 0, cw, chh);
                     }
                 }
@@ -1781,7 +1823,7 @@ mod tests {
         s.put(3, 0, '▂', 0x654321 | 8 << BLEND_SHIFT, surf(S_PANEL));
         // 70 more colours on row 1: the inks run out, the rest stay text
         for x in 0..70 {
-            s.put(x, 1, '▄', 0x100000 + x as u32, surf(S_PANEL));
+            s.put(x, 1, '▄', 0xa0c0c0 + x as u32, surf(S_PANEL));
         }
         let out = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
             .to_string();
@@ -1793,8 +1835,11 @@ mod tests {
             let p = |v: u8| (v as u32 * 100 + 127) / 255;
             format!("#{};2;{};{};{}", ix, p(r), p(g), p(b))
         };
-        assert!(seq.contains(&def(t.border, INK)), "{seq:?}");
-        assert!(seq.contains(&def(0x123456, INK + 1)));
+        // (each made 3:1 against the picture behind its cell)
+        let ink = |ch: char, fg: u32, x: usize| comp.ink(Cell { ch, fg, bg: surf(S_PANEL) }, x, 0, &bd);
+        assert!(seq.contains(&def(ink('─', t.border, 1), INK)), "{seq:?}");
+        assert!(seq.contains(&def(ink('▂', 0x123456, 2), INK + 1)));
+        assert!(contrast(ink('▂', 0x123456, 2), 0x123456) > 1.0);
         let (dw, _, px) = crate::gfx::sixel_decode(seq.as_bytes());
         // the line: a row of ink across cell 1, picture above and below
         assert!((10..20).all(|x| px[9 * dw + x] == Some(INK)));
@@ -1911,31 +1956,40 @@ mod tests {
     }
 
     #[test]
-    fn light_glass_turns_text_dark_on_bright_pictures() {
+    fn text_and_marks_read_on_any_picture() {
         let mut t = theme();
         t.glass = Glass::Light;
         for sid in [S_SCREEN, S_BAR, S_PANEL] {
             t.surf[sid as usize] = Surf {
                 tint: 0x101010,
-                alpha: 0.2,
-                text_alpha: 0.2,
+                alpha: 0.1,
+                text_alpha: 0.1,
             };
         }
         let comp = Comp::new(&t, Look::Glass);
         let mut bd = Backdrop::empty(1, 1);
-        let c = Cell {
-            ch: 'A',
-            fg: 0xe0e0f0,
+        let cell = |ch: char, fg: u32| Cell {
+            ch,
+            fg,
             bg: surf(S_PANEL),
         };
-        // a bright sun: the cell keeps the picture's colour, the text goes dark
-        bd.sharp = vec![px2(0xffd060, 0xffc050)];
-        let o = comp.cell(c, 0, 0, Some(&bd), false);
-        assert!(!o.plate && crate::color::lum(o.fg) < 0.1, "{o:?}");
-        assert!(crate::color::lum(o.bg) > 0.3 && contrast(o.fg, o.bg) >= 4.4);
-        // a dark sky: light text, no plate either
+        let (dim, light) = (0x6a5f78, 0xe0e0f0);
+        // a dark sky: the colours as they are
         bd.sharp = vec![px2(0x101830, 0x101830)];
-        let o = comp.cell(c, 0, 0, Some(&bd), false);
-        assert!(!o.plate && o.fg == 0xe0e0f0);
+        let o = comp.cell(cell('A', light), 0, 0, Some(&bd), false);
+        assert!(!o.plate && o.fg == light);
+        // a sun dimmed to the light glass's cap (image::tone): a dim label gets
+        // lighter, never darker, and reads at 4.5:1 without a plate
+        bd.sharp = vec![px2(0x8a5a1c, 0x8a5a1c)];
+        let o = comp.cell(cell('a', dim), 0, 0, Some(&bd), false);
+        assert!(!o.plate && contrast(o.fg, o.bg) >= 4.5, "{o:?}");
+        assert!(crate::color::lum(o.fg) > crate::color::lum(dim));
+        // a frame there: 3:1
+        let o = comp.cell(cell('│', 0x4a3a5a), 0, 0, Some(&bd), false);
+        assert!(contrast(o.fg, o.bg) >= 3.0, "{o:?}");
+        // a full-brightness sun (clear glass): the text stays light and gets a plate
+        bd.sharp = vec![px2(0xffd060, 0xffc050)];
+        let o = comp.cell(cell('A', light), 0, 0, Some(&bd), false);
+        assert!(o.plate && crate::color::lum(o.fg) > 0.5 && contrast(o.fg, o.bg) >= 4.5, "{o:?}");
     }
 }

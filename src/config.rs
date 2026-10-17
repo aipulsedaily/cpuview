@@ -12,8 +12,9 @@ pub struct ImgOpt {
     pub dim: f32,
     pub blur: f32,
     pub fit: Fit,
-    /// focus point (0..1, 0..1): kept in view when cropping (cover)
-    pub focus: (f32, f32),
+    /// focus point (0..1, 0..1) kept in view when cropping (cover); `None`: the
+    /// wallpaper's own (credits.toml) or one found in the picture (image::auto_focus)
+    pub focus: Option<(f32, f32)>,
 }
 
 impl ImgOpt {
@@ -22,14 +23,8 @@ impl ImgOpt {
             file: file.to_string(),
             dim: 0.9,
             blur: 0.0,
-            fit: Fit::Contain,
-            focus: (0.5, 0.5),
-        }
-    }
-    pub fn place(&self) -> crate::image::Place {
-        crate::image::Place {
-            fit: self.fit,
-            focus: self.focus,
+            fit: Fit::Cover,
+            focus: None,
         }
     }
 }
@@ -197,19 +192,19 @@ impl Config {
                                 "dim" => o.dim = parse_f(v, 0.9).clamp(0.2, 1.0),
                                 "blur" => o.blur = parse_f(v, 0.0).clamp(0.0, 8.0),
                                 "fit" => {
-                                    o.fit = if v == "cover" {
-                                        Fit::Cover
-                                    } else {
+                                    o.fit = if v == "contain" {
                                         Fit::Contain
+                                    } else {
+                                        Fit::Cover
                                     }
                                 }
                                 "focus" => {
                                     // "x,y" in 0..1 (e.g. 0.5,0.3 keeps the upper middle)
                                     if let Some((a, b)) = v.split_once(',') {
-                                        o.focus = (
+                                        o.focus = Some((
                                             parse_f(a.trim(), 0.5).clamp(0.0, 1.0),
                                             parse_f(b.trim(), 0.5).clamp(0.0, 1.0),
-                                        );
+                                        ));
                                     }
                                 }
                                 _ => {}
@@ -270,12 +265,12 @@ impl Config {
                 o.file,
                 o.blur as u32
             );
-            if o.fit == Fit::Cover {
-                s += &format!("image.{}.fit = cover\n", o.file);
+            if o.fit == Fit::Contain {
+                s += &format!("image.{}.fit = contain\n", o.file);
             }
-            if o.focus != (0.5, 0.5) {
+            if let Some(f) = o.focus {
                 let p = |v: f32| (v * 100.0).round() as u32;
-                let (x, y) = (p(o.focus.0), p(o.focus.1));
+                let (x, y) = (p(f.0), p(f.1));
                 s += &format!(
                     "image.{}.focus = {}.{:02},{}.{:02}\n",
                     o.file,
@@ -463,22 +458,28 @@ mod tests {
     fn picture_options_round_trip() {
         let mut c = Config::default();
         assert_eq!(c.glass, Glass::Light);
-        assert_eq!(c.img("a.jpg").fit, Fit::Contain);
+        // pictures fill the window by default, around a focus found for them
+        assert_eq!(c.img("a.jpg").fit, Fit::Cover);
+        assert_eq!(c.img("a.jpg").focus, None);
         c.glass = Glass::Frosted;
         c.glyphs = Some(Glyphs::Sextant);
         let o = c.img_mut("lofi-synthwave.jpg");
-        o.fit = Fit::Cover;
-        o.focus = (0.5, 0.3);
+        o.fit = Fit::Contain;
+        o.focus = Some((0.5, 0.3));
         let text = c.render();
         assert!(
             text.contains("image.lofi-synthwave.jpg.focus = 0.50,0.30"),
             "{text}"
         );
+        assert!(text.contains("image.lofi-synthwave.jpg.fit = contain"), "{text}");
         let d = Config::parse(&text);
         assert_eq!(d.glass, Glass::Frosted);
         assert_eq!(d.glyphs, Some(Glyphs::Sextant));
         let o = d.img("lofi-synthwave.jpg");
-        assert_eq!((o.fit, o.focus), (Fit::Cover, (0.5, 0.3)));
+        assert_eq!((o.fit, o.focus), (Fit::Contain, Some((0.5, 0.3))));
+        // an older config's "fit = cover" still reads, and no line means cover
+        let d = Config::parse("image.x.jpg.fit = cover\nimage.y.jpg.dim = 0.9\n");
+        assert_eq!((d.img("x.jpg").fit, d.img("y.jpg").fit), (Fit::Cover, Fit::Cover));
         // the defaults are not written
         let text = Config::default().render();
         assert!(!text.contains("glass") && !text.contains("glyphs"));

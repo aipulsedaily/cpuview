@@ -49,9 +49,10 @@ usage: cpuview [options]
   --glass GLASS         pictures: light (default: a light veil; text turns darker
                         or lighter where the picture needs it), clear (the picture
                         as it is) or frosted (blurred, darker panels)
-  --fit FIT             pictures: contain (default: the whole picture, margins
-                        filled with a soft copy) or cover (fill the window, crop;
-                        image.<file>.focus = x,y in the config picks what stays)
+  --fit FIT             pictures: cover (default: fill the window, cropped around
+                        the picture's subject; image.<file>.focus = x,y in the
+                        config picks what stays) or contain (the whole picture,
+                        margins filled with a soft copy of it)
   --glyphs SET          block glyphs for pictures drawn with characters: auto,
                         octant (2×4), sextant (2×3), quadrant (2×2) or half (1×2)
   --speed SPEED         eco (default: adaptive 1-2 s, ≤ 0.01 % of one thread),
@@ -140,6 +141,10 @@ impl Gfx {
     }
 }
 
+/// The light glass: the picture's luminance capped here (image::tone), so text 4.5:1
+/// and marks 3:1 against it hold everywhere, and the picture stays the picture.
+const PICTURE_CAP: f32 = 0.07;
+
 fn image_theme(file: &str, img: &image::Img, opt: &config::ImgOpt, glass: Glass) -> Theme {
     let mut t = theme::load("default").unwrap();
     let p = image::palette_from(img);
@@ -150,22 +155,38 @@ fn image_theme(file: &str, img: &image::Img, opt: &config::ImgOpt, glass: Glass)
         .map(|(s, _)| s.to_string())
         .unwrap_or(file.to_string());
     t.desc = "image · palette from picture".into();
+    // what text and marks must read on: the brightest the glass lets through (light:
+    // the cap; clear / frosted: as dark as their plates make it)
+    t.cap = if glass == Glass::Light { PICTURE_CAP } else { 0.0 };
+    let grey = color::enc8(PICTURE_CAP);
+    let veil_max = color::rgb(grey, grey, grey);
+    // surfaces that sit under text (selection, chips) stay below the cap too
+    let under_cap = |c: color::Rgb| {
+        let mut c = c;
+        while color::lum(c) > PICTURE_CAP * 0.7 {
+            c = mix(c, 0, 0.12);
+        }
+        c
+    };
     t.bg = tint;
     t.panel = mix(tint, a1, 0.04);
     t.bar = mix(tint, 0, 0.3);
-    t.select = mix(tint, a1, 0.22);
-    t.chip = mix(tint, a1, 0.18);
-    t.track = mix(tint, a1, 0.12);
-    t.border = mix(tint, a1, 0.35);
-    t.border_hi = mix(tint, a1, 0.7);
-    t.title = text;
+    t.select = under_cap(mix(tint, a1, 0.3));
+    t.chip = under_cap(mix(tint, a1, 0.24));
+    t.track = mix(tint, a1, 0.16);
+    // frames in the picture's accent, a mid tone (made 3:1 below); titles brighter
+    t.border = mix(tint, a1, 0.45);
+    t.border_hi = mix(tint, a1, 0.8);
+    t.title = mix(text, 0xffffff, 0.5);
     t.accent = a1;
     t.accent2 = a2;
     t.fg = text;
-    t.text = mix(text, tint, 0.18);
-    t.mid = mix(text, tint, 0.42);
-    t.dim = mix(text, tint, 0.62);
-    t.freq = Ramp::even(&[image::with_value(a2, 0.45), a2, a1, mix(a1, 0xffffff, 0.6)]);
+    // the hierarchy: labels and units in the picture's tint, lighter than they would
+    // be on a plain dark theme (guarantee lifts them just to 4.5:1)
+    t.text = mix(text, a2, 0.12);
+    t.mid = mix(text, a1, 0.35);
+    t.dim = mix(mix(text, a1, 0.4), tint, 0.5);
+    t.freq = Ramp::even(&[image::with_value(a2, 0.6), a2, a1, mix(a1, 0xffffff, 0.6)]);
     t.brightness = opt.dim;
     let s = |tint, alpha, text_alpha| Surf {
         tint,
@@ -184,29 +205,36 @@ fn image_theme(file: &str, img: &image::Img, opt: &config::ImgOpt, glass: Glass)
         }
         _ => {
             // one even veil over screen, bars and panels (the picture reads as one
-            // picture; the borders show the panels). Text cells show the picture's
-            // colour through the same veil; the contrast guard changes the text's
-            // lightness where it doesn't read (Comp::guarded)
-            let (a, ta) = if glass == Glass::Clear {
-                (0.0, 0.0)
-            } else {
-                (0.2, 0.2)
-            };
+            // picture; the borders show the panels): light glass is a thin tint over
+            // the tone-capped picture, clear the picture as it is
+            let a = if glass == Glass::Clear { 0.0 } else { 0.1 };
             for sid in [S_SCREEN, S_BAR, S_PANEL] {
-                t.surf[sid as usize] = s(tint, a, ta);
+                t.surf[sid as usize] = s(tint, a, a);
             }
         }
     }
-    t.surf[S_SELECT as usize] = s(t.select, 0.68, 0.74);
+    t.surf[S_SELECT as usize] = s(t.select, 0.72, 0.78);
     t.surf[S_CHIP as usize] = s(t.chip, 0.8, 0.85);
     t.surf[S_TRACK as usize] = s(t.track, 0.7, 0.8);
     t.surf[S_DIALOG as usize] = s(tint, 0.84, 0.88);
     t.image = Some(file.to_string());
     t.soft_blur = opt.blur;
     t.glass = glass;
-    t.place = opt.place();
+    t.place = image::Place {
+        fit: opt.fit,
+        // contain centres the picture unless told otherwise; cover crops around the
+        // wallpaper's subject (credits.toml) or what stands out in it
+        focus: opt.focus.unwrap_or_else(|| match opt.fit {
+            image::Fit::Contain => (0.5, 0.5),
+            image::Fit::Cover => {
+                theme::wallpaper_focus(file).unwrap_or_else(|| image::auto_focus(img))
+            }
+        }),
+    };
     t.layers = &[];
-    refresh_derived(&mut t);
+    // every colour legible on the brightest the light glass shows: a grey at the cap
+    // (its own selection and chips are darker than that)
+    theme::guarantee(&mut t, veil_max);
     t
 }
 
@@ -233,6 +261,36 @@ fn trim_heap() {
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Unmap the program's and its libraries' code pages from this process (they stay in
+/// the page cache; the ones still used fault straight back in): start-up, page set-up
+/// and picture decoding run once, and their code would otherwise count in the resident
+/// size for as long as cpuview runs. Done a few samples after start and after a page or
+/// theme change.
+fn trim_code() {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return;
+    };
+    for l in maps.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(range), Some(perm)) = (it.next(), it.next()) else {
+            continue;
+        };
+        // private, executable, file-backed (path after offset, dev, inode)
+        if perm != "r-xp" || it.nth(3).is_none_or(|p| !p.starts_with('/')) {
+            continue;
+        }
+        let Some((a, b)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else {
+            continue;
+        };
+        unsafe {
+            libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
+        }
     }
 }
 
@@ -326,7 +384,10 @@ fn build_backdrop(
     bd.glyphs = gl;
     let cells = |bd: &mut Backdrop, cv: &[u8]| {
         bd.sharp = mosaic::halves(gl, cv, w, h);
-        bd.widen();
+        if t.glass != Glass::Frosted {
+            // (only the light / clear veils adapt text to the picture around it)
+            bd.widen();
+        }
         if gl != mosaic::Glyphs::Half {
             bd.mos = mosaic::build(gl, cv, w, h);
         }
@@ -336,6 +397,8 @@ fn build_backdrop(
             Some(i) => i,
             None => image::decode_file(&config::resolve_image(file)?.to_string_lossy()).ok()?,
         };
+        let mut img = img;
+        image::tone(&mut img, t.cap);
         let ub = t.soft_blur;
         let frosted = t.glass == Glass::Frosted;
         let soft_r = 2.0 + ub;
@@ -380,20 +443,36 @@ fn build_backdrop(
                 .collect()
         };
         let img = |w: usize, h: usize, rgb: Vec<u8>| image::Img { w, h, rgb };
+        let pixels = g.mode.pixels();
+        if !pixels {
+            // drawn with characters: the built-in backgrounds are smooth gradients and
+            // dots, designed for half blocks; one pixel per half cell (a 4K window's
+            // canvas: 1 MB while it renders, 260 KB kept; no mosaic, no `wide`: the
+            // built-in looks never adapt text to the picture)
+            let cv = bg::render(t.layers, t.bg, w, 2 * h, w, h, false);
+            bd.glyphs = mosaic::Glyphs::Half;
+            bd.sharp = (0..w * h)
+                .map(|i| {
+                    let o = i / w * 2 * w + i % w;
+                    let [a, b] = [cv.px[o], cv.px[o + w]].map(|p| color::ch(color::from_f(p)));
+                    [a[0], a[1], a[2], b[0], b[1], b[2]]
+                })
+                .collect();
+            bd.has_glyphs = cv.glyph.iter().any(|g| g.0 != '\0');
+            if bd.has_glyphs {
+                bd.glyph = cv.glyph;
+            }
+            trim_heap();
+            return Some(bd);
+        }
         // the layers assume square pixels and cost ~1 µs a pixel: pixel modes render
         // one canvas of at most 250 kpx (the layers are smooth; pixel stars at that
-        // grid) and derive the cell canvas from it; otherwise 2 pixels per cell width
-        let pixels = g.mode.pixels();
-        let (rw, rh) = if pixels {
+        // grid) and derive the cell canvas (the mosaic of busy cells) from it
+        let (rw, rh) = {
             let s = (250_000.0 / (pw * ph) as f64).sqrt().min(1.0);
             (
                 ((pw as f64 * s).round() as usize).max(1),
                 ((ph as f64 * s).round() as usize).max(1),
-            )
-        } else {
-            (
-                w * 2,
-                ((h * 2 * ch) as f64 / cw as f64).round().max(1.0) as usize,
             )
         };
         let cv = bg::render(t.layers, t.bg, rw, rh, w, h, pixels);
@@ -404,7 +483,7 @@ fn build_backdrop(
         }
         let src = img(rw, rh, px);
         cells(&mut bd, &image::stretch(&src, mw, mh));
-        if pixels {
+        {
             // stored at up to ~1.3 Mpx (a 1080p-class window at full resolution),
             // enlarged smoothly from the render; patches scale it up from there
             let s = (1_300_000.0 / (pw * ph) as f64).sqrt().min(1.0);
@@ -1499,6 +1578,7 @@ fn main() {
     let mut refill_t = term::mono();
     let mut est: i64 = CAP / 2;
     let mut nsamp = 0u32;
+    let (mut code_key, mut trim_at) = ((usize::MAX, 0, 0), 0i64);
     let mut cpu_mark = term::cpu_ns();
     let mut user = false;
     let mut active_left: u32 = 5;
@@ -1866,6 +1946,17 @@ fn main() {
                 dirty = false;
             }
             nsamp += 1;
+            // (start-up and set-up code out of the resident set, see trim_code)
+            let ck = (st.app.page, st.app.t.id.len(), st.app.t.label.len());
+            let tnow = term::mono();
+            if ck != code_key {
+                code_key = ck;
+                trim_at = tnow + 3 * SEC;
+            }
+            if trim_at > 0 && tnow >= trim_at {
+                trim_at = 0;
+                trim_code();
+            }
             if eco && nsamp > 2 {
                 // a slowly decaying peak: the dearer wakeups (scans, refreshes) every
                 // few samples keep it up (not the first samples: start-up, first scans)
@@ -1919,4 +2010,23 @@ fn main() {
     term::write_all(OUT, term::LEAVE.as_bytes());
     term::restore_mode();
     prof::dump(0);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn code_trim_is_harmless() {
+        // the code pages leave the resident set and come back as they run
+        let rss = || {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("RssFile")).map(|l| l.to_string()))
+        };
+        let before = rss();
+        super::trim_code();
+        let v: u64 = (1..1000u64).map(|i| i * i % 7).sum();
+        assert_eq!(v, (1..1000u64).map(|i| i * i % 7).sum::<u64>());
+        assert!(before.is_none() || rss().is_some());
+        super::trim_code();
+    }
 }

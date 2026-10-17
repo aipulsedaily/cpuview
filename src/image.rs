@@ -205,7 +205,7 @@ pub enum Fit {
     /// the whole picture, as large as fits; the margins show a blurred, dimmed
     /// enlargement of it, so the edges continue instead of ending in black bars
     Contain,
-    /// fill the window, cropping around the focus point
+    /// fill the window, cropping around the focus point (the default)
     Cover,
 }
 
@@ -220,10 +220,51 @@ pub struct Place {
 impl Default for Place {
     fn default() -> Self {
         Place {
-            fit: Fit::Contain,
+            fit: Fit::Cover,
             focus: (0.5, 0.5),
         }
     }
+}
+
+/// Where the eye goes in a picture (0..1, 0..1), for cropping it to fill the window:
+/// the centroid of a cheap saliency map (edge energy + contrast with the mean +
+/// colourfulness) on a small copy, pulled a quarter of the way back to the middle
+/// (a busy picture crops from the centre). Computed once, when the picture loads.
+pub fn auto_focus(img: &Img) -> (f32, f32) {
+    if img.w < 2 || img.h < 2 {
+        return (0.5, 0.5);
+    }
+    let tw = 48usize;
+    let th = ((tw * img.h) as f64 / img.w as f64).round().clamp(4.0, 96.0) as usize;
+    let t = stretch(img, tw, th);
+    let lum: Vec<f32> = t
+        .chunks_exact(3)
+        .map(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32)
+        .collect();
+    let mean = lum.iter().sum::<f32>() / lum.len() as f32;
+    let (mut sx, mut sy, mut sw) = (0f64, 0f64, 0f64);
+    for y in 0..th {
+        for x in 0..tw {
+            let l = |xx: usize, yy: usize| lum[yy.min(th - 1) * tw + xx.min(tw - 1)];
+            let gx = (l(x + 1, y) - l(x.saturating_sub(1), y)).abs();
+            let gy = (l(x, y + 1) - l(x, y.saturating_sub(1))).abs();
+            let p = &t[(y * tw + x) * 3..];
+            let sat = p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap();
+            let v = (gx + gy + 0.5 * (l(x, y) - mean).abs() + 0.25 * sat as f32) as f64;
+            // squared (the strongest parts lead), times a centre prior (σ 0.3): what
+            // stands out near the middle is the subject more often than an edge
+            let (dx, dy) = ((x as f32 + 0.5) / tw as f32 - 0.5, (y as f32 + 0.5) / th as f32 - 0.5);
+            let v = v * v * (-(dx * dx + dy * dy) / 0.18).exp() as f64;
+            sx += v * (x as f64 + 0.5) / tw as f64;
+            sy += v * (y as f64 + 0.5) / th as f64;
+            sw += v;
+        }
+    }
+    if sw <= 0.0 {
+        return (0.5, 0.5);
+    }
+    let pull = |c: f64| (0.5 + (c - 0.5) * 0.75) as f32;
+    (pull(sx / sw), pull(sy / sw))
 }
 
 /// The picture's rectangle (x, y, w, h) inside a dw × dh canvas under `contain`;
@@ -260,8 +301,9 @@ pub fn place(src: &Img, dw: usize, dh: usize, aspect: f64, pl: &Place) -> Vec<u8
     if pl.fit == Fit::Cover {
         let scale = (pw / sw).max(ph / sh);
         let (cw, chh) = (pw / scale, ph / scale);
-        let x0 = (fx * sw - cw / 2.0).clamp(0.0, sw - cw);
-        let y0 = (fy * sh - chh / 2.0).clamp(0.0, sh - chh);
+        // (the spare width or height is 0 on one axis; rounding can make it -1e-13)
+        let x0 = (fx * sw - cw / 2.0).clamp(0.0, (sw - cw).max(0.0));
+        let y0 = (fy * sh - chh / 2.0).clamp(0.0, (sh - chh).max(0.0));
         return resample(src, (x0, y0, cw, chh), dw, dh);
     }
     let (x0, y0, iw, ih) = contain_rect(src.w, src.h, dw, dh, aspect, pl.focus);
@@ -345,6 +387,59 @@ pub fn place(src: &Img, dw: usize, dh: usize, aspect: f64, pl: &Place) -> Vec<u8
         }
     }
     out
+}
+
+/// Compress the picture's highlights so nothing in it is brighter than luminance
+/// `cap` (WCAG relative luminance): a soft knee (`L / (1 + (L/cap)³)^⅓`: the darks stay
+/// as they are, the highlights roll off), colour kept (each pixel's linear RGB scaled
+/// alike) and a little richer (+15 % saturation: dimmed colours look duller; dimmed
+/// yellows lean to orange instead of going olive). Text
+/// colours made legible against `cap` then read on every part of the picture.
+pub fn tone(img: &mut Img, cap: f32) {
+    if cap <= 0.0 {
+        return;
+    }
+    let lin = |v: u8| crate::color::lin8(v);
+    // the knee's gain by luminance, tabulated
+    const N: usize = 1024;
+    let gain: Vec<f32> = (0..=N)
+        .map(|i| {
+            let l = (i as f32 / N as f32).max(1e-6);
+            1.0 / (1.0 + (l / cap).powi(3)).cbrt()
+        })
+        .collect();
+    for p in img.rgb.chunks_exact_mut(3) {
+        let c = [lin(p[0]), lin(p[1]), lin(p[2])];
+        let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let x = l * N as f32;
+        let i = (x as usize).min(N - 1);
+        let g = gain[i] + (gain[i + 1] - gain[i]) * (x - i as f32);
+        let lo = l * g;
+        let mut v = [0f32; 3];
+        for k in 0..3 {
+            v[k] = (lo + (c[k] * g - lo) * 1.15).max(0.0);
+        }
+        if g < 0.97 {
+            // a yellow dimmed a lot turns olive: lean it away from olive (60°), the
+            // yellows towards orange and the yellow-greens towards green (by up to
+            // 22°), at the same luminance
+            let mut h = crate::color::rgb_to_hsv(v);
+            if h[0] > 0.08 && h[0] < 0.3 {
+                let k = (1.0 - g) * h[1];
+                let side = if h[0] < 1.0 / 6.0 { -1.0 } else { 1.0 };
+                let t = (h[0] - 0.08) / 0.22;
+                h[0] += side * 0.06 * k * (t * std::f32::consts::PI).sin();
+                let w = crate::color::hsv_to_rgb(h);
+                let l2 = 0.2126 * w[0] + 0.7152 * w[1] + 0.0722 * w[2];
+                if l2 > 0.0 {
+                    v = [w[0] * lo / l2, w[1] * lo / l2, w[2] * lo / l2];
+                }
+            }
+        }
+        for k in 0..3 {
+            p[k] = crate::color::enc8(v[k]);
+        }
+    }
 }
 
 /// Stretch the whole image to dw × dh.
@@ -691,14 +786,29 @@ pub fn palette_from(img: &Img) -> ImgPalette {
     crate::sys::isort(&mut vivid, &|a, b| vivid_score(a) > vivid_score(b));
     let acc1 = vivid[0].0;
     let h1 = rgb_to_hsv(acc1)[0];
+    // the second accent: of the picture's vivid colours, the one most unlike the
+    // first in hue (a pair from the picture that tells apart: download / upload,
+    // reading / writing), as long as it has some colour at all
+    let hd = |c: [f32; 3]| {
+        let d = (rgb_to_hsv(c)[0] - h1).abs();
+        d.min(1.0 - d)
+    };
     let acc2 = vivid[1..]
         .iter()
-        .find(|(c, _)| {
-            let d = (rgb_to_hsv(*c)[0] - h1).abs();
-            d.min(1.0 - d) > 40.0 / 360.0
-        })
+        .take(6)
+        .filter(|c| vivid_score(c) > vivid_score(&vivid[0]) * 0.08)
+        .max_by(|a, b| (hd(a.0) * vivid_score(a).sqrt()).total_cmp(&(hd(b.0) * vivid_score(b).sqrt())))
+        .filter(|c| hd(c.0) > 40.0 / 360.0)
         .map(|c| c.0)
         .unwrap_or(if vivid.len() > 1 { vivid[1].0 } else { acc1 });
+    // (a picture of one hue, or of greys: the second accent across the colour wheel
+    // from the first, so a pair of series never looks alike)
+    let acc2 = if hd(acc2) < 60.0 / 360.0 {
+        let h = rgb_to_hsv(acc1);
+        hsv_to_rgb([(h[0] + 0.42) % 1.0, h[1].max(0.35), h[2].max(0.6)])
+    } else {
+        acc2
+    };
     let with = |c: [f32; 3], s: Option<f32>, v: Option<f32>| {
         let mut h = rgb_to_hsv(c);
         if let Some(s) = s {
@@ -793,7 +903,7 @@ mod tests {
         let img = Img { w: sw, h: sh, rgb };
         // contain into a square: all of it (both colours) in the middle band, the
         // margins a dimmer copy
-        let c = place(&img, 64, 64, 1.0, &Place::default());
+        let c = place(&img, 64, 64, 1.0, &Place { fit: Fit::Contain, focus: (0.5, 0.5) });
         let px = |c: &[u8], x: usize, y: usize| {
             let o = (y * 64 + x) * 3;
             [c[o], c[o + 1], c[o + 2]]
@@ -810,8 +920,105 @@ mod tests {
         let c = place(&img, 64, 64, 1.0, &pl);
         assert_eq!(px(&c, 50, 32), [255, 0, 0]);
         // same shape: exact stretch, no margins
-        let c = place(&img, 64, 36, 1.0, &Place::default());
+        let c = place(&img, 64, 36, 1.0, &Place { fit: Fit::Contain, focus: (0.5, 0.5) });
         assert_eq!(c, stretch(&img, 64, 36));
+        // the default fills the window at any shape: no margins, no mirrored edges
+        for (dw, dh) in [(128, 90), (209, 102), (80, 48), (415, 210), (40, 24), (2090, 1020)] {
+            let c = place(&img, dw, dh, 1.0, &Place::default());
+            // every pixel is the picture itself (red, blue or a mix at the seam), none
+            // a dimmed margin
+            assert!(
+                c.chunks_exact(3).all(|p| p[1] == 0 && (254..=256).contains(&(p[0] as u32 + p[2] as u32))),
+                "{dw}x{dh}"
+            );
+        }
+    }
+
+    #[test]
+    fn cover_at_every_window_shape() {
+        // (a 1920×1080 picture into 2090×1020 once panicked: a spare height of -2e-13)
+        let img = Img { w: 1920, h: 1080, rgb: vec![7; 1920 * 1080 * 3] };
+        for (w, h) in [(2090, 1020), (1280, 900), (800, 480), (4150, 2100), (400, 240), (1, 1)] {
+            for f in [(0.6, 0.42), (0.0, 1.0), (0.5, 0.5)] {
+                let c = place(&img, w / 10, h / 10, 1.0, &Place { fit: Fit::Cover, focus: f });
+                assert_eq!(c.len(), (w / 10) * (h / 10) * 3);
+                let c = place(&img, w, h / 20, 2.0, &Place { fit: Fit::Cover, focus: f });
+                assert_eq!(c.len(), w * (h / 20) * 3);
+            }
+        }
+        let c = place(&img, 2090, 1020, 1.0, &Place { fit: Fit::Cover, focus: (0.6, 0.42) });
+        assert_eq!(c.len(), 2090 * 1020 * 3);
+    }
+
+    #[test]
+    fn accents_tell_apart() {
+        // a grey picture with one red light: two accents far apart in hue
+        let (w, h) = (64usize, 36usize);
+        let mut rgb = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let v = (40 + (x + y) % 60) as u8;
+                let px = if y == 10 && x > 10 && x < 50 { [220, 30, 30] } else { [v, v, v] };
+                rgb.extend_from_slice(&px);
+            }
+        }
+        let p = palette_from(&Img { w, h, rgb });
+        let hue = |c: Rgb| rgb_to_hsv(chf(c))[0];
+        let d = (hue(p.a1) - hue(p.a2)).abs();
+        assert!(d.min(1.0 - d) >= 60.0 / 360.0, "{:06x} {:06x}", p.a1, p.a2);
+    }
+
+    #[test]
+    fn tone_caps_the_highlights() {
+        use crate::color::{lum, rgb};
+        let mut img = Img {
+            w: 4,
+            h: 1,
+            rgb: vec![255, 255, 255, 255, 200, 60, 10, 12, 30, 0, 0, 0],
+        };
+        tone(&mut img, 0.075);
+        let px = |i: usize| rgb(img.rgb[i * 3], img.rgb[i * 3 + 1], img.rgb[i * 3 + 2]);
+        // white and a bright sun come down to the cap; the sun stays orange
+        assert!(lum(px(0)) <= 0.08 && lum(px(0)) > 0.05);
+        assert!(lum(px(1)) <= 0.08);
+        assert!(img.rgb[3] > img.rgb[4] && img.rgb[4] > img.rgb[5]);
+        // a dark night sky is (nearly) untouched; black stays black
+        assert!((img.rgb[8] as i32 - 30).abs() <= 3, "{:?}", &img.rgb[6..9]);
+        assert_eq!(px(3), 0);
+    }
+
+    #[test]
+    fn focus_finds_the_subject() {
+        // a dark picture with a bright, detailed patch in the upper right
+        let (w, h) = (64usize, 36usize);
+        let mut rgb = vec![12u8; w * h * 3];
+        for y in 4..12 {
+            for x in 44..56 {
+                let v = if (x + y) % 2 == 0 { 250 } else { 120 };
+                rgb[(y * w + x) * 3..][..3].copy_from_slice(&[v, v / 2, 30]);
+            }
+        }
+        let (fx, fy) = auto_focus(&Img { w, h, rgb });
+        assert!(fx > 0.65 && fy < 0.4, "{fx} {fy}");
+        // a flat picture: the middle
+        let flat = Img { w, h, rgb: vec![90; w * h * 3] };
+        assert_eq!(auto_focus(&flat), (0.5, 0.5));
+    }
+
+    /// `cargo test -- --ignored print_focus`: the automatic focus of the bundled
+    /// wallpapers (compare with credits.toml)
+    #[test]
+    #[ignore]
+    fn print_focus() {
+        for e in std::fs::read_dir("wallpapers").unwrap().flatten() {
+            let p = e.path();
+            if let Ok(img) = decode_file(&p.to_string_lossy()) {
+                eprintln!("{:?} {:?}", p.file_name().unwrap(), auto_focus(&img));
+            }
+        }
+        if let Ok(d) = std::env::var("FOCUS_FILE") {
+            eprintln!("{d} {:?}", auto_focus(&decode_file(&d).unwrap()));
+        }
     }
 
     #[test]

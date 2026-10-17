@@ -22,6 +22,10 @@ use crate::f;
 use crate::procs::Procs;
 use crate::sensors::{K_FAN, K_TEMP, P_LOCKED, P_OK, R_BAT, R_GPU, R_PKG, R_PSYS};
 
+/// Seconds a column of every overview chart (CPU, RAM, disk, network): the same
+/// time scale side by side, so "1 min ago" is in the same place on each.
+const OV_SECS: usize = 2;
+
 /// Overview panels (`w == 0`: not shown).
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct OvLay {
@@ -323,7 +327,10 @@ impl App {
         let mut b: Vec<(u64, [f32; 4], f32)> = g.iter().map(|x| (x.0, [x.1 * share, mem_of(x.0).unwrap_or(x.2), x.3 as f32, 0.0], x.1 * share)).collect();
         crate::sys::isort(&mut b, &|a, b| a.2 > b.2);
         b.truncate(OV_NPROG);
-        let mut big: Vec<(u64, [f32; 4], f32)> = m.top.iter().take(OV_NPROG).map(|&i| &m.groups[i]).map(|x| (name_key(&x.name), [0.0, x.mem as f32, x.n as f32, 0.0], x.mem as f32)).collect();
+        // (the process count from the same live list as the busiest, so a program
+        // shows the same "×n" in both lists; the memory scan's count can be minutes old)
+        let live_n = |k: u64, n: u32| g.iter().find(|x| x.0 == k).map_or(n as f32, |x| x.3 as f32);
+        let mut big: Vec<(u64, [f32; 4], f32)> = m.top.iter().take(OV_NPROG).map(|&i| &m.groups[i]).map(|x| { let k = name_key(&x.name); (k, [0.0, x.mem as f32, live_n(k, x.n), 0.0], x.mem as f32) }).collect();
         if big.is_empty() {
             // (not scanned yet: resident sizes)
             big = g.iter().map(|x| (x.0, [0.0, x.2, x.3 as f32, 0.0], x.2)).collect();
@@ -579,7 +586,8 @@ impl App {
                 let s = match (lv, cpu) {
                     (2, true) => fc(&[n.s(), " at ", degc(t).s(), " — limited by temperature"]),
                     (2, _) => fc(&[n.s(), " too hot: ", degc(t).s()]),
-                    _ => fc(&[n.s(), " hot: ", degc(t).s()]),
+                    // (one word per level everywhere: "warm", then "too hot")
+                    _ => fc(&[n.s(), " warm: ", degc(t).s()]),
                 };
                 v.push((lv, PG_SENS, s));
             }
@@ -963,7 +971,8 @@ impl App {
             if st[1] {
                 let lv = level(hot, 85.0, 95.0);
                 let v = degc(hot);
-                let note = ["of 95 °C", "hot", "limited by temperature"][lv as usize];
+                // (a number alone says nothing: normal or not, and against what)
+                let note = ["normal · limit 95 °C", "warm · limit 95 °C", "limited by temperature"][lv as usize];
                 let c = if lv > 0 { self.hcol(lv) } else { th.dim };
                 self.orow(scr, ir.x, y, maxx, "temp", (v.s(), self.hcol(lv) | BOLD), Some(((hot - 30.0) / 65.0, &th.temp, bw)), (note, c));
                 y += 1;
@@ -1115,8 +1124,7 @@ impl App {
     /// Memo key of a column chart `iw` wide: the bucket its columns are at (they
     /// step once a bucket), see `ov_cols`.
     fn ov_cols_key(&self, iw: usize, pts: u64) -> u64 {
-        let gw = iw.saturating_sub(10).clamp(1, 256);
-        let b = (gw * 2).clamp(120, 300).div_ceil(gw).clamp(2, 5);
+        let b = OV_SECS;
         mixk(&[pts / b as u64, iw as u64, self.smooth() as u64 * self.body_key(2)])
     }
 
@@ -1147,7 +1155,7 @@ impl App {
         let gut = 10;
         let gx = ir.x + gut;
         let gw = ir.w.saturating_sub(gut).clamp(1, 256);
-        let b = (gw * 2).clamp(120, 300).div_ceil(gw).clamp(2, 5);
+        let b = OV_SECS;
         let mut v = [(0.0f32, 0.0f32); 256];
         let mut have = 0;
         let mut top = 0.0f32;
@@ -1251,7 +1259,7 @@ impl App {
             }
             if full && chart {
                 let gw = iw.saturating_sub(10).clamp(1, 256);
-                let b = (gw * 2).clamp(120, 300).div_ceil(gw).clamp(2, 5);
+                let b = OV_SECS;
                 self.time_axis(scr, r, ir.x + 10, gw, b as f32, "");
             }
         }
@@ -1335,7 +1343,7 @@ impl App {
             }
             if full && chart {
                 let gw = iw.saturating_sub(10).clamp(1, 256);
-                let b = (gw * 2).clamp(120, 300).div_ceil(gw).clamp(2, 5);
+                let b = OV_SECS;
                 self.time_axis(scr, r, ir.x + 10, gw, b as f32, "");
             }
         }
@@ -1557,7 +1565,7 @@ impl App {
         if let Some((n, t, w, c)) = &hot {
             let l = level(*t, *w, *c);
             let v = degc(*t);
-            let note = fc(&[n.s(), " · limit ", degc(*c).s()]);
+            let note = if l == 0 { fc(&[n.s(), " · normal, limit ", degc(*c).s()]) } else { fc(&[n.s(), " · limit ", degc(*c).s()]) };
             // (the bar's width doesn't follow the name's length)
             let bw = Self::ov_bw(iw, 28).min(12);
             let note = if note.n + 27 <= iw { note } else { fc(&[n.s()]) };
