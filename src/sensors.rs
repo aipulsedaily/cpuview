@@ -67,6 +67,9 @@ const S_BAT: u8 = 4;
 // source is read every base, or less often if a read costs more than the share
 // allows.
 const C_CPU: usize = 0;
+const C_SLOW: usize = 3;
+/// eco on the overview: a dear source (> 0.2 ms a read) at most this often
+const OV_DEAR: i64 = 600 * SEC;
 const C_POWER: usize = 4;
 const C_CORES: usize = 5;
 const C_BAT: usize = 6;
@@ -279,6 +282,8 @@ pub struct Sens {
     /// CPU time spent reading since `take_spent`
     spent: i64,
     pub perf_paranoid: i32,
+    /// the overview's last dear read (not counting the one when it came into view)
+    ov_dear: i64,
 }
 
 fn thread_ns() -> i64 {
@@ -828,6 +833,7 @@ impl Sens {
             last_seen: i64::MIN,
             spent: 0,
             perf_paranoid: -9,
+            ov_dear: i64::MIN / 2,
         }
     }
 
@@ -1194,7 +1200,17 @@ impl Sens {
                 }
                 r.minor |= r.raw.starts_with("Tccd") && nccd > 4;
             }
-            if (r.kind == K_TEMP && !r.minor) || matches!(r.role, R_PKG | R_GPU | R_BAT | R_CORES | R_PSYS) {
+        }
+        self.hists(true);
+    }
+
+    /// The key readings' histories (4 KB each): made for the page, dropped while the
+    /// overview (which shows none) has the sensors.
+    fn hists(&mut self, on: bool) {
+        for r in &mut self.rd {
+            if !on {
+                r.hist = None;
+            } else if r.hist.is_none() && ((r.kind == K_TEMP && !r.minor) || matches!(r.role, R_PKG | R_GPU | R_BAT | R_CORES | R_PSYS)) {
                 r.hist = Some(Box::new(Ring::new()));
             }
         }
@@ -1206,6 +1222,7 @@ impl Sens {
         if !self.detected {
             self.detect(now);
         } else {
+            self.hists(true);
             for i in 0..self.srcs.len() {
                 self.read_src(i, now);
             }
@@ -1272,6 +1289,97 @@ impl Sens {
             self.push_hist(push, false);
         }
         self.last_seen = now;
+    }
+
+    /// The overview (view 0) reads source `i`: not the per-core power counters, not
+    /// the CPU's temperatures when the CPU sampler has them (`cpu_t`), not the slow
+    /// ones (RAM sticks and drives on the SMBus / admin queue block for up to ~10 ms:
+    /// the memory page's helper thread reads those, firmware zones, Wi-Fi).
+    pub fn ov_wants(&self, i: usize, cpu_t: bool) -> bool {
+        let c = self.srcs[i].class;
+        c != C_CORES && c != C_SLOW && !(cpu_t && c == C_CPU && self.srcs[i].n[K_POWER as usize] == 0)
+    }
+
+    /// How often the overview reads source `i`: as the page does, but in eco the
+    /// temperatures every 30 s, dearer reads every 2 minutes, and a dear one (a
+    /// board's sensor chip: 2.5 ms) every OV_DEAR; CPU power as the page does.
+    pub fn ov_period(&self, i: usize, eco: bool) -> i64 {
+        let (p, c) = (self.period(i, eco), self.srcs[i].cost);
+        if !eco {
+            // (smooth & co: a dear one every 30 s, the fan isn't the point here)
+            if self.ov_dear_src(i) { p.max(30 * SEC) } else { p }
+        } else if self.ov_dear_src(i) {
+            p.max(OV_DEAR)
+        } else if c > 40_000 {
+            // (a GPU's power reading: a message to its firmware, 50-400 µs; RAM sticks'
+            // sensors on the SMBus, ~95 µs)
+            p.max(120 * SEC)
+        } else if self.srcs[i].class == C_POWER {
+            p
+        } else {
+            p.max(30 * SEC)
+        }
+    }
+
+    /// A dear source: a read costs over 0.2 ms, or it is a board chip on the LPC bus
+    /// (Nuvoton, ITE, Winbond, Fintek: 2.5 ms when its cache is stale, cheap when
+    /// another program just read it) or behind SMM (Dell).
+    fn ov_dear_src(&self, i: usize) -> bool {
+        let s = &self.srcs[i];
+        s.cost > 200_000 || ["nct", "it8", "w83", "f71", "dell"].iter().any(|p| s.chip.starts_with(p))
+    }
+
+    /// The overview's planned sensor CPU time (ns a second), and in eco while a dear
+    /// read is within a minute (before or after), that read's cost spread over the
+    /// minute: the rest then runs slower, so no 60 s window holds more than the
+    /// budget.
+    pub fn ov_planned(&self, now: i64, eco: bool, cpu_t: bool) -> i64 {
+        let mut p = 0;
+        for i in 0..self.srcs.len() {
+            if self.ov_wants(i, cpu_t) {
+                p += self.srcs[i].cost * SEC / self.ov_period(i, eco).max(1);
+            }
+        }
+        p + self.ov_near(now, eco, cpu_t) / 60
+    }
+
+    /// Eco on the overview: the cost (ns) of a dear read that happened in the last
+    /// minute or is due in the next one (a read when the page came into view is the
+    /// user's, not counted), else 0.
+    pub fn ov_near(&self, now: i64, eco: bool, cpu_t: bool) -> i64 {
+        let mut c = 0;
+        for i in 0..self.srcs.len() {
+            let s = &self.srcs[i];
+            if eco && self.ov_dear_src(i) && self.ov_wants(i, cpu_t) && s.last != i64::MIN {
+                let next = s.last + self.ov_period(i, eco);
+                if now - self.ov_dear < 60 * SEC || next - now < 60 * SEC {
+                    c = c.max(s.cost.max(2_500_000));
+                }
+            }
+        }
+        c
+    }
+
+    /// A sample on the overview: the sources it shows that are due (all of them
+    /// when `enter`), then `push` history points.
+    pub fn tick_ov(&mut self, now: i64, push: u32, eco: bool, cpu_t: bool, enter: bool) {
+        if !self.detected {
+            self.enter(now);
+        }
+        if enter {
+            self.hists(false);
+        }
+        for i in 0..self.srcs.len() {
+            let (p, l) = (self.ov_period(i, eco), self.srcs[i].last);
+            if self.ov_wants(i, cpu_t) && (enter || l == i64::MIN || now - l >= p - p / 10) {
+                self.read_src(i, now);
+                if !enter && self.ov_dear_src(i) {
+                    self.ov_dear = now;
+                }
+            }
+        }
+        // (no histories here: the page marks the time away as a gap)
+        let _ = push;
     }
 
     fn push_hist(&mut self, n: u32, gap: bool) {

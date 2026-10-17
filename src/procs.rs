@@ -464,6 +464,9 @@ pub struct Procs {
     pub cost: i64,
     pub last_track: i64,
     pub ok: bool,
+    /// tracked processes' exact resident size (`statm`) and command lines; else
+    /// stat's estimate, names only (the overview)
+    pub statm: bool,
 }
 
 /// errno of the last failed call.
@@ -486,11 +489,8 @@ impl Procs {
     pub fn new(root: &str) -> Procs {
         let c = std::ffi::CString::new(root).unwrap_or_default();
         let dir = unsafe { libc::opendir(c.as_ptr()) };
-        let dfd = if dir.is_null() {
-            -1
-        } else {
-            unsafe { libc::dirfd(dir) }
-        };
+        // (its own descriptor: the listing can be closed between scans, `release`)
+        let dfd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
         let mi = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let mut p = Procs {
             list: Vec::new(),
@@ -517,6 +517,7 @@ impl Procs {
             cost: 0,
             last_track: i64::MIN / 2,
             ok: false,
+            statm: true,
         };
         p.load_fd = p.open(&format!("{root}/loadavg"));
         p
@@ -605,13 +606,17 @@ impl Procs {
     /// Name and command line of a process seen for the first time (or after an exec):
     /// (text, name length, arguments offset, comm hash).
     fn read_txt(&mut self, pid: u32, st: &Stat) -> (Rc<str>, u8, u8, u16) {
+        let whole = self.statm;
         let c = self.read_file(pid, "cmdline").unwrap_or(&[]);
         let (name, aoff) = prog_name(c, st.comm());
         let mut s = String::new();
         clean(name, 64, &mut s);
         let nlen = s.len() as u8;
         s.push('\0');
-        clean(c, CMD_MAX + s.len(), &mut s);
+        if whole {
+            // (the overview, `statm` off, shows names only)
+            clean(c, CMD_MAX + s.len(), &mut s);
+        }
         // (the offset counts bytes of the raw command line: right while it's ASCII)
         let aoff = if c.get(..aoff).is_some_and(|a| a.is_ascii()) {
             aoff.min(255) as u8
@@ -631,6 +636,10 @@ impl Procs {
     /// A full scan: list /proc, read every process's `stat` (and `io` with `io_all`),
     /// note new and exited processes. `keep_ms`: exited ones stay that long (fading).
     pub fn scan(&mut self, now: i64, keep_ms: u32) {
+        if self.dir.is_null() && self.dfd >= 0 {
+            // (released: list the directory again)
+            self.dir = unsafe { libc::fdopendir(libc::fcntl(self.dfd, libc::F_DUPFD_CLOEXEC, 0)) };
+        }
         if self.dir.is_null() {
             return;
         }
@@ -856,7 +865,7 @@ impl Procs {
             if fd < 0 {
                 continue;
             }
-            let mfd = self.openat(pid, "statm");
+            let mfd = if self.statm { self.openat(pid, "statm") } else { -1 };
             self.tr.push(Track {
                 pid,
                 start,
@@ -1050,6 +1059,14 @@ impl Procs {
         }
         self.skip.clear();
         self.scans = 0;
+    }
+
+    /// Close the directory listing (its buffer is 32 KB) until the next scan.
+    pub fn release(&mut self) {
+        if !self.dir.is_null() {
+            unsafe { libc::closedir(self.dir) };
+            self.dir = std::ptr::null_mut();
+        }
     }
 
     /// Forget everything (leaving the page): the next scan starts afresh.

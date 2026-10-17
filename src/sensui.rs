@@ -33,7 +33,7 @@ impl SensLay {
 /// Animated values: one per reading (`Sens::rd`), and the cores' total.
 #[derive(Default)]
 pub struct ZA {
-    v: Vec<Val>,
+    pub(super) v: Vec<Val>,
     csum: Val,
     l: ZL,
 }
@@ -218,7 +218,7 @@ impl App {
     }
 
     /// Fans that ever spun, and the empty headers.
-    fn fans(&self) -> (Vec<usize>, Vec<usize>) {
+    pub(super) fn fans(&self) -> (Vec<usize>, Vec<usize>) {
         let (mut on, mut off) = (Vec::new(), Vec::new());
         for (i, r) in self.z.rd.iter().enumerate() {
             if r.kind == K_FAN {
@@ -244,7 +244,7 @@ impl App {
     }
 
     /// Power readings other than the CPU's own (GPU, RAM, battery...), per-core ones.
-    fn power_items(&self) -> (Vec<usize>, Vec<usize>) {
+    pub(super) fn power_items(&self) -> (Vec<usize>, Vec<usize>) {
         let (mut o, mut c) = (Vec::new(), Vec::new());
         for (i, r) in self.z.rd.iter().enumerate() {
             if r.kind == K_POWER {
@@ -334,7 +334,7 @@ impl App {
 
     /// New targets after a sample (`smooth`: values glide; else they jump).
     pub fn sens_retarget(&mut self, smooth: bool) {
-        if self.page != PG_SENS {
+        if self.page != PG_SENS && self.page != PG_OVERVIEW {
             return;
         }
         let z = &self.z;
@@ -351,7 +351,7 @@ impl App {
 
     /// Smooth mode: one frame of the springs and digits.
     pub fn sens_step(&mut self, dt: f32) -> bool {
-        if self.page != PG_SENS {
+        if self.page != PG_SENS && self.page != PG_OVERVIEW {
             return false;
         }
         let (et, ef, ep) = ((-W_TEMP * dt).exp(), (-W_CLOCK * dt).exp(), (-W_LOAD * dt).exp());
@@ -373,7 +373,7 @@ impl App {
     }
 
     /// Shown value of reading `i` (smooth: gliding).
-    fn zv(&self, i: usize) -> Val {
+    pub(super) fn zv(&self, i: usize) -> Val {
         match self.zv.v.get(i) {
             Some(v) => *v,
             None => {

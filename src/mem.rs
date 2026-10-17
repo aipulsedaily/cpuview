@@ -835,6 +835,23 @@ impl Mem {
         }
     }
 
+    /// Drop what only the next full scan needs (every process's sizes, the names by
+    /// pid): the overview scans rarely and keeps its memory small; the next scan
+    /// reads the names again.
+    pub fn shrink(&mut self) {
+        if !self.proc_dir.is_null() {
+            // (the listing's buffer is 32 KB: opened again for the next scan)
+            unsafe { libc::closedir(self.proc_dir) };
+            self.proc_dir = std::ptr::null_mut();
+        }
+        self.all = Vec::new();
+        self.name_of = Vec::new();
+        self.names = Vec::new();
+        for g in &mut self.groups {
+            g.name.shrink_to_fit();
+        }
+    }
+
     /// Full scan of /proc (~1.3 µs a process): every process's memory, grouped by
     /// program name; the `NPROC` biggest are then followed live (`refresh_procs`).
     /// Kernel threads (no memory) are remembered and skipped; that list is rebuilt

@@ -30,8 +30,9 @@ use theme::*;
 use ui::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
-memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes), a
+const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with an
+overview page (everything at a glance: what needs attention, CPU, RAM, disks,
+network, the busiest and biggest programs, sensors), a memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes), a
 network & system page (link speeds, ports, connections, containers, services), a
 processes page (every process: CPU, memory, disk, tree, groups, signals) and a
 sensors & power page (temperatures by part, fans, CPU / GPU / battery watts, voltages,
@@ -48,7 +49,8 @@ usage: cpuview [options]
                         smooth (10 samples/s, everything animated at a steady
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
-  --page PAGE           start on: cpu, memory (RAM, swap, disks, filesystems),
+  --page PAGE           start on: overview (the default: every page's answer on
+                        one screen), cpu, memory (RAM, swap, disks, filesystems),
                         network (links, ports, containers, services), processes,
                         or sensors (temperatures, fans, power, voltages)
   --setup-sensors       make fans and CPU power readable: shows what it would change
@@ -62,7 +64,8 @@ usage: cpuview [options]
   -h, --help            this help
   -V, --version         version
 
-keys: 1 2 3 4 5 or tab / shift-tab pages (cpu, memory, network, processes, sensors)
+keys: 0 1 2 3 4 5 or tab / shift-tab pages (overview, cpu, memory, network,
+      processes, sensors); on the overview click a panel to open its page
       arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
       o sort · c view · g graphs · d/enter detail · r reset peaks · space pause
       t themes · q quit
@@ -416,7 +419,7 @@ impl State {
                 },
             ),
         ];
-        if self.app.page == 0 {
+        if self.app.page == ui::PG_CPU {
             if l.top.is_some() {
                 rects.extend([
                     (S_PANEL, l.g_load),
@@ -660,6 +663,9 @@ impl State {
         if a.page == ui::PG_PROC {
             a.procs_leave();
         }
+        if a.page == ui::PG_OVERVIEW {
+            a.ov_leave();
+        }
         a.page = p;
         self.cfg.page = p;
         self.cfg.save();
@@ -684,6 +690,11 @@ impl State {
             a.z.enter(term::mono());
             a.fit(a.w, a.h);
             a.sens_retarget(false);
+        }
+        if p == ui::PG_OVERVIEW {
+            a.ov_enter();
+            a.fit(a.w, a.h);
+            trim_heap();
         }
         true
     }
@@ -719,6 +730,8 @@ impl State {
                     0 => {
                         if let Some(k) = self.app.key_at(x, y) {
                             Key::Char(k)
+                        } else if let Some(p) = self.app.ov_at(x, y) {
+                            return self.set_page(p);
                         } else if let Some(g) = self.app.card_at(x, y) {
                             self.app.selected = g;
                             return true;
@@ -740,10 +753,10 @@ impl State {
         let np = ui::NPAGES;
         let p = self.app.page;
         match key {
-            Key::Char(c @ '1'..='5') => return self.set_page(c as usize - '1' as usize),
+            Key::Char(c @ '0'..='5') => return self.set_page(c as usize - '0' as usize),
             Key::Tab => return self.set_page((p + 1) % np),
             Key::BackTab => return self.set_page((p + np - 1) % np),
-            Key::Char('m') => return self.set_page(if p == ui::PG_MEM { 0 } else { ui::PG_MEM }),
+            Key::Char('m') => return self.set_page(if p == ui::PG_MEM { ui::PG_CPU } else { ui::PG_MEM }),
             _ => {}
         }
         let a = &mut self.app;
@@ -864,6 +877,17 @@ fn auto_pin(t: &sys::Topo) {
         }
         libc::sched_setaffinity(0, sz, &set);
     }
+}
+
+/// The overview's own sampling (view 0): its sensors (no per-core power, a dear
+/// chip rarely: sensors::Sens::tick_ov), processes and containers
+/// (App::ov_sample). `push`: history seconds for the sensors, `net_held` the links'.
+fn ov_work(app: &mut App, now: i64, eco: bool, smooth: bool, push: u32, net_held: &mut u32) {
+    let cpu_t = !app.s.temps.is_empty();
+    let quiet = eco && app.z.ov_near(now, true, cpu_t) > 0;
+    prof(4, || app.z.tick_ov(now, push, eco, cpu_t, false));
+    let push = std::mem::take(net_held);
+    prof(14, || app.ov_sample(now, eco, smooth, push, quiet));
 }
 
 fn update_clock(app: &mut App) {
@@ -1094,7 +1118,7 @@ fn main() {
             "--page" => {
                 let v = val();
                 page_arg = Some(ui::page_index(&v).unwrap_or_else(|| {
-                    die("unknown page (one of cpu, memory, network, processes, sensors)")
+                    die("unknown page (one of overview, cpu, memory, network, processes, sensors)")
                 }));
             }
             "--image-mode" => {
@@ -1234,6 +1258,11 @@ fn main() {
         st.app.z.enter(term::mono());
         st.app.fit(cols as usize, rows as usize);
     }
+    if st.app.page == ui::PG_OVERVIEW {
+        st.app.ov_enter();
+        st.app.fit(cols as usize, rows as usize);
+        trim_heap();
+    }
     st.rebuild(img);
     update_clock(&mut st.app);
     st.app.s.sample(0, true);
@@ -1295,6 +1324,9 @@ fn main() {
     let mut last_pol_sec = last_sample_sec;
     let mut last_min = last_sample_sec / 60;
     let (mut net_held, mut net_last) = (0u32, 0i64);
+    // the overview's sensors and processes: due (smooth: done after the frame), and
+    // the history seconds they hold
+    let (mut ov_due, mut ov_push) = (false, 0u32);
     let mut winch_at: Option<i64> = None;
     let mut esc_at: Option<i64> = None;
     // smooth: next frame on the grid, the time the animation state is at, frames per
@@ -1361,13 +1393,20 @@ fn main() {
         // the rest of the wakeup is charged here. A board's sensor chip can cost
         // 2.5 ms a read, so any minute holding one keeps the rest under ~25 µs/s: the
         // bucket holds 0.4 ms there (bursts of the rest stay small)
-        let zs = st.app.z.take_spent();
+        // (the overview: its sensors' share, and while a dear read is within a minute
+        // most of the budget for that read, see sensors::Sens::ov_planned)
+        let zs = st.app.z.take_spent() + std::mem::take(&mut st.app.ov.spent);
+        let ovp = st.app.page == ui::PG_OVERVIEW;
+        let cpu_t = !st.app.s.temps.is_empty();
+        let near = eco && ovp && st.app.z.ov_near(now, true, cpu_t) > 0;
         let zp = if eco && st.app.page == ui::PG_SENS {
             st.app.z.planned(true).min(48_000)
+        } else if eco && ovp {
+            (st.app.z.ov_planned(now, true, cpu_t) + st.app.ov_planned()).min(55_000)
         } else {
             0
         };
-        let cap = if zp > 0 { CAP / 3 } else { CAP };
+        let cap = if zp > 0 && (!ovp || near) { CAP / 3 } else { CAP };
         // (a wakeup that handled keys, a resize or a resume is the user's: it may use
         // up saved tokens, never borrow)
         tokens = (tokens - (c - cpu_mark - zs).max(0)).max(if user { tokens.min(0) } else { i64::MIN });
@@ -1477,6 +1516,7 @@ fn main() {
             // slow sensors: one temperature every 3 s (round robin; smooth: all of
             // them every second), load average every 5 s, governor / EPP every 10 s
             let zpage = st.app.page == ui::PG_SENS;
+            let ov = st.app.page == ui::PG_OVERVIEW;
             if zpage {
                 // (the sensors page reads its own)
             } else if smooth && push > 0 {
@@ -1496,7 +1536,8 @@ fn main() {
                 st.app.s.read_policy();
             }
             // smooth: clocks 5 times a second, numbers / order 2.5 times
-            let clocks = !smooth || tick % 2 == 0;
+            // (the overview in eco: every other sample, its numbers are averages)
+            let clocks = if eco && st.app.page == ui::PG_OVERVIEW { nsamp % 2 == 0 } else { !smooth || tick % 2 == 0 };
             // the network page shows no CPU numbers: the CPU sampler runs every other
             // sample there (eco; other speeds twice a second), its histories get the
             // seconds in between from the next one
@@ -1520,30 +1561,38 @@ fn main() {
             // keep going); swap rates and pressure, filesystems (every 3 s, eco 10 s),
             // processes (below) and the DIMM / drive temperatures (helper thread, every
             // 5 s, eco 60 s) only while shown
+            // (the overview shows RAM, swap, disks and the fullest filesystem)
             let vis = st.app.mem_visible();
+            let mvis = vis || ov;
             let pvis = st.app.procs_visible();
             let m = &mut st.app.m;
             let now = term::mono();
-            // swap rates: smooth 2.5 times a second, eco every 4 s at most
+            // swap rates: smooth 2.5 times a second, eco every 4 s at most (the
+            // overview: 12 s)
             let vm = if eco {
-                now - m.last_vm >= 4 * SEC - SEC / 5
+                now - m.last_vm >= if ov { 12 } else { 4 } * SEC - SEC / 5
             } else {
                 !smooth || tick % 4 == 0
             };
-            prof(16, || m.sample(push, now, vis, vm));
-            mem::slow_period(if !vis {
+            prof(16, || m.sample(push, now, mvis, vm));
+            // (the overview: the hottest part may be a drive or a RAM stick)
+            mem::slow_period(if !vis && !ov {
                 0
             } else if eco {
                 60_000
+            } else if ov {
+                10_000
             } else {
                 5_000
             });
-            if vis {
-                let gap = if eco { 10 } else { 3 } * SEC;
+            if mvis {
+                let gap = if eco && ov { 30 } else if eco { 10 } else { 3 } * SEC;
                 if now - m.last_fs >= gap {
                     m.last_fs = now;
                     m.refresh_fs();
                 }
+            }
+            if vis {
                 // processes: a full scan (to find newcomers) costs ~1.3 µs a process,
                 // so it runs every 4 s (eco: 2 minutes); the biggest ones are followed
                 // live through their open statm (~1 µs each): 2.5 times a second
@@ -1568,7 +1617,10 @@ fn main() {
             // (the sensors page in eco: the hidden links' history every 30 s, its
             // seconds held until then)
             net_held += push;
-            if !(zpage && eco && now - net_last < 30 * SEC) {
+            if ov {
+                // (the overview: links every 4 s in eco, containers now and then: in
+                // App::ov_sample)
+            } else if !(zpage && eco && now - net_last < 30 * SEC) {
                 net_last = now;
                 let push = std::mem::take(&mut net_held);
                 st.app.n.tick(now, push, st.app.page == ui::PG_NET, eco);
@@ -1577,6 +1629,17 @@ fn main() {
             // cadence (sensors::Sens::tick)
             if zpage {
                 prof(4, || st.app.z.tick(now, push, eco));
+            }
+            // the overview (view 0): its sensors (no per-core power, a dear chip rarely
+            // in eco) and processes (sensors::Sens::tick_ov, App::ov_sample)
+            // (smooth: after this wakeup's frame, so a dear read doesn't delay it)
+            if ov {
+                ov_push += push;
+                if smooth {
+                    ov_due = true;
+                } else {
+                    ov_work(&mut st.app, now, eco, smooth, std::mem::take(&mut ov_push), &mut net_held);
+                }
             }
             // processes page (view 4): only while shown, see App::procs_sample
             if st.app.page == ui::PG_PROC {
@@ -1617,7 +1680,7 @@ fn main() {
             if eco && nsamp > 2 {
                 // a slowly decaying peak: the dearer wakeups (scans, refreshes) every
                 // few samples keep it up (not the first samples: start-up, first scans)
-                let spent = term::cpu_ns() - cpu_mark - st.app.z.spent();
+                let spent = term::cpu_ns() - cpu_mark - st.app.z.spent() - st.app.ov.spent;
                 est = if spent > est {
                     spent
                 } else {
@@ -1658,6 +1721,9 @@ fn main() {
             } else {
                 Some(anim::next_frame(now + offset, fps) - offset)
             };
+        }
+        if std::mem::take(&mut ov_due) && st.app.page == ui::PG_OVERVIEW {
+            ov_work(&mut st.app, now, eco, smooth, std::mem::take(&mut ov_push), &mut net_held);
         }
     }
     st.kitty_clear();

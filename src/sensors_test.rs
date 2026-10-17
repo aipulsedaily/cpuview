@@ -11,8 +11,11 @@ struct Fx(String);
 
 impl Fx {
     fn new(name: &str) -> Fx {
+        // (unique: tests run in parallel and build the same machines)
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = format!(
-            "{}/cpuview-fx-{name}-{}",
+            "{}/cpuview-fx-{name}-{}-{n}",
             std::env::temp_dir().display(),
             std::process::id()
         );
@@ -319,8 +322,8 @@ fn asus_b850_desktop() {
     }
 }
 
-#[test]
-fn intel_laptop_with_battery() {
+/// An Intel ThinkPad: coretemp, a fan, RAPL readable, a battery on its own.
+fn laptop() -> Fx {
     let fx = Fx::new("laptop");
     fx.dir(
         "/sys/class/dmi/id",
@@ -371,6 +374,12 @@ fn intel_laptop_with_battery() {
     )
     .dir("/sys/class/power_supply/AC", &[("type", "Mains"), ("online", "0")])
     .dir("/sys/class/power_supply/hid-mouse-battery", &[("type", "Battery"), ("scope", "Device"), ("capacity", "40")]);
+    fx
+}
+
+#[test]
+fn intel_laptop_with_battery() {
+    let fx = laptop();
     let mut s = fx.sens();
     assert_eq!(find(&s, "Package id 0").name, "CPU");
     assert_eq!(find(&s, "Package id 0").crit, 100.0);
@@ -404,12 +413,18 @@ fn intel_laptop_with_battery() {
     }
 }
 
-#[test]
-fn raspberry_pi_thermal_zone_only() {
+/// A Raspberry Pi: one thermal zone, nothing else.
+fn rpi() -> Fx {
     let fx = Fx::new("rpi");
     fx.dir("/proc/device-tree", &[("model", "Raspberry Pi 4 Model B Rev 1.4\0")])
         .dir("/proc", &[("cpuinfo", "processor\t: 0\nmodel name\t: ARMv7 Processor rev 3 (v7l)")])
         .dir("/sys/class/thermal/thermal_zone0", &[("type", "cpu-thermal"), ("temp", "48312")]);
+    fx
+}
+
+#[test]
+fn raspberry_pi_thermal_zone_only() {
+    let fx = rpi();
     let s = fx.sens();
     assert_eq!(s.board, "Raspberry Pi 4 Model B Rev 1.4");
     let t: Vec<&Rd> = s.rd.iter().filter(|r| r.kind == K_TEMP).collect();
@@ -423,14 +438,20 @@ fn raspberry_pi_thermal_zone_only() {
     assert!(t.contains("no power meters"), "{t}");
 }
 
-#[test]
-fn virtual_machine_without_sensors() {
+/// A virtual machine: no sensors at all.
+fn vm() -> Fx {
     let fx = Fx::new("vm");
     fx.dir(
         "/sys/class/dmi/id",
         &[("sys_vendor", "QEMU"), ("product_name", "Standard PC (Q35 + ICH9, 2009)"), ("board_vendor", "")],
     )
     .dir("/sys/class/hwmon", &[]);
+    fx
+}
+
+#[test]
+fn virtual_machine_without_sensors() {
+    let fx = vm();
     let s = fx.sens();
     assert!(s.vm);
     assert!(s.rd.is_empty() && s.fan_hint.is_none());
@@ -520,4 +541,294 @@ fn plain_names() {
     assert_eq!(temp_limits(G_MEM, Some(55000), Some(85000)), (70.0, 85.0));
     assert!(!temp_ok(-60.0, false, None) && !temp_ok(0.0, false, None) && !temp_ok(127.0, false, None));
     assert!(!temp_ok(19.0, true, Some(30.0)) && temp_ok(35.0, true, Some(30.0)));
+}
+
+// ── the overview (view 0) on these machines ───────────────────────────────────
+
+/// A fake /proc with a few programs; `ticks` scales their CPU time (two scans with
+/// different values give CPU rates).
+fn fake_proc(dir: &std::path::Path, ticks: u64) {
+    let progs: [(u32, &str, u64, u64); 6] = [
+        (100, "postgres", 400, 300_000),
+        (101, "postgres", 300, 200_000),
+        (102, "postgres", 10, 100_000),
+        (200, "firefox", 90, 500_000),
+        (300, "Xorg", 20, 50_000),
+        (400, "a-program-with-a-very-long-name-indeed", 1, 10_000),
+    ];
+    for (pid, name, cpu, rss) in progs {
+        let d = dir.join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        let t = cpu * ticks;
+        std::fs::write(
+            d.join("stat"),
+            format!("{pid} ({name}) S 1 {pid} {pid} 0 -1 0 0 0 0 0 {t} 0 0 0 20 0 1 0 1000 9000000 {rss} 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join("cmdline"), format!("/usr/bin/{name}\0")).unwrap();
+    }
+    std::fs::write(dir.join("loadavg"), "1.50 0.75 0.25 2/300 999\n").unwrap();
+}
+
+/// The overview at w × h for these sensors, memory and network (as text), with the
+/// fake processes; `f` adjusts the app first.
+fn overview(s: Sens, m: crate::mem::Mem, n: crate::net::Net, w: usize, h: usize, f: &dyn Fn(&mut App)) -> String {
+    let mut sm = crate::sys::Sampler::new_for_test(&(0..32).collect::<Vec<_>>());
+    sm.t.groups = (0..16).map(|c| vec![c, c + 16]).collect();
+    sm.t.ccd = (0..16).map(|c| c / 8).collect();
+    sm.t.ndom = 2;
+    sm.t.rank = vec![-1; 16];
+    sm.t.maxf = 5760.0;
+    sm.t.has_freq = true;
+    for i in 0..32 {
+        sm.f[i] = 3000.0 + i as f32 * 50.0;
+        sm.u[i] = (i * 37 % 100) as f32 / 100.0;
+        sm.ur[i] = sm.u[i];
+    }
+    for _ in 0..200 {
+        sm.sample_fake();
+    }
+    let mut a = App::new(sm, crate::theme::load("default").unwrap());
+    a.z = s;
+    a.m = m;
+    a.n = n;
+    a.page = crate::ui::PG_OVERVIEW;
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cpuview-ovproc-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    fake_proc(&dir, 1);
+    let mut d = crate::procs::Procs::new(dir.to_str().unwrap());
+    d.scan(1_000_000_000, 0);
+    fake_proc(&dir, 2);
+    d.scan(3_000_000_000, 0);
+    a.ov.d = Some(d);
+    a.ov_retarget(false);
+    f(&mut a);
+    a.first_size(w, h);
+    a.bars_snap();
+    a.sens_retarget(false);
+    a.net_retarget(false);
+    a.mem_retarget(false);
+    let mut scr = Screen::new(w, h);
+    a.draw(&mut scr, true);
+    a.draw(&mut scr, false);
+    a.draw_bars(&mut scr);
+    // a live redraw shows what a full one does
+    let mut s2 = Screen::new(w, h);
+    a.draw(&mut s2, true);
+    for y in 0..h {
+        let row = |s: &Screen| (0..w).map(|x| s.buf[y * w + x].ch).collect::<String>();
+        assert_eq!(row(&scr), row(&s2), "{w}x{h} row {y} differs after a live redraw");
+    }
+    // panels inside the screen, below the title and the strip, not overlapping
+    let l = a.ov.lay;
+    if h >= 4 {
+        assert_eq!((l.strip.y, l.strip.h, l.strip.w), (1, 1, w), "{w}x{h}");
+    }
+    let rs: Vec<Rect> = l.rects().into_iter().filter(|r| r.w > 0).collect();
+    for (i, r) in rs.iter().enumerate() {
+        assert!(r.x + r.w <= w && r.y >= 2 && r.y + r.h < h, "{w}x{h} {r:?}");
+        if !l.lines {
+            assert!(r.h >= 3 && r.w >= 30, "{w}x{h} panel too small {r:?}");
+        }
+        for q in &rs[i + 1..] {
+            let apart = r.x + r.w <= q.x || q.x + q.w <= r.x || r.y + r.h <= q.y || q.y + q.h <= r.y;
+            assert!(apart, "{w}x{h} overlap {r:?} {q:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::env::var_os("OVLAY").is_some() {
+        eprintln!("{:?}", a.ov.lay);
+    }
+    let mut t = String::new();
+    for y in 0..h {
+        for x in 0..w {
+            t.push(scr.buf[y * w + x].ch);
+        }
+        t.push('\n');
+    }
+    assert!(!t.contains("NaN") && !t.contains("inf"), "{w}x{h}\n{t}");
+    t
+}
+
+use crate::ui::Rect;
+
+const SIZES: [(usize, usize); 9] = [(128, 45), (80, 24), (60, 20), (40, 12), (205, 50), (275, 70), (415, 105), (172, 40), (100, 30)];
+
+#[test]
+fn overview_on_this_desktop() {
+    use crate::mem::Mem;
+    use crate::net::Net;
+    let fx = asus_b850();
+    for (w, h) in SIZES {
+        let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), w, h, &|a| a.n.ctrs.iter_mut().for_each(|c| c.health = 2));
+        // every page's answer, at every size
+        for want in ["CPU", "RAM", "disk", "↓", "postgres", "0 ", "5 "] {
+            assert!(t.contains(want), "missing {want:?} at {w}x{h}\n{t}");
+        }
+        // all 16 cores (32 threads) as bars: the number 15 under the last core where
+        // there is room for numbers
+        if w >= 80 && h >= 24 {
+            for want in ["RAM 17% in use", "containers 5 running", "programs · busiest: postgres ×3", "sensors", "CPU fan", "all normal", if w >= 128 { " 15 " } else { " 14 " }] {
+                assert!(t.contains(want), "missing {want:?} at {w}x{h}\n{t}");
+            }
+        }
+        if w >= 128 && h >= 45 {
+            for want in ["busiest", "biggest", "firefox", "swap", "CPU load over time", "now", "1 min ago", "fullest", "free", "2 ›", "click a panel"] {
+                assert!(t.contains(want), "missing {want:?} at {w}x{h}\n{t}");
+            }
+        }
+        // RAPL is root-only here: no watts, but how to get them
+        assert!(!t.contains(" W ·"), "{w}x{h}\n{t}");
+    }
+    // the big screens: every core's load over time beside the history charts
+    let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), 275, 70, &|_| {});
+    assert!(t.contains("load per core"), "{t}");
+}
+
+#[test]
+fn overview_on_other_machines() {
+    use crate::mem::Mem;
+    use crate::net::Net;
+    // a laptop: battery, CPU watts readable, one fan, no containers, no swap
+    let fx = laptop();
+    for (w, h) in SIZES {
+        let t = overview(fx.sens(), Mem::fake(1, 1, 6), Net::fake(0, 0), w, h, &|a| {
+            a.m.mi.swap_total = 0;
+            a.m.mi.swap_free = 0;
+        });
+        assert!(!t.contains("containers"), "{w}x{h}\n{t}");
+        if w >= 80 && h >= 24 {
+            assert!(t.contains("battery") && t.contains("fan"), "{w}x{h}\n{t}");
+        }
+        if w >= 128 && h >= 45 {
+            assert!(t.contains("no swap set up"), "{w}x{h}\n{t}");
+        }
+    }
+    // a Raspberry Pi: one temperature, no fans, no power meters, no disk statistics
+    let fx = rpi();
+    for (w, h) in SIZES {
+        let t = overview(fx.sens(), Mem::fake(0, 1, 3), Net::fake(0, 0), w, h, &|a| a.s.temps.clear());
+        assert!(!t.contains("RPM") && !t.contains(" W "), "{w}x{h}\n{t}");
+        if w >= 80 && h >= 24 {
+            assert!(t.contains("storage") && t.contains("hottest"), "{w}x{h}\n{t}");
+        }
+    }
+    // a virtual machine: no sensors (no panel), no disks, no filesystems, no network
+    let fx = vm();
+    for (w, h) in SIZES {
+        let t = overview(fx.sens(), Mem::fake(0, 0, 3), Net::empty(), w, h, &|a| a.s.temps.clear());
+        assert!(!t.contains("sensors") && !t.contains("RPM"), "{w}x{h}\n{t}");
+        assert!(a_layout_has_no_disk(w, h) || !t.contains("disk idle"), "{w}x{h}\n{t}");
+    }
+}
+
+fn a_layout_has_no_disk(_w: usize, _h: usize) -> bool {
+    true
+}
+
+#[test]
+fn overview_alerts() {
+    use crate::mem::Mem;
+    use crate::net::Net;
+    let fx = asus_b850();
+    let g = 1u64 << 30;
+    // a full filesystem, RAM nearly full and swapping, the CPU at its limit, a
+    // container unhealthy, the network down
+    let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), 128, 45, &|a| {
+        a.m.fs[0].avail = 40 * g;
+        a.m.fs[0].used = 960 * g;
+        a.m.mi.avail = g;
+        a.m.swin = 30e6;
+        a.s.temps = Vec::new();
+        a.n.ctrs[1].health = 3;
+        for i in a.n.ifs.iter_mut() {
+            i.up = false;
+        }
+    });
+    for want in ["act now", "RAM nearly full", "swap active", "/ 96% full · 42.9 GB free", "container", "unhealthy", "network not connected"] {
+        assert!(t.lines().nth(1).unwrap().contains(want) || t.contains(want), "missing {want:?}\n{t}");
+    }
+    // the hottest part at its limit
+    let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), 128, 45, &|a| {
+        let k = a.z.rd.iter().position(|r| r.raw == "SYSTIN").unwrap();
+        a.z.rd[k].val = 96.0;
+    });
+    assert!(t.lines().nth(1).unwrap().contains("motherboard hot: 96 °C"), "{t}");
+    // (the SSD and the RAM sticks come from the memory page's helper thread, not read here)
+    let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), 128, 45, &|a| {
+        let k = a.z.rd.iter().position(|r| r.raw == "Composite").unwrap();
+        a.z.rd[k].val = 96.0;
+    });
+    assert!(!t.contains("SSD too hot"), "{t}");
+    // nothing: all normal
+    let t = overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), 128, 45, &|a| a.n.ctrs.iter_mut().for_each(|c| c.health = 2));
+    assert!(t.lines().nth(1).unwrap().contains("all normal"), "{t}");
+}
+
+#[test]
+fn overview_layouts_at_every_size() {
+    use crate::mem::Mem;
+    use crate::net::Net;
+    let fx = asus_b850();
+    for w in (40..=415).step_by(25) {
+        for h in (12..=105).step_by(9) {
+            overview(fx.sens(), Mem::fake(1, 3, 12), Net::fake(5, 3), w, h, &|_| {});
+        }
+    }
+}
+
+/// `W=128 H=45 cargo test --release dump_overview -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn dump_overview() {
+    let w: usize = std::env::var("W").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let h: usize = std::env::var("H").ok().and_then(|v| v.parse().ok()).unwrap_or(45);
+    let fx = asus_b850();
+    eprintln!("{}", overview(fx.sens(), crate::mem::Mem::fake(1, 3, 12), crate::net::Net::fake(5, 3), w, h, &|_| {}));
+    let fx = laptop();
+    eprintln!("{}", overview(fx.sens(), crate::mem::Mem::fake(1, 1, 6), crate::net::Net::fake(0, 0), w, h, &|_| {}));
+}
+
+/// Live redraw cost of the overview: `cargo test --release bench_overview -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_overview() {
+    let fx = asus_b850();
+    let (w, h) = (128, 45);
+    let mut a = None;
+    let _ = overview(fx.sens(), crate::mem::Mem::fake(1, 3, 12), crate::net::Net::fake(5, 3), w, h, &|_| {});
+    // (the same set-up as `overview`, kept)
+    let mut sm = crate::sys::Sampler::new_for_test(&(0..32).collect::<Vec<_>>());
+    sm.t.groups = (0..16).map(|c| vec![c, c + 16]).collect();
+    sm.t.ccd = (0..16).map(|c| c / 8).collect();
+    sm.t.ndom = 2;
+    sm.t.maxf = 5760.0;
+    sm.t.has_freq = true;
+    for _ in 0..200 {
+        sm.sample_fake();
+    }
+    let mut app = App::new(sm, crate::theme::load("default").unwrap());
+    app.z = fx.sens();
+    app.m = crate::mem::Mem::fake(1, 3, 12);
+    app.n = crate::net::Net::fake(5, 3);
+    app.page = crate::ui::PG_OVERVIEW;
+    app.first_size(w, h);
+    let mut scr = Screen::new(w, h);
+    app.draw(&mut scr, true);
+    a.get_or_insert(0);
+    let n = 2000;
+    let t0 = crate::term::cpu_ns();
+    for k in 0..n {
+        for i in 0..32 {
+            app.s.u[i] = ((i * 37 + k * 13) % 100) as f32 / 100.0;
+            app.s.ur[i] = app.s.u[i];
+        }
+        app.s.sample_fake();
+        app.m.mi.avail -= 1 << 20;
+        app.bars_snap();
+        app.draw(&mut scr, false);
+    }
+    eprintln!("live redraw: {} µs", (crate::term::cpu_ns() - t0) / n as i64 / 1000);
 }

@@ -30,20 +30,20 @@ impl NetLay {
 /// when the order changes.
 #[derive(Clone, Copy, Default)]
 pub struct Item {
-    key: u64,
+    pub(super) key: u64,
     idx: usize,
-    v: [Val; 5],
+    pub(super) v: [Val; 5],
 }
 
 #[derive(Default)]
 pub struct List {
-    it: Vec<Item>,
+    pub(super) it: Vec<Item>,
 }
 
 impl List {
     /// New data (key, values, sort key), sorted biggest first. The order shown changes
     /// only when an item clearly overtakes the one above it (by `hy` × + `abs`).
-    fn set(&mut self, new: &[(u64, [f32; 4], f32)], smooth: bool, hy: f32, abs: f32) {
+    pub(super) fn set(&mut self, new: &[(u64, [f32; 4], f32)], smooth: bool, hy: f32, abs: f32) {
         self.it.retain(|i| new.iter().any(|n| n.0 == i.key));
         for (j, (k, v, _)) in new.iter().enumerate() {
             if let Some(i) = self.it.iter_mut().find(|i| i.key == *k) {
@@ -84,7 +84,7 @@ impl List {
 
     /// Smooth mode: one frame. Values show at `bsize`'s resolution (counts: whole),
     /// the first in tenths of a percent with `pct`.
-    fn step(&mut self, dt: f32, ex: f32, pct: bool) -> bool {
+    pub(super) fn step(&mut self, dt: f32, ex: f32, pct: bool) -> bool {
         let mut mv = false;
         for i in &mut self.it {
             for q in 0..4 {
@@ -98,13 +98,13 @@ impl List {
     }
 
     /// Rows in display order (by gliding position).
-    fn order(&self) -> Vec<usize> {
+    pub(super) fn order(&self) -> Vec<usize> {
         let mut o: Vec<usize> = (0..self.it.len()).collect();
         crate::sys::isort(&mut o, &|&a, &b| self.it[a].v[4].x < self.it[b].v[4].x);
         o
     }
 
-    fn key(&self, bars: usize, top: f32) -> u64 {
+    pub(super) fn key(&self, bars: usize, top: f32) -> u64 {
         let mut k = self.it.len() as u64;
         for i in &self.it {
             k = mixk(&[
@@ -196,7 +196,7 @@ pub fn link_speed(mbit: u32) -> F {
 }
 
 /// Below this (both ways together) a link counts as quiet (bytes/s).
-const QUIET_BPS: f32 = 10e3;
+pub(super) const QUIET_BPS: f32 = 10e3;
 
 impl App {
     // ── layout ─────────────────────────────────────────────────────────────
@@ -341,7 +341,7 @@ impl App {
 
     /// New targets after a sample (`smooth`: values glide; else they jump).
     pub fn net_retarget(&mut self, smooth: bool) {
-        if self.page != PG_NET {
+        if self.page != PG_NET && self.page != PG_OVERVIEW {
             return;
         }
         let (_, gw, b) = self.nchart_geo(self.nl.net.inner());
@@ -364,6 +364,10 @@ impl App {
         }
         let a = &mut self.nv;
         a.links.set(&links, smooth, f32::INFINITY, 0.0);
+        if self.page == PG_OVERVIEW {
+            // (the overview shows the links only)
+            return;
+        }
         a.estab.set(n.estab as f32, smooth);
         a.tw.set(n.tw as f32, smooth);
         let mut ctrs: Vec<(u64, [f32; 4], f32)> = Vec::new();
@@ -394,7 +398,7 @@ impl App {
 
     /// Smooth mode: one frame of every network-page spring and digit.
     pub fn net_step(&mut self, dt: f32) -> bool {
-        if self.page != PG_NET {
+        if self.page != PG_NET && self.page != PG_OVERVIEW {
             return false;
         }
         let ex = (-W_LOAD * dt).exp();
@@ -504,7 +508,7 @@ impl App {
     }
 
     /// Shown rate values of a link (smooth: gliding), chart scales.
-    fn link_vals(&self, name: &str) -> [Val; 4] {
+    pub(super) fn link_vals(&self, name: &str) -> [Val; 4] {
         let k = hkey(name.as_bytes());
         self.nv
             .links
@@ -516,7 +520,7 @@ impl App {
 
     /// The link the chart follows: the first that is up (default route first), else
     /// the first one there is.
-    fn main_link(&self) -> Option<usize> {
+    pub(super) fn main_link(&self) -> Option<usize> {
         let n = &self.n;
         (0..n.ifs.len())
             .find(|&i| n.ifs[i].prim && n.ifs[i].up)
@@ -539,7 +543,7 @@ impl App {
     /// download / upload over whole `b`-second buckets of the history, aligned to the
     /// history count, so the columns step left once per bucket and never change in
     /// between.
-    fn link_col(&self, m: usize, c: usize, b: usize) -> Option<(f32, f32)> {
+    pub(super) fn link_col(&self, m: usize, c: usize, b: usize) -> Option<(f32, f32)> {
         let f = &self.n.ifs[m];
         if c == 0 {
             let v = self.link_vals(&f.name);
@@ -1469,7 +1473,7 @@ mod tests {
                     let s = crate::sys::Sampler::new_for_test(&(0..8).collect::<Vec<_>>());
                     let mut a = App::new(s, crate::theme::load("default").unwrap());
                     a.n = crate::net::Net::fake(nc, ns);
-                    a.page = 2;
+                    a.page = PG_NET;
                     a.first_size(w, h);
                     a.net_retarget(false);
                     let rs: Vec<Rect> = a.nl.rects().into_iter().filter(|r| r.w > 0).collect();
@@ -1503,7 +1507,7 @@ mod tests {
         let s = crate::sys::Sampler::new_for_test(&(0..8).collect::<Vec<_>>());
         let mut a = App::new(s, crate::theme::load("default").unwrap());
         a.n = crate::net::Net::fake(5, 16);
-        a.page = 2;
+        a.page = PG_NET;
         a.first_size(128, 45);
         a.net_retarget(false);
         let mut scr = Screen::new(128, 45);

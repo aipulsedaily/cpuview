@@ -1,6 +1,9 @@
 # cpuview
 
-A btop-style terminal monitor that shows **every core's clock speed and load at once**, grouped
+A btop-style terminal monitor that opens on an **Overview** (`0`): every page's answer on one
+screen — what needs attention, CPU load, clocks, watts and temperature with every thread as a
+mini bar, RAM, disks, network, the busiest and biggest programs and the sensors — and shows
+**every core's clock speed and load at once** (`1`), grouped
 by physical core and CCD, with temperatures, history graphs, themes and picture backgrounds,
 plus a **Memory & Storage** page (`m` or `2`) written for people who aren't Linux experts: how much
 RAM is in use and whether that's fine, what the disk is doing now and did a minute ago, how full
@@ -16,9 +19,16 @@ thread** (≈ 45–85 µs of CPU per second) at the default `eco` speed. Press `
 ≤ 0.5 % of one thread) or fixed rates up to
 60 updates per second.
 
-![cpuview, Midnight theme, 128×45](docs/screenshots/rust-128x45.webp)
+![cpuview Overview, Midnight theme, 128×45](docs/screenshots/rust-overview-128x45.webp)
 
-*128×45 (a ~1180×880 px Windows Terminal window), Midnight: graph band, all 32 threads in one column per
+*The Overview (`0`, the default page) at 128×45 (a ~1180×880 px Windows Terminal window), eco
+speed, real data on this Ryzen 9 9950X while idle. The strip at the top says what needs
+attention ("all normal" here); each panel opens with its page's answer in its title, coloured
+by health, and a click on it (or its number, top right) opens that page.*
+
+![cpuview CPU view, Midnight theme, 128×45](docs/screenshots/rust-128x45.webp)
+
+*`1`: the CPU view at 128×45 (a ~1180×880 px Windows Terminal window), Midnight: graph band, all 32 threads in one column per
 CCD with a load-history strip per thread, and the all-core load heatmap at the bottom. Real data on a
 Ryzen 9 9950X with a synthetic load running. Captured headlessly: the app ran in a pseudo-terminal, its
 output was replayed in a VT emulator (pyte) and painted with DejaVu Sans Mono.*
@@ -116,6 +126,48 @@ terminal.
   the theme menu
 - No root, no daemon: reads `/proc/stat` and sysfs; works on any Linux x86_64 / aarch64 and
   degrades gracefully without cpufreq, hwmon, SMT or CCD information
+
+### Overview
+
+The default page (`0`): one panel per page, each a compact summary with its single most
+important answer first, in the pages' own grammar (a headline in the title coloured by health,
+label → value → bar → note rows, charts with "… ago · now" time axes, stacked columns for
+rates), so a glance answers "is this machine fine, and if not, what's wrong?".
+
+- **What needs attention**, in a strip under the title bar, from the pages' own health rules,
+  worst first, each opening its page when clicked: a temperature at its part's limit ("CPU at
+  95 °C — limited by temperature", "SSD too hot: 82 °C") or near it ("… hot"), a CPU fan that
+  spun and stopped, RAM getting / nearly full (80 / 90 %) or programs waiting for it, swap
+  active (≥ 1 MB/s), a filesystem ≥ 90 % full ("/ 92% full · 74 GB free"), no network link
+  connected, packets lost, a container unhealthy or restarting, a battery under 20 % while
+  discharging. Otherwise "all normal".
+- **CPU**: % busy, average and fastest-core clock, package watts (when RAPL is readable) and
+  temperature in the title and as rows; **every thread as a mini bar** (two per core, grouped
+  by CCD, core numbers under them; one per core where threads don't fit), and the load over
+  time. 3 columns (from ≈ 190×30): every core's load over time (the CPU view's heatmap).
+- **RAM** as on the Memory & Storage page ("20% in use · 6.4 of 32.2 GB · plenty free"), swap
+  and whether it's active, available memory, RAM in use over time with the trend in words.
+- **Disk**: reading / writing now and % busy, the fullest filesystem (% full, free space), and
+  activity over time as stacked columns.
+- **Network**: download / upload of the links that are up ("quiet" below 10 kB/s), the main
+  link, the containers' state and health ("5 running · all healthy") when there are any, and
+  the main link's traffic over time.
+- **Programs**: the busiest (CPU as a share of the whole machine, like the CPU's "busy") and
+  the biggest (memory as the Memory & Storage page counts it), grouped by program.
+- **Sensors**: the hottest part with its plain name and limit, the CPU fan, and power (CPU,
+  GPU, battery).
+- From 76 columns two columns of panels, from ≈ 190 three; big screens get taller bars and
+  more history, small ones (under 76×18) one line per page with the threads' bars and, from
+  ≈ 20 rows, the CPU load over time. Anything a machine doesn't have isn't shown (no
+  containers, swap, RAPL, fans, sensors at all in a VM; batteries on laptops; ARM boards).
+- **Cheap**: it reads only what it shows, on slow cadences in eco: the CPU and memory every
+  sample, the links every 10 s (a read of `/proc/net/dev` costs ~50 µs here), processes from a
+  scan every 90 s with the busiest followed every 6 s (and the memory page's program scan every
+  3 minutes), containers every 2–5 minutes,
+  temperatures every 30 s, CPU power as the Sensors page does, and a board's sensor chip (2.5
+  ms a read on this Nuvoton chip) every 10 minutes, with the minute around that read sampled
+  more slowly so no 60 s window goes over the budget. RAM sticks and drives come from the
+  memory page's helper thread (their SMBus / admin reads block for milliseconds).
 
 ### Memory & Storage
 
@@ -319,8 +371,8 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 |---|---|
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
-| `1` `2` `3` `4` `5` / `tab` / `shift-tab` | pages: CPU, Memory & Storage, Network & System, Processes, Sensors & Power (remembered; `--page cpu\|memory\|network\|processes\|sensors`; the footer's tabs are clickable) |
-| `m` | CPU view ⇄ Memory & Storage page |
+| `0` `1` `2` `3` `4` `5` / `tab` / `shift-tab` | pages: Overview, CPU, Memory & Storage, Network & System, Processes, Sensors & Power (remembered; a fresh install opens on the Overview; `--page overview\|cpu\|memory\|network\|processes\|sensors`; the footer's tabs are clickable, and so are the Overview's panels) |
+| `m` | Memory & Storage page ⇄ CPU view |
 | `p` | Memory & Storage: top programs by memory ⇄ each process |
 | `+` / `-` | faster / slower (`=` works as `+`) |
 | `o` | sort cores: number → load → clock |
@@ -335,7 +387,7 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 
 On the Processes page (`4`) the arrows, `pgup` / `pgdn` / `home` / `end`, the mouse wheel
 and clicks move the selection, and these keys change meaning (the global ones — `q`, `space`,
-`s`, `+` `-`, `t`, `1`–`5`, `tab` — still work):
+`s`, `+` `-`, `t`, `0`–`5`, `tab` — still work):
 
 | Key | Processes page |
 |---|---|

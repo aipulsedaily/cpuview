@@ -280,15 +280,15 @@ pub fn dur(secs: usize) -> F {
 }
 
 /// Label column width of the rows ("available ").
-const LW: usize = 10;
+pub(super) const LW: usize = 10;
 /// Value column width ("18.8 MB/s").
-const VW: usize = 9;
+pub(super) const VW: usize = 9;
 
 /// A stacked rate column for the disk chart.
 #[derive(Clone, Copy, Default)]
-struct Col {
-    rd: f32,
-    wr: f32,
+pub(super) struct Col {
+    pub(super) rd: f32,
+    pub(super) wr: f32,
 }
 
 impl App {
@@ -651,7 +651,7 @@ impl App {
 
     /// History series for `n` braille half-columns (one point a second each): the
     /// points as they are, or in smooth mode with the live value at the head.
-    fn series(&self, out: &mut Vec<f32>, n: usize, h: &crate::sys::Ring<f32>, head: f32) {
+    pub(super) fn series(&self, out: &mut Vec<f32>, n: usize, h: &crate::sys::Ring<f32>, head: f32) {
         if !self.smooth() {
             h.tail(n, 0.0, out);
             return;
@@ -670,7 +670,7 @@ impl App {
     /// One statistics row: label → value → [bar → %] → note, in aligned columns.
     /// `bar`: (fraction, width, ramp); width 0: none.
     #[allow(clippy::too_many_arguments)]
-    fn srow(
+    pub(super) fn srow(
         &self,
         scr: &mut Screen,
         x: usize,
@@ -699,7 +699,7 @@ impl App {
     }
 
     /// Bar width for a row with a bar, a 5-wide % and `tail` more cells after it.
-    fn sbar_w(iw: usize, tail: usize) -> usize {
+    pub(super) fn sbar_w(iw: usize, tail: usize) -> usize {
         iw.saturating_sub(LW + VW + 1 + 5 + tail).min(40)
     }
 
@@ -787,7 +787,7 @@ impl App {
     }
 
     /// RAM health: 0 plenty free, 1 getting full / swapping / waiting, 2 nearly full.
-    fn ram_level(&self) -> u8 {
+    pub(super) fn ram_level(&self) -> u8 {
         let a = &self.ma;
         let total = (self.m.mi.total as f32).max(1.0);
         // (swap traffic alone, with plenty available, is one memory-limited group
@@ -1224,7 +1224,7 @@ impl App {
 
     /// RAM in use (fraction) `secs` ago (the oldest point if the history is shorter),
     /// and how it changed since in words: "rising", "falling" or "steady" (± 2 points).
-    fn ram_trend(&self, secs: usize) -> (f32, &'static str) {
+    pub(super) fn ram_trend(&self, secs: usize) -> (f32, &'static str) {
         let h = &self.m.h_used;
         let total = (self.m.mi.total as f32).max(1.0);
         let now = self.ma.used.n / total;
@@ -1308,7 +1308,7 @@ impl App {
     /// Reading and writing colours: the clock ramp's blue and the load ramp's orange,
     /// or (picture palettes can make those alike) the most distinct pair of the
     /// theme's other colours, so the two always tell apart.
-    fn rw_cols(&self) -> (u32, u32) {
+    pub(super) fn rw_cols(&self) -> (u32, u32) {
         let t = &self.t;
         let rs = [t.freq.at(0.35), t.temp.at(0.0), t.accent, t.good];
         let ws = [t.load.at(0.68), t.warn, t.accent2, t.crit];
@@ -1637,7 +1637,7 @@ impl App {
     /// then mean read / write rates over whole `b`-second buckets of the history,
     /// aligned to the history count, so the columns step left once per bucket and
     /// never change in between.
-    fn disk_col(&self, c: usize, b: usize) -> Option<Col> {
+    pub(super) fn disk_col(&self, c: usize, b: usize) -> Option<Col> {
         if c == 0 {
             let (rd, wr) = self.disk_now();
             return Some(Col { rd, wr });
@@ -1660,7 +1660,7 @@ impl App {
     }
 
     /// History point `p` (0 = newest) of all disks together: read, write bytes/s.
-    fn disk_pt(&self, p: usize) -> (f32, f32) {
+    pub(super) fn disk_pt(&self, p: usize) -> (f32, f32) {
         self.m.disks.iter().fold((0.0, 0.0), |a, d| {
             (a.0 + d.h_rd.back(p), a.1 + d.h_wr.back(p))
         })
@@ -1668,14 +1668,14 @@ impl App {
 
     /// The live rates of all disks together, as the numbers show them (held, so the
     /// newest column doesn't flicker).
-    fn disk_now(&self) -> (f32, f32) {
+    pub(super) fn disk_now(&self) -> (f32, f32) {
         self.ma
             .disk
             .iter()
             .fold((0.0, 0.0), |a, v| (a.0 + v[D_RD].n, a.1 + v[D_WR].n))
     }
 
-    fn disk_len(&self) -> usize {
+    pub(super) fn disk_len(&self) -> usize {
         self.m.disks.iter().map(|d| d.h_rd.len()).min().unwrap_or(0)
     }
 

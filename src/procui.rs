@@ -14,17 +14,19 @@ use crate::color::mix;
 use crate::input::Key;
 use crate::procs::{self, Procs, IOK, NEW, NOIO, NORATE};
 
-/// pages (`App::page`)
-pub const PG_CPU: usize = 0;
-pub const PG_MEM: usize = 1;
-pub const PG_NET: usize = 2;
-pub const PG_PROC: usize = 3;
-pub const PG_SENS: usize = 4;
-pub const NPAGES: usize = 5;
+/// pages (`App::page`), numbered as their keys: 0 overview, 1 cpu ... 5 sensors
+pub const PG_OVERVIEW: usize = 0;
+pub const PG_CPU: usize = 1;
+pub const PG_MEM: usize = 2;
+pub const PG_NET: usize = 3;
+pub const PG_PROC: usize = 4;
+pub const PG_SENS: usize = 5;
+pub const NPAGES: usize = 6;
 /// (tab label, config / --page name)
 pub fn page_name(p: usize) -> (&'static str, &'static str) {
     match p {
-        PG_MEM => ("mem", "memory"),
+        PG_OVERVIEW => ("all", "overview"),
+        PG_MEM => ("mem/disk", "memory"),
         PG_NET => ("net", "network"),
         PG_PROC => ("proc", "processes"),
         PG_SENS => ("sens", "sensors"),
@@ -34,11 +36,12 @@ pub fn page_name(p: usize) -> (&'static str, &'static str) {
 
 pub fn page_index(name: &str) -> Option<usize> {
     match name {
-        "cpu" => Some(PG_CPU),
-        "memory" | "mem" => Some(PG_MEM),
-        "network" | "net" => Some(PG_NET),
-        "processes" | "proc" => Some(PG_PROC),
-        "sensors" | "sens" | "power" | "fans" => Some(PG_SENS),
+        "overview" | "all" | "0" => Some(PG_OVERVIEW),
+        "cpu" | "1" => Some(PG_CPU),
+        "memory" | "mem" | "2" => Some(PG_MEM),
+        "network" | "net" | "3" => Some(PG_NET),
+        "processes" | "proc" | "4" => Some(PG_PROC),
+        "sensors" | "sens" | "power" | "fans" | "5" => Some(PG_SENS),
         _ => None,
     }
 }
@@ -1081,12 +1084,16 @@ impl App {
     }
 
     /// Panels the page draws (kitty glass placements).
-    pub fn page_rects(&self) -> [Rect; 5] {
-        let mut r = [Rect::default(); 5];
+    pub fn page_rects(&self) -> [Rect; 8] {
+        let mut r = [Rect::default(); 8];
         match self.page {
+            PG_OVERVIEW if !self.ov.lay.lines => {
+                r[..7].copy_from_slice(&self.ov.lay.rects());
+                r[7] = self.ov.lay.strip;
+            }
             PG_PROC => (r[0], r[1]) = (self.pv.lay.table, self.pv.lay.detail),
             PG_NET => r[..4].copy_from_slice(&self.nl.rects()),
-            PG_SENS => r = self.zl.rects(),
+            PG_SENS => r[..5].copy_from_slice(&self.zl.rects()),
             _ => {}
         }
         r

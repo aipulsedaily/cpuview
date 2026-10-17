@@ -1202,6 +1202,8 @@ pub struct Net {
     last: [i64; NJOB],
     last_dev: i64,
     pub entered: bool,
+    /// the overview's look-ups: containers only (no services, no cgroup names)
+    pub lite: bool,
     cread: u32,
 }
 
@@ -1245,6 +1247,7 @@ impl Net {
             last: [i64::MIN / 2; NJOB],
             last_dev: i64::MIN / 2,
             entered: false,
+            lite: false,
             cread: 0,
         }
     }
@@ -1271,6 +1274,7 @@ impl Net {
     /// outside the eco budget).
     pub fn enter(&mut self, now: i64) {
         self.entered = true;
+        self.lite = false;
         self.read_counts();
         for j in 0..NJOB {
             self.job(j, now);
@@ -1349,6 +1353,35 @@ impl Net {
             self.last[j] = now;
             self.job(j, now);
         }
+    }
+
+    /// The overview (view 0): the links' rates every `gap` (eco 10 s: a read of
+    /// /proc/net/dev can cost 50 µs), the containers (cgroup walk, the engine API's
+    /// names and health) every 5 / 2 minutes (eco; else 60 / 30 s); no sockets, no service statistics.
+    /// `enter`: everything now (the page just came into view).
+    /// Returns the CPU time (ns) of the links' read and of the container jobs.
+    pub fn tick_ov(&mut self, now: i64, push: u32, eco: bool, enter: bool) -> (i64, i64) {
+        self.held += push;
+        // (the network page, shown later, looks everything up afresh)
+        self.lite = true;
+        self.entered = false;
+        let gap = if eco { 10 * SEC } else { SEC };
+        let t0 = crate::term::cpu_ns();
+        if enter || now - self.last_dev >= gap - SEC / 5 {
+            self.read_dev(now);
+        }
+        // (one job a sample)
+        let t1 = crate::term::cpu_ns();
+        for (j, p) in [(J_WALK, if eco { 300 } else { 60 }), (J_API, if eco { 120 } else { 30 })] {
+            if enter || (now - self.last[j] >= p * SEC - SEC / 5 && (j == J_WALK || !self.ctrs.is_empty())) {
+                self.last[j] = now;
+                self.job(j, now);
+                if !enter {
+                    break;
+                }
+            }
+        }
+        (t1 - t0, crate::term::cpu_ns() - t1)
     }
 
     fn job(&mut self, j: usize, now: i64) {
@@ -1747,6 +1780,7 @@ impl Net {
         if self.cpu_root.is_empty() {
             return;
         }
+        let lite = self.lite;
         let mut found: Vec<(String, u8, String)> = Vec::new();
         let mut names: Vec<(u64, String)> = Vec::new();
         let mut stack = vec![String::new()];
@@ -1763,19 +1797,21 @@ impl Net {
                     return;
                 }
                 let path = cat(&[&rel, "/", n]);
-                if names.len() < 4096 {
+                if names.len() < 4096 && !lite {
                     names.push((ino, n.to_string()));
                 }
                 if let Some((k, id)) = ctr_dir(&parent, n) {
                     found.push((path, k, id));
-                } else if let Some(s) = svc_dir(&parent, n) {
+                } else if let Some(s) = svc_dir(&parent, n).filter(|_| !lite) {
                     found.push((path, SVC, s));
                 } else if depth < 6 && descend(n) {
                     stack.push(path);
                 }
             });
         }
-        self.cgnames = names;
+        if !lite {
+            self.cgnames = names;
+        }
         let (v2, cr, mr) = (self.cg2, self.cpu_root.clone(), self.mem_root.clone());
         // containers: keep the known ones (their counters), add the new
         self.ctrs.retain(|c| found.iter().any(|f| f.0 == c.rel));
