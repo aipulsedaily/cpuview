@@ -17,7 +17,8 @@ pub struct Config {
     pub sort: usize,
     pub view: usize,
     pub speed: usize,
-    /// 0 CPU, 1 memory & storage, 2 network & system, 3 processes (ui::page_name)
+    /// 0 CPU, 1 memory & storage, 2 network & system, 3 processes, 4 sensors & power
+    /// (ui::page_name)
     pub page: usize,
     pub imgs: Vec<ImgOpt>,
 }
@@ -236,10 +237,15 @@ extern "C" {
     static environ: *const *mut libc::c_char;
 }
 
-/// Run a program (found on PATH) with stdin, stdout and stderr on /dev/null and an
-/// empty signal mask; returns its exit code (-1 if a signal ended it). posix_spawn
-/// instead of std::process::Command keeps ~15 KB of std out of the binary.
 fn run_quiet(args: &[&str]) -> Result<i32, String> {
+    run(args, true)
+}
+
+/// Run a program (found on PATH) with an empty signal mask (`quiet`: stdin, stdout
+/// and stderr on /dev/null, else the terminal's); returns its exit code (-1 if a
+/// signal ended it). posix_spawn instead of std::process::Command keeps ~15 KB of
+/// std out of the binary.
+pub fn run(args: &[&str], quiet: bool) -> Result<i32, String> {
     let cs = args
         .iter()
         .map(|a| std::ffi::CString::new(*a).map_err(|_| "bad argument".to_string()))
@@ -251,7 +257,7 @@ fn run_quiet(args: &[&str]) -> Result<i32, String> {
         let mut at: libc::posix_spawnattr_t = std::mem::zeroed();
         libc::posix_spawn_file_actions_init(&mut fa);
         libc::posix_spawnattr_init(&mut at);
-        for fd in 0..3 {
+        for fd in 0..if quiet { 3 } else { 0 } {
             let fl = if fd == 0 {
                 libc::O_RDONLY
             } else {

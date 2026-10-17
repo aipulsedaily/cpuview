@@ -14,6 +14,7 @@ mod probe;
 mod procs;
 mod prof;
 mod screen;
+mod sensors;
 mod sys;
 mod term;
 mod theme;
@@ -31,8 +32,10 @@ use ui::App;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "cpuview — live per-core CPU clock, load and temperature monitor, with a
 memory & storage page (RAM, swap, disk I/O, filesystems, biggest processes), a
-network & system page (link speeds, ports, connections, containers, services) and a
-processes page (every process: CPU, memory, disk, tree, groups, signals)
+network & system page (link speeds, ports, connections, containers, services), a
+processes page (every process: CPU, memory, disk, tree, groups, signals) and a
+sensors & power page (temperatures by part, fans, CPU / GPU / battery watts, voltages,
+and the drivers they come from)
 
 usage: cpuview [options]
 
@@ -46,13 +49,20 @@ usage: cpuview [options]
                         60 fps, ≤ 0.5 %), or updates per second: 1, 2, 4, 10,
                         20, 30, 60
   --page PAGE           start on: cpu, memory (RAM, swap, disks, filesystems),
-                        network (links, ports, containers, services), or processes
+                        network (links, ports, containers, services), processes,
+                        or sensors (temperatures, fans, power, voltages)
+  --setup-sensors       make fans and CPU power readable: shows what it would change
+                        and why, asks, then uses sudo. Loads the board's fan driver
+                        (if missing) now and at boot; makes the RAPL energy counters
+                        readable with a udev rule. Options: --per-core (per-core
+                        power: cap_perfmon on this binary, redo after reinstalling),
+                        --undo (reverse it all), --dry-run (only show the plan)
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
   -V, --version         version
 
-keys: 1 2 3 4 or tab / shift-tab pages (cpu, memory, network, processes)
+keys: 1 2 3 4 5 or tab / shift-tab pages (cpu, memory, network, processes, sensors)
       arrows/hjkl/click select · s speed (+ faster, - slower) · m memory & storage
       o sort · c view · g graphs · d/enter detail · r reset peaks · space pause
       t themes · q quit
@@ -670,6 +680,11 @@ impl State {
             a.n.enter(term::mono());
             a.net_retarget(false);
         }
+        if p == ui::PG_SENS {
+            a.z.enter(term::mono());
+            a.fit(a.w, a.h);
+            a.sens_retarget(false);
+        }
         true
     }
 
@@ -721,11 +736,11 @@ impl State {
         if self.app.proc_key(key) {
             return true;
         }
-        // pages: 1-4, tab / shift-tab
+        // pages: 1-5, tab / shift-tab
         let np = ui::NPAGES;
         let p = self.app.page;
         match key {
-            Key::Char(c @ '1'..='4') => return self.set_page(c as usize - '1' as usize),
+            Key::Char(c @ '1'..='5') => return self.set_page(c as usize - '1' as usize),
             Key::Tab => return self.set_page((p + 1) % np),
             Key::BackTab => return self.set_page((p + np - 1) % np),
             Key::Char('m') => return self.set_page(if p == ui::PG_MEM { 0 } else { ui::PG_MEM }),
@@ -1033,6 +1048,7 @@ fn main() {
     let mut mode_arg = None;
     let mut speed_arg = None;
     let mut page_arg = None;
+    let (mut setup, mut undo, mut per_core, mut dry) = (false, false, false, false);
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1059,6 +1075,10 @@ fn main() {
                 return;
             }
             "--doctor" => want_doctor = true,
+            "--setup-sensors" => setup = true,
+            "--undo" => undo = true,
+            "--per-core" => per_core = true,
+            "--dry-run" => dry = true,
             "--no-probe" => no_probe = true,
             "--theme" => theme_arg = Some(val()),
             "--image" => image_arg = Some(val()),
@@ -1074,7 +1094,7 @@ fn main() {
             "--page" => {
                 let v = val();
                 page_arg = Some(ui::page_index(&v).unwrap_or_else(|| {
-                    die("unknown page (one of cpu, memory, network, processes)")
+                    die("unknown page (one of cpu, memory, network, processes, sensors)")
                 }));
             }
             "--image-mode" => {
@@ -1086,6 +1106,12 @@ fn main() {
             _ => die(&format!("unknown option: {a} (see --help)")),
         }
         i += 1;
+    }
+    if setup || undo || per_core || dry {
+        if !setup {
+            die("--undo, --per-core and --dry-run go with --setup-sensors");
+        }
+        std::process::exit(sensors::setup(undo, per_core, dry));
     }
     if let Some(n) = speed_arg {
         cfg.speed = n;
@@ -1204,6 +1230,10 @@ fn main() {
     if st.app.page == ui::PG_NET {
         st.app.n.enter(term::mono());
     }
+    if st.app.page == ui::PG_SENS {
+        st.app.z.enter(term::mono());
+        st.app.fit(cols as usize, rows as usize);
+    }
     st.rebuild(img);
     update_clock(&mut st.app);
     st.app.s.sample(0, true);
@@ -1264,6 +1294,7 @@ fn main() {
     let mut last_slow_sec = last_sample_sec;
     let mut last_pol_sec = last_sample_sec;
     let mut last_min = last_sample_sec / 60;
+    let (mut net_held, mut net_last) = (0u32, 0i64);
     let mut winch_at: Option<i64> = None;
     let mut esc_at: Option<i64> = None;
     // smooth: next frame on the grid, the time the animation state is at, frames per
@@ -1325,9 +1356,21 @@ fn main() {
         // the process clock is a syscall, which faster speeds needn't pay per frame)
         let c = if eco { term::cpu_ns() } else { cpu_mark };
         let now = term::mono();
+        // sensors page: the sensor reads have their own share of the budget (`zp`,
+        // planned from their measured costs and periods, see sensors::Sens::period),
+        // the rest of the wakeup is charged here. A board's sensor chip can cost
+        // 2.5 ms a read, so any minute holding one keeps the rest under ~25 µs/s: the
+        // bucket holds 0.4 ms there (bursts of the rest stay small)
+        let zs = st.app.z.take_spent();
+        let zp = if eco && st.app.page == ui::PG_SENS {
+            st.app.z.planned(true).min(48_000)
+        } else {
+            0
+        };
+        let cap = if zp > 0 { CAP / 3 } else { CAP };
         // (a wakeup that handled keys, a resize or a resume is the user's: it may use
         // up saved tokens, never borrow)
-        tokens = (tokens - (c - cpu_mark)).max(if user { tokens.min(0) } else { i64::MIN });
+        tokens = (tokens - (c - cpu_mark - zs).max(0)).max(if user { tokens.min(0) } else { i64::MIN });
         if !eco {
             tokens = CAP;
         }
@@ -1335,8 +1378,9 @@ fn main() {
         user = false;
         // wakeups dearer than CAP: the bucket holds one, and fills slower by the excess
         // over a minute (so any minute still stays under BUDGET + CAP / 60)
-        let over = (est - CAP).max(0);
-        tokens = (tokens + (BUDGET - over / 60) * (now - refill_t) / SEC).min(CAP + over);
+        let over = (est - cap).max(0);
+        let budget = BUDGET - zp;
+        tokens = (tokens + (budget - over / 60) * (now - refill_t) / SEC).min(cap + over);
         refill_t = now;
         // next sample: eco = whole wall-clock seconds, gap by activity, paid by
         // tokens; fixed speed = the next tick of the 1/hz grid
@@ -1344,7 +1388,7 @@ fn main() {
             let gap = if active_left > 0 { 1 } else { IDLE_GAP };
             let mut t = (last_tick + gap) * SEC - offset;
             if tokens < est {
-                t = t.max(now + (est - tokens) * SEC / (BUDGET - over / 60));
+                t = t.max(now + (est - tokens) * SEC / (budget - over / 60).max(1_000));
                 t = (wall_sec(t, offset) + 1) * SEC - offset;
             }
             t
@@ -1432,18 +1476,22 @@ fn main() {
             last_push_sec = sec;
             // slow sensors: one temperature every 3 s (round robin; smooth: all of
             // them every second), load average every 5 s, governor / EPP every 10 s
-            if smooth && push > 0 {
+            let zpage = st.app.page == ui::PG_SENS;
+            if zpage {
+                // (the sensors page reads its own)
+            } else if smooth && push > 0 {
                 last_temp_sec = sec;
                 prof(4, || st.app.s.read_temps(true));
             } else if sec - last_temp_sec >= 3 {
                 last_temp_sec = sec;
                 prof(4, || st.app.s.read_temps(false));
             }
-            if sec - last_slow_sec >= 5 {
+            // (load average, governor: not on the sensors page)
+            if sec - last_slow_sec >= 5 && !zpage {
                 last_slow_sec = sec;
                 prof(5, || st.app.s.read_slow());
             }
-            if sec - last_pol_sec >= 10 {
+            if sec - last_pol_sec >= 10 && !zpage {
                 last_pol_sec = sec;
                 st.app.s.read_policy();
             }
@@ -1453,7 +1501,17 @@ fn main() {
             // sample there (eco; other speeds twice a second), its histories get the
             // seconds in between from the next one
             cpu_held += push;
-            cpu_skip = st.app.page == ui::PG_NET && (if eco { !cpu_skip } else { tick % 5 != 0 });
+            // (the sensors page: one in four in eco)
+            cpu_skip = (st.app.page == ui::PG_NET || zpage)
+                && (if eco {
+                    if zpage {
+                        nsamp % 6 != 0
+                    } else {
+                        !cpu_skip
+                    }
+                } else {
+                    tick % 5 != 0
+                });
             if !cpu_skip {
                 let push = std::mem::take(&mut cpu_held);
                 prof(0, || st.app.s.sample(push, clocks));
@@ -1507,7 +1565,19 @@ fn main() {
             }
             // network & system: links every sample while shown (every 10 s hidden, to
             // keep their history), the rest on its own spread-out schedule (net::tick)
-            st.app.n.tick(now, push, st.app.page == ui::PG_NET, eco);
+            // (the sensors page in eco: the hidden links' history every 30 s, its
+            // seconds held until then)
+            net_held += push;
+            if !(zpage && eco && now - net_last < 30 * SEC) {
+                net_last = now;
+                let push = std::mem::take(&mut net_held);
+                st.app.n.tick(now, push, st.app.page == ui::PG_NET, eco);
+            }
+            // sensors & power (view 5): only while shown, each source on its own
+            // cadence (sensors::Sens::tick)
+            if zpage {
+                prof(4, || st.app.z.tick(now, push, eco));
+            }
             // processes page (view 4): only while shown, see App::procs_sample
             if st.app.page == ui::PG_PROC {
                 prof(16, || st.app.procs_sample(now, eco, smooth, tick, push));
@@ -1547,7 +1617,7 @@ fn main() {
             if eco && nsamp > 2 {
                 // a slowly decaying peak: the dearer wakeups (scans, refreshes) every
                 // few samples keep it up (not the first samples: start-up, first scans)
-                let spent = term::cpu_ns() - cpu_mark;
+                let spent = term::cpu_ns() - cpu_mark - st.app.z.spent();
                 est = if spent > est {
                     spent
                 } else {

@@ -19,13 +19,15 @@ pub const PG_CPU: usize = 0;
 pub const PG_MEM: usize = 1;
 pub const PG_NET: usize = 2;
 pub const PG_PROC: usize = 3;
-pub const NPAGES: usize = 4;
+pub const PG_SENS: usize = 4;
+pub const NPAGES: usize = 5;
 /// (tab label, config / --page name)
 pub fn page_name(p: usize) -> (&'static str, &'static str) {
     match p {
         PG_MEM => ("mem", "memory"),
         PG_NET => ("net", "network"),
         PG_PROC => ("proc", "processes"),
+        PG_SENS => ("sens", "sensors"),
         _ => ("cpu", "cpu"),
     }
 }
@@ -36,6 +38,7 @@ pub fn page_index(name: &str) -> Option<usize> {
         "memory" | "mem" => Some(PG_MEM),
         "network" | "net" => Some(PG_NET),
         "processes" | "proc" => Some(PG_PROC),
+        "sensors" | "sens" | "power" | "fans" => Some(PG_SENS),
         _ => None,
     }
 }
@@ -1078,17 +1081,15 @@ impl App {
     }
 
     /// Panels the page draws (kitty glass placements).
-    pub fn page_rects(&self) -> [Rect; 4] {
+    pub fn page_rects(&self) -> [Rect; 5] {
+        let mut r = [Rect::default(); 5];
         match self.page {
-            PG_PROC => [
-                self.pv.lay.table,
-                self.pv.lay.detail,
-                Rect::default(),
-                Rect::default(),
-            ],
-            PG_NET => self.nl.rects(),
-            _ => [Rect::default(); 4],
+            PG_PROC => (r[0], r[1]) = (self.pv.lay.table, self.pv.lay.detail),
+            PG_NET => r[..4].copy_from_slice(&self.nl.rects()),
+            PG_SENS => r = self.zl.rects(),
+            _ => {}
         }
+        r
     }
 
     // ── keys ───────────────────────────────────────────────────────────────

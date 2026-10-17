@@ -17,6 +17,10 @@ pub use procui::*;
 #[path = "netui.rs"]
 mod netui;
 pub use netui::*;
+// view 5: sensors & power
+#[path = "sensui.rs"]
+mod sensui;
+pub use sensui::*;
 
 const SLOT_TITLE: usize = 0;
 const SLOT_GLOAD: usize = 1;
@@ -421,6 +425,11 @@ pub struct App {
     pub nl: NetLay,
     nv: NA,
     ncache: Vec<u64>,
+    /// view 5: sensors & power (sensui.rs)
+    pub z: crate::sensors::Sens,
+    pub zl: SensLay,
+    zv: ZA,
+    zcache: Vec<u64>,
     /// view 4: processes (procui.rs)
     pub pv: PV,
     /// colour of the series in `vals2` that `graph` draws under its own (0: none)
@@ -506,6 +515,10 @@ impl App {
             nl: NetLay::default(),
             nv: NA::default(),
             ncache: Vec::new(),
+            z: crate::sensors::Sens::empty(),
+            zl: SensLay::default(),
+            zv: ZA::default(),
+            zcache: Vec::new(),
             pv: PV::new(),
             under: std::cell::Cell::new(0),
             ctop: Default::default(),
@@ -564,6 +577,7 @@ impl App {
         self.anim_numbers(1.0);
         self.mem_retarget(false);
         self.net_retarget(false);
+        self.sens_retarget(false);
     }
 
     /// Smooth mode, after a sample: the bars' new targets.
@@ -587,6 +601,7 @@ impl App {
         }
         self.mem_retarget(true);
         self.net_retarget(true);
+        self.sens_retarget(true);
     }
 
     /// Smooth mode: advance every spring by `dt` s. Returns whether anything moves.
@@ -627,7 +642,7 @@ impl App {
         }
         let ta = &mut self.ta;
         moving |= spring(&mut ta.0, &mut ta.1, self.s.avg_r, dt, W_CLOCK, xf, 1.0);
-        moving | self.mem_step(dt) | self.proc_step(dt) | self.net_step(dt)
+        moving | self.mem_step(dt) | self.proc_step(dt) | self.net_step(dt) | self.sens_step(dt)
     }
 
     /// Smooth mode: the digits follow the moving values (with hysteresis, see
@@ -944,10 +959,14 @@ impl App {
         // views 3 (network, netui.rs) and 4 (processes, procui.rs)
         self.pv.lay = PLay::default();
         self.nl = NetLay::default();
-        if self.page == PG_NET || self.page == PG_PROC {
+        self.zl = SensLay::default();
+        if self.page == PG_NET || self.page == PG_PROC || self.page == PG_SENS {
             self.fit_cpu(w, h);
             if self.page == PG_NET {
                 self.nl = self.net_layout(area);
+            }
+            if self.page == PG_SENS {
+                self.zl = self.sens_layout(area);
             }
             if self.page == PG_PROC {
                 self.proc_layout(area);
@@ -1276,11 +1295,14 @@ impl App {
             if self.page == PG_NET {
                 self.draw_net(scr, false, false);
             }
+            if self.page == PG_SENS {
+                self.draw_sens(scr, false, false);
+            }
         }
     }
 
     pub fn draw(&mut self, scr: &mut Screen, full: bool) {
-        let full = full || self.menu.is_some() || self.net_refit();
+        let full = full || self.menu.is_some() || self.net_refit() || self.sens_refit();
         if !self.paused && !self.anim {
             prof(13, || {
                 self.prev_order.clone_from(&self.order);
@@ -1378,6 +1400,8 @@ impl App {
             prof(15, || self.draw_proc_page(scr, full, false));
         } else if self.page == PG_NET {
             prof(15, || self.draw_net(scr, full, true));
+        } else if self.page == PG_SENS {
+            prof(15, || self.draw_sens(scr, full, true));
         }
         if full {
             self.draw_keys(scr);
@@ -1619,6 +1643,8 @@ impl App {
         };
         let (minfo, dinfo) = if self.page == PG_NET {
             self.net_info()
+        } else if self.page == PG_SENS {
+            self.sens_info()
         } else {
             (minfo, dinfo)
         };
@@ -1626,6 +1652,7 @@ impl App {
             match self.page {
                 PG_PROC => "  processes",
                 PG_NET => "  network & system",
+                PG_SENS => "  sensors & power",
                 _ => "  memory & storage",
             },
             t.fg | BOLD,
@@ -3715,7 +3742,7 @@ impl App {
         ];
         let keys: &[(char, &str, Option<&str>, &str)] = match self.page {
             PG_MEM => &mem_keys,
-            PG_NET => &mem_keys[..3],
+            PG_NET | PG_SENS => &mem_keys[..3],
             PG_PROC => &proc_keys,
             _ => &cpu_keys,
         };

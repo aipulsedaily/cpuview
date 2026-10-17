@@ -6,9 +6,11 @@ plus a **Memory & Storage** page (`m` or `2`) written for people who aren't Linu
 RAM is in use and whether that's fine, what the disk is doing now and did a minute ago, how full
 each drive is, and which programs use the most memory, live; a **Network & System** page (`3`):
 download and upload per link now and over the last minutes, the listening ports and who owns
-them, connections, containers and services; and a **Processes** page (`4`):
+them, connections, containers and services; a **Processes** page (`4`):
 every process with its CPU, memory and disk use, as a list, grouped by program or as a tree, with
-signals and nice. Native Rust, one 1.1 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+signals and nice; and a **Sensors & Power** page (`5`): every temperature by part with plain
+names, the fans and how the board drives them, CPU / GPU / battery watts, voltages, and the
+drivers it all comes from. Native Rust, one 1.1 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 45–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -54,6 +56,18 @@ aren't connected and the virtual ones; the traffic of the last ~2 minutes as sta
 connection counts, the listening ports with what they listen on and the program or container
 behind them, the busiest remote ends; the Docker containers' health, CPU, memory and network;
 what the logged-in users run and the systemd services, busiest first.*
+
+![Sensors & Power page, 128×45](docs/screenshots/rust-sensors-128x45.webp)
+
+*`5`: the Sensors & Power page at 128×45 on the ASUS ProArt B850 / Ryzen 9 9950X it was built
+on. Temperatures by part with plain names ("CPU chiplet 1", "motherboard", "RAM stick 2", "SSD",
+"network eno1"), the chip's own name dim at the end ("Tccd1", "SYSTIN", "AUXTIN0"), a bar
+against each sensor's limit, green / amber / red; unlabelled motherboard inputs that read
+nonsense (−60 °C, 0 °C, colder than the board) are dropped. The two CPU fans with the speed the
+board sets them to and their headers (CPU_FAN, CPU_OPT), the five empty headers in one line,
+and how fresh the reading is (this board's sensor chip costs 2.5 ms of CPU a read). CPU power
+here needs a one-time permission (`cpuview --setup-sensors`); the iGPU's own meter, voltages,
+and every driver with what it shows.*
 
 ![4K, 415x105, CPU view with the memory column](docs/screenshots/rust-4k-memory.webp)
 
@@ -224,6 +238,63 @@ no systemd, no Wi-Fi...). No root needed, no extra packages.
 - 40×12 shows the link's rates and the containers' count and health; from 100 columns the page
   has two columns.
 
+### Sensors & Power
+
+Everything is found at run time, on any Linux machine: hwmon chips, thermal zones (Raspberry
+Pi and other ARM boards), RAPL energy counters (powercap or perf), batteries and mains power;
+what a machine doesn't have isn't shown, and a virtual machine says the host has them. Nothing
+is read for the page while it isn't shown.
+
+- **Temperatures** grouped by part — CPU (Tctl / Tdie and each chiplet on AMD, the package and
+  every core on Intel, the SoC on ARM), motherboard & chipset, memory (each DDR5 / DDR4 stick's
+  own sensor), storage (NVMe, SATA via drivetemp), graphics, network chips and Wi-Fi, other —
+  each with a plain name, its value, its highest in the last 2 minutes, a bar against its limit
+  (the chip's own max / crit when they are sane, else a default for that kind of part) in
+  green / amber / red, and the chip's name for it dimly beside it. Motherboard chips' unlabelled
+  inputs that read nonsense are dropped: placeholders at 0 °C, disconnected inputs at −60 /
+  −128 / 127 °C, and inputs colder than the board itself by more than 8 °C (nothing inside a
+  running computer is). Unlabelled inputs that look real stay, marked as such, and don't count
+  for the panel's verdict. Small graphs of the key ones over the last few minutes.
+- **Fans**: speed, a bar against the fastest seen (or what the duty cycle suggests at 100 %),
+  the duty the board sets ("board sets 42 %", "fixed at 60 %", "full speed") and the header:
+  ASUS / Nuvoton boards' CPU_FAN, CPU_OPT, CHA_FAN… (a "?" where the header is a guess), labels
+  from Dell, ThinkPad, Apple and ASUS EC drivers; otherwise "fan 3". Headers with nothing
+  connected share one line. A CPU fan that spun and reads 0 turns the headline red. Speed over
+  time with both CPU fans.
+- **Power**: CPU package watts and, where the CPU counts it per core (AMD Zen, through perf),
+  each core and "cores vs the rest of the CPU"; Intel's core / uncore / DRAM / platform domains;
+  the GPU's own meter (amdgpu, nouveau, Intel energy counters); a laptop's battery (watts,
+  charge, charging or not, time to empty / full) and mains. RAPL counters wrap (handled with
+  `max_energy_range_uj`) and tick about once a millisecond, so watts come from windows of at
+  least 0.4 s. Counters are root-only on most distributions: the page then says so and
+  `cpuview --setup-sensors` (below) makes them readable.
+- **Voltages** compactly: the CPU core (Vcore), +12 V / +5 V through Nuvoton's usual dividers
+  (only where that gives a plausible value), 3.3 V, standby, the CMOS battery, the GPU's and
+  SoC's rails; only rails outside limits the chip sets stand out.
+- **Sensor sources**: every driver (two DIMM sensors are "spd5118 ×2"), what it is and shows,
+  the board (DMI), how CPU power is read or why not; with no fan sensors, the driver this
+  board's maker usually needs (nct6775, it87, asus_ec_sensors, asus_wmi_sensors,
+  dell_smm_hwmon, thinkpad_acpi, applesmc, …, found by DMI vendor, not modinfo) and whether
+  it's installed, else `sudo sensors-detect`. cpuview never loads modules itself.
+- 40×12 shows the temperatures and the fans; from 100 columns the page has two columns, from
+  200 three.
+
+`cpuview --setup-sensors` shows the shell commands it would run as root, each with what it
+changes and why, asks, and only then runs exactly those with sudo (`--dry-run` only shows
+them; `--undo` reverses everything it did):
+
+- the board's fan driver, if one is known and installed but not loaded: written to
+  `/etc/modules-load.d/cpuview-<module>.conf` and loaded now;
+- CPU power: a udev rule (`/etc/udev/rules.d/70-cpuview-rapl.rules`) that makes the RAPL
+  `energy_uj` counters readable by everyone at every boot, and the same now. Caveat: RAPL
+  readings can leak information about what other users' programs do (power side channels,
+  e.g. the 2020 PLATYPUS attack), which is why distributions lock them down; on a single-user
+  machine that is no concern;
+- with `--per-core`: the perfmon capability on the installed binary, for per-core power
+  through perf (the kernel's `perf_event_paranoid` allows it only that way). File
+  capabilities are lost when the binary is replaced, so redo it after every `./install.sh`;
+  the udev rule alone gives the package's watts.
+
 ## Install
 
 Needs a Rust toolchain (<https://rustup.rs>) on Linux.
@@ -248,7 +319,7 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 |---|---|
 | `↑↓←→` / `hjkl` / click | select a core (columns run top to bottom) |
 | `s` | update speed: eco → smooth → 1 → 2 → 4 → 10 → 20 → 30 → 60 per second → eco |
-| `1` `2` `3` `4` / `tab` / `shift-tab` | pages: CPU, Memory & Storage, Network & System, Processes (remembered; `--page cpu\|memory\|network\|processes`; the footer's tabs are clickable) |
+| `1` `2` `3` `4` `5` / `tab` / `shift-tab` | pages: CPU, Memory & Storage, Network & System, Processes, Sensors & Power (remembered; `--page cpu\|memory\|network\|processes\|sensors`; the footer's tabs are clickable) |
 | `m` | CPU view ⇄ Memory & Storage page |
 | `p` | Memory & Storage: top programs by memory ⇄ each process |
 | `+` / `-` | faster / slower (`=` works as `+`) |
@@ -264,7 +335,7 @@ Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuv
 
 On the Processes page (`4`) the arrows, `pgup` / `pgdn` / `home` / `end`, the mouse wheel
 and clicks move the selection, and these keys change meaning (the global ones — `q`, `space`,
-`s`, `+` `-`, `t`, `1`–`4`, `tab` — still work):
+`s`, `+` `-`, `t`, `1`–`5`, `tab` — still work):
 
 | Key | Processes page |
 |---|---|
@@ -526,6 +597,37 @@ formatter), loops instead of iterator chains and closures (each extra function c
 tables too), one generic insertion sort, a shell sort for the connection table; and to make room,
 the palette's median cut sorts by one channel with a counting sort (−4 KB) and the stack
 formatter's constructor isn't inlined at its hundreds of call sites (−4 KB).
+
+**Sensors & Power data** costs what the hardware makes it cost, which differs by three
+orders of magnitude (cold cache, this machine): a k10temp temperature 3–6 µs, a cached hwmon
+attribute 1–2 µs, a DIMM sensor (SMBus) ~95 µs, the amdgpu power reading (a message to the
+GPU's firmware) 50–400 µs, and the motherboard's Nuvoton chip 2.5–3 ms: its driver re-reads
+all ~300 registers over the LPC bus whenever its 1.5 s cache is stale, so the first attribute
+of a read pays for all of them. Each source is therefore read on its own cadence, stretched
+by its measured cost to a share of the budget (eco: CPU temperatures every 3 s, the board chip
+— fans, board temperatures, voltages — every ~70–100 s, RAM / SSD / network chips every 60 s
+or more, at most one dear read every 30 s; smooth: the board chip every ~4 s, CPU power twice
+a second), and the page says how fresh the fans are. In eco the reads have their own share of
+the token bucket and the rest of the page keeps under ~25 µs/s, so even a minute that holds a
+2.7 ms board-chip read stays under 85 µs/s; the price is that eco updates this page every
+~5 s at 128×45 (~15–30 s at 415×105). Nothing is read while the page is hidden; the
+histories mark that time as a gap.
+
+| sensors page, 60 s runs (machine idle) | CPU per second | output | RSS |
+|---|---|---|---|
+| eco 128×45 · 415×105, a minute without a board-chip read | 27.8 · 27.7 µs | 0.1 · 0.0 KB/s | 4.2 · 4.9 MB |
+| eco 128×45 · 415×105, the worst 60 s window of a 5-minute run (with a 2.9–3.8 ms board-chip read in it) · the 5-minute average | 74.8 · 67.0 µs · 50.6 · 26.3 µs | | |
+| smooth 128×45 · 172×40 | 4.1 · 4.1 ms | 2.8 · 3.1 KB/s | 4.3 · 4.2 MB |
+| (same session) the other pages, eco 128×45: CPU · memory · network · processes | 66.9 · 67.1 · 62.6 · 47.2 µs | | 4.1–4.2 MB |
+
+Smooth frames stay on the 60 fps grid (offset from the grid p95 1.3 ms); frames are written
+only when something changed, which on this page is a few times a second. Values match
+`sensors` (lm-sensors) and sysfs; with root, CPU package watts matched
+`perf stat -e power/energy-pkg/` (60.3 W over 2 s vs 58.5 W shown) and the cores' total its
+`power_core/energy-core/` (22.4 vs 20.8 W). The page adds about 94 KB to the binary
+(1,210,160 bytes): name tables as single strings (no relocated `&str` tables), paths and small
+files on the stack instead of `String`s, rows written straight into one reused buffer, and
+`--setup-sensors` as a shell script it shows before running.
 
 What makes that possible:
 

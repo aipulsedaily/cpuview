@@ -450,7 +450,7 @@ impl App {
 
     /// A table row: cells (text, colour, width): `w > 0` left-aligned and clipped in
     /// w cells, `w < 0` right-aligned in -w cells, 0 as it is; then blanks to `maxx`.
-    fn row(scr: &mut Screen, mut x: usize, y: usize, maxx: usize, cells: &[(&str, u32, i32)]) {
+    pub(crate) fn row(scr: &mut Screen, mut x: usize, y: usize, maxx: usize, cells: &[(&str, u32, i32)]) {
         let bg = surf(S_PANEL);
         for &(s, c, w) in cells {
             let wa = w.unsigned_abs() as usize;
@@ -475,7 +475,7 @@ impl App {
         }
     }
 
-    fn blank(scr: &mut Screen, x: usize, y: &mut usize, end: usize, maxx: usize) {
+    pub(crate) fn blank(scr: &mut Screen, x: usize, y: &mut usize, end: usize, maxx: usize) {
         while *y < end {
             Self::row(scr, x, *y, maxx, &[]);
             *y += 1;
@@ -1423,7 +1423,7 @@ impl App {
 }
 
 /// Concatenated (cheaper in code than formatting).
-fn fc(p: &[&str]) -> F {
+pub(crate) fn fc(p: &[&str]) -> F {
     let mut f = F::new();
     for s in p {
         f.str(s);

@@ -308,7 +308,7 @@ impl App {
         self.mem_retarget(false);
     }
 
-    fn hcol(&self, l: u8) -> u32 {
+    pub(crate) fn hcol(&self, l: u8) -> u32 {
         match l {
             0 => self.t.good,
             1 => self.t.warn,
