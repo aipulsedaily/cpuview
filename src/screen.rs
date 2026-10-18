@@ -512,14 +512,17 @@ impl Comp {
                             // frames, graph dots, bars: 3:1 against the picture
                             out.fg = self.mark(fg_rgb, out.bg);
                         }
-                        // frames, grid lines and bars: a pixel patch draws them over the
-                        // picture itself (not a bar's anti-aliased end: a blend)
+                        // frames and grid lines: a pixel patch draws them over the picture
+                        // itself (bars' tracks too)
                         out.pix = if c.fg & BLEND != 0 {
                             false
                         } else if c.fg & TRACK != 0 {
                             matches!(c.ch, '▁'..='▄')
                         } else {
-                            ink_glyph(c.ch) || matches!(c.ch, '▁'..='█')
+                            // (not blocks: drawn as text they look the same in every
+                            // frame, while a cell waiting for its patch would show one
+                            // look and then another as a graph scrolls)
+                            ink_glyph(c.ch)
                         };
                     }
                 }
@@ -1800,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn borders_and_bars_are_drawn_into_patches() {
+    fn borders_are_drawn_into_patches_and_bars_stay_text() {
         let t = theme();
         let comp = Comp::new(&t, Look::Glass);
         let (w, h) = (80usize, 5usize);
@@ -1818,18 +1821,19 @@ mod tests {
             },
         );
         s.put(1, 0, '─', t.border, surf(S_PANEL));
-        // a bar: the lower quarter in its colour; an anti-aliased end stays text
+        // a bar and an anti-aliased end: text (blocks look the same in every frame
+        // as text, while a patch would replace a text cell some frames later)
         s.put(2, 0, '▂', 0x123456, surf(S_PANEL));
         s.put(3, 0, '▂', 0x654321 | 8 << BLEND_SHIFT, surf(S_PANEL));
-        // 70 more colours on row 1: the inks run out, the rest stay text
+        // 70 more colours of lines on row 1: the inks run out, the rest stay text
         for x in 0..70 {
-            s.put(x, 1, '▄', 0xa0c0c0 + x as u32, surf(S_PANEL));
+            s.put(x, 1, '│', 0xa0c0c0 + x as u32, surf(S_PANEL));
         }
         let out = String::from_utf8_lossy(s.flush(&comp, Some(&bd), Depth::True, Patch::Sixel))
             .to_string();
         let seq = &out[out.find("\x1bP0;1;0q").unwrap()..];
         let seq = &seq[..seq.find("\x1b\\").unwrap() + 2];
-        // the border colour is the first ink of the picture, the bar's the second
+        // the border colour is the first ink of the picture
         let def = |c: u32, ix: u8| {
             let [r, g, b] = crate::color::ch(c);
             let p = |v: u8| (v as u32 * 100 + 127) / 255;
@@ -1838,24 +1842,21 @@ mod tests {
         // (each made 3:1 against the picture behind its cell)
         let ink = |ch: char, fg: u32, x: usize| comp.ink(Cell { ch, fg, bg: surf(S_PANEL) }, x, 0, &bd);
         assert!(seq.contains(&def(ink('─', t.border, 1), INK)), "{seq:?}");
-        assert!(seq.contains(&def(ink('▂', 0x123456, 2), INK + 1)));
-        assert!(contrast(ink('▂', 0x123456, 2), 0x123456) > 1.0);
         let (dw, _, px) = crate::gfx::sixel_decode(seq.as_bytes());
         // the line: a row of ink across cell 1, picture above and below
         assert!((10..20).all(|x| px[9 * dw + x] == Some(INK)));
         assert!(px[2 * dw + 15] != Some(INK) && px[2 * dw + 15].is_some());
-        // the bar: rows 15..20 of cell 2
-        assert!(px[16 * dw + 25] == Some(INK + 1) && px[14 * dw + 25] != Some(INK + 1));
-        // the blend cell is transparent (written as text afterwards)
-        assert!(px[16 * dw + 35].is_none());
-        // row 1: 63 inks left, so 63 bar cells in the picture and 7 written as text
+        // the bars: transparent in the picture, written as text afterwards
+        assert!(px[16 * dw + 25].is_none() && px[16 * dw + 35].is_none());
+        // row 1: 64 inks left, so 64 line cells in the picture and 6 written as text
         let row1 = (0..w)
-            .filter(|&x| px[(20 + 16) * dw + x * 10].is_some_and(|v| v >= INK))
+            .filter(|&x| px[(20 + 10) * dw + x * 10 + 4].is_some_and(|v| v >= INK))
             .count();
-        assert_eq!(row1, 63);
+        assert_eq!(row1, 64);
         let text = &out[out.find("\x1b\\").unwrap()..];
         assert_eq!(text.matches('─').count(), 0);
-        assert_eq!(text.matches('▄').count(), 7);
+        assert_eq!(text.matches('▂').count(), 2);
+        assert_eq!(text.matches('│').count(), 6);
     }
 
     #[test]

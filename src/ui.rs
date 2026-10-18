@@ -318,8 +318,6 @@ pub const SIDE_W: usize = 190;
 pub const SIDE_H: usize = 36;
 pub const CLK: char = '▂';
 pub const LOAD: char = '▄';
-/// Fill under a history curve: the line colour blended to SOFT/16 into the track.
-const SOFT: u32 = 6;
 
 #[derive(Clone, Copy, Debug)]
 struct Plan {
@@ -1761,7 +1759,11 @@ impl App {
         }
     }
 
-    /// Braille area graph of the most recent `2 * w` values in `vals` (chronological).
+    /// Area graph of the most recent `2 * w` values in `vals` (chronological): one
+    /// column of eighth blocks per cell, as tall as the higher of the cell's two values.
+    /// Blocks look the same drawn as text or as pixel ink (sixel/iterm patches), so a
+    /// column keeps its look while it scrolls (braille read as dots until its cell was
+    /// patched, then as solid ink).
     #[allow(clippy::too_many_arguments)]
     pub fn graph(
         &self,
@@ -1778,79 +1780,52 @@ impl App {
             return;
         }
         let bg = surf(S_PANEL);
-        let top = (h * 4) as f32;
-        // dot height of every half-column, computed once (not once per row)
+        let top = (h * 8) as f32;
+        // height in eighths of every column, computed once (not once per row)
         let w = w.min(1024);
         // a second series drawn under the first in its own colour (`under`, `vals2`)
         let uc = self.under.get();
-        let mut dots = [[0u16; 2]; 2048];
+        let mut hts = [[0u16; 2]; 1024];
         for (k, vals) in [vals, &self.vals2[..]]
             .into_iter()
             .enumerate()
             .take(1 + (uc != 0) as usize)
         {
             let n = vals.len();
-            for (i, d) in dots.iter_mut().enumerate().take(2 * w) {
-                // i over 0..2w; vals are right-aligned (newest last)
-                let j = n as isize - 2 * w as isize + i as isize;
-                if j < 0 {
-                    continue;
+            for (i, d) in hts.iter_mut().enumerate().take(w) {
+                // the cell's two values (i over 0..w; vals right-aligned, newest last):
+                // the higher one, so a one-sample spike keeps its full height
+                let mut v = 0.0f32;
+                for j in [2 * i, 2 * i + 1] {
+                    let j = n as isize - 2 * w as isize + j as isize;
+                    if j >= 0 {
+                        v = v.max(vals[j as usize]);
+                    }
                 }
-                let v = vals[j as usize];
                 if v > 0.0 {
                     d[k] = (v / vmax * top).round().max(1.0).min(top) as u16;
                 }
             }
         }
-        let dot = |i: usize| dots[i][0].max(dots[i][1]) as usize;
+        // grid lines at 25 / 50 / 75 %, in braille dots (4 per cell) on empty cells
+        let dots = (h * 4) as f32;
         let gl = [
-            (0.25 * top).round() as usize,
-            (0.5 * top).round() as usize,
-            (0.75 * top).round() as usize,
+            (0.25 * dots).round() as usize,
+            (0.5 * dots).round() as usize,
+            (0.75 * dots).round() as usize,
         ];
         for r in 0..h {
-            let base = (h - 1 - r) * 4;
+            let base = (h - 1 - r) * 8;
             let col = ramp.at((h as f32 - r as f32 - 0.5) / h as f32);
-            let grid_bit = (0..4).find(|k| gl.contains(&(base + k + 1)));
-            for i in 0..w {
-                let (a, b) = (dot(2 * i), dot(2 * i + 1));
-                let mut code = 0;
-                if a >= base + 4 && b >= base + 4 {
-                    code = 0xff;
-                } else if a > base || b > base {
-                    for (k, &(lb, rb)) in BRAILLE.iter().enumerate() {
-                        if a > base + k {
-                            code |= lb;
-                        }
-                        if b > base + k {
-                            code |= rb;
-                        }
-                    }
-                }
-                if code != 0 {
-                    let mine = dots[2 * i][0] as usize > base || dots[2 * i + 1][0] as usize > base;
-                    // an area, not a slab: cells under the curve's edge (both halves
-                    // go on above) are a soft fill, the edge itself stays bright
-                    let inside = a > base + 4 && b > base + 4;
-                    let c = if !mine {
-                        uc
-                    } else if inside {
-                        col | SOFT << BLEND_SHIFT
-                    } else {
-                        col
-                    };
-                    // the fill under the curve is solid (a full block in the soft
-                    // colour: braille ⣿ would read as a hatched texture); the edge
-                    // keeps braille's two columns of resolution
-                    // (a full cell is a block whether the curve's edge or its fill: a
-                    // value wavering at a cell boundary changes the colour, never the
-                    // glyph)
-                    let g = if code == 0xff && mine {
-                        '█'
-                    } else {
-                        char::from_u32(0x2800 + code).unwrap()
-                    };
-                    scr.put(x0 + i, y0 + r, g, c, bg);
+            let grid_bit = (0..4).find(|k| gl.contains(&((h - 1 - r) * 4 + k + 1)));
+            for (i, d) in hts.iter().enumerate().take(w) {
+                let (a, b) = (d[0] as usize, d[1] as usize);
+                let t = a.max(b);
+                if t > base {
+                    // the curve's own colour all the way down (a solid column, no
+                    // separate fill tint); the series under it where only it reaches
+                    let c = if a > base { col } else { uc };
+                    scr.put(x0 + i, y0 + r, BLOCKS[(t - base).min(8) - 1], c, bg);
                 } else if let (Some(k), true) = (grid_bit, i % 2 == 0) {
                     scr.put(
                         x0 + i,
@@ -4424,6 +4399,30 @@ mod tests {
         assert!((0..3).all(|i| cell(i) & (TRACK | BLEND) == 0));
         assert_eq!((cell(3) & BLEND) >> BLEND_SHIFT, 1, "edge cell covers 1/16");
         assert!((4..10).all(|i| cell(i) & TRACK != 0));
+    }
+
+    #[test]
+    fn graph_columns_keep_their_look_while_scrolling() {
+        // a column is drawn the same at the newest position and after it has scrolled
+        // left: solid eighth blocks in the curve's colour, never braille (dots as text,
+        // solid as pixel ink) and never a blended fill (a grey slab over a picture)
+        let a = app(4, 1, 1);
+        let (w, h) = (8usize, 3usize);
+        let col = |vals: &[f32], i: usize| {
+            let mut scr = Screen::new(w, h);
+            a.graph(&mut scr, 0, 0, w, h, vals, 1.0, &a.t.load);
+            (0..h).map(|r| (scr.buf[r * w + i].ch, scr.buf[r * w + i].fg)).collect::<Vec<_>>()
+        };
+        let mut vals = vec![0.0f32; 2 * w];
+        vals[2 * w - 1] = 0.7;
+        let newest = col(&vals, w - 1);
+        // four samples later: two cells to the left
+        vals.drain(..4);
+        vals.extend([0.0; 4]);
+        assert_eq!(col(&vals, w - 3), newest);
+        assert!(newest.iter().all(|&(ch, fg)| !('\u{2800}'..='\u{28ff}').contains(&ch) && fg & BLEND == 0));
+        // 0.7 of 24 eighths = 17: two full cells and one eighth on top
+        assert_eq!(newest.iter().map(|c| c.0).collect::<String>(), "▁██");
     }
 
     #[test]
