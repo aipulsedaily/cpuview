@@ -157,16 +157,13 @@ pub fn speed_index(v: &str) -> usize {
 }
 /// How far toward the theme's background a chart's base is shaded (see `App::deep`).
 const DEPTH: f32 = 0.4;
-/// Cells under a graph's edge over which its fill deepens to its base shade.
-const GDEEP: usize = 4;
 /// Cells behind a bar's head over which it deepens to its base shade.
 const HEAD: usize = 6;
 
 /// Depth (0..1, see `App::deep`) of whole cell `i` of a bar filled to `n` sixteenths:
-/// lit at the head, deeper over the `HEAD` cells behind it (bars only go 3/5 of the way:
-/// one row of half blocks reads dim sooner than a column or an area).
+/// lit at the head, deeper over the `HEAD` cells behind it.
 pub fn bar_depth(i: usize, n: usize) -> f32 {
-    n.div_ceil(16).saturating_sub(i + 1).min(HEAD) as f32 / HEAD as f32 * 0.6
+    n.div_ceil(16).saturating_sub(i + 1).min(HEAD) as f32 / HEAD as f32
 }
 
 const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -1848,15 +1845,10 @@ impl App {
         for r in 0..h {
             let base = (h - 1 - r) * 4;
             let col = ramp.at((h as f32 - r as f32 - 0.5) / h as f32);
-            // the fill: a darker shade of the curve's colour (toward the theme's
-            // background; not a blend into the track: a grey slab over pictures),
-            // deeper with each cell below its column's edge (`deep` over `GDEEP` cells)
-            // so the area has depth at any height instead of reading as a flat slab
-            let lit = self.shade(col, 0.3);
-            let mut fill = [0u32; GDEEP + 1];
-            for (k, f) in fill.iter_mut().enumerate().skip(1) {
-                *f = self.deep(lit, k as f32 / GDEEP as f32) | FILL;
-            }
+            // the fill: the curve's colour, light near the top of the graph and deep at
+            // its base (as the column charts; not a blend into the track: a grey slab
+            // over pictures)
+            let fill = self.fill_shade(col, h - 1 - r, h);
             let grid_bit = (0..4).find(|k| gl.contains(&(base + k + 1)));
             for i in 0..w {
                 let (a, b) = (dot(2 * i), dot(2 * i + 1));
@@ -1881,9 +1873,7 @@ impl App {
                     let c = if !mine {
                         uc
                     } else if inside {
-                        // k cells below the column's edge cell (row h - its cells)
-                        let k = (a.max(b).div_ceil(4) + r).saturating_sub(h);
-                        fill[k.clamp(1, GDEEP)]
+                        fill
                     } else {
                         col
                     };
@@ -1914,9 +1904,10 @@ impl App {
 
     /// Columns of stacked eighths (newest at the right, `cols[c]` = (total, lower part,
     /// has data)) in rows `cy..cy + ch` from `gx`, lower part in `ca`, the rest in `cb`,
-    /// a dotted line at `half`. Each column is lit at its top and deeper toward its base
-    /// (`deep`, by cells below its top over the chart's height). Only the rows a column fills now or filled the last
-    /// time are drawn (the ones above are blank already) unless `full`.
+    /// a dotted line at `half`. Drawn like the history graphs: a braille top edge in
+    /// the plain colour over a solid fill that goes from that colour at the chart's top
+    /// to deep at its base (`fill_shades`). Only the rows a column fills now or filled
+    /// the last time are drawn (the ones above are blank already) unless `full`.
     #[allow(clippy::too_many_arguments)]
     pub fn col_chart(
         &self,
@@ -1937,32 +1928,38 @@ impl App {
         if full || m.0 != key {
             m = (key, vec![u16::MAX; gw]);
         }
-        // both colours' shade per cell below a column's top, worked out once per call
-        // (below the top: `FILL`, the shade as it is over a picture, not lifted back
-        // toward the top's by the 3:1 rule)
+        // both colours' fill per row, worked out once per call
         let n = ch.clamp(1, 64);
         let mut sh = [(0u32, 0u32); 64];
-        for (k, s) in sh.iter_mut().enumerate().take(n) {
-            let d = k as f32 / (ch.max(2) - 1) as f32;
-            let f = if k > 0 { FILL } else { 0 };
-            *s = (self.deep(ca, d) | f, self.deep(cb, d) | f);
+        for (row, s) in sh.iter_mut().enumerate().take(n) {
+            *s = (self.fill_shade(ca, row, ch), self.fill_shade(cb, row, ch));
         }
         for ((c, &(t8, a8, has)), prev) in cols.iter().enumerate().zip(m.1.iter_mut()) {
-            let (t8, a8) = (t8 as usize, a8 as usize);
+            // in braille dots (4 a cell)
+            let (t4, a4) = ((t8 as usize).div_ceil(2), (a8 as usize).div_ceil(2));
             let x = gx + gw - 1 - c;
-            let rows = t8.div_ceil(8).max(1);
+            let rows = t4.div_ceil(4).max(1);
             let top = rows.max(*prev as usize).min(ch);
             *prev = rows as u16;
             for row in 0..ch {
                 if row >= top && row != hrow {
                     continue;
                 }
-                let lo = row * 8;
-                let inc = t8.saturating_sub(lo).min(8);
+                let lo = row * 4;
+                let inc = t4.saturating_sub(lo).min(4);
                 let (g, fg) = if inc > 0 {
-                    let ap = a8.saturating_sub(lo).min(inc);
-                    let (da, db) = sh[(rows - 1 - row).min(n - 1)];
-                    (BLOCKS[inc - 1], if ap * 2 >= inc { da } else { db })
+                    let ap = a4.saturating_sub(lo).min(inc);
+                    let low = ap * 2 >= inc;
+                    if t4 > lo + 4 {
+                        // under the edge: the fill
+                        let (da, db) = sh[row.min(n - 1)];
+                        ('█', if low { da } else { db })
+                    } else {
+                        // the edge: both dot columns as high as the value
+                        let code = BRAILLE.iter().take(inc).fold(0, |m, &(l, r)| m | l | r);
+                        let g = if inc == 4 { '█' } else { char::from_u32(0x2800 + code).unwrap() };
+                        (g, if low { ca } else { cb })
+                    }
                 } else if row == 0 && has {
                     ('▁', TRACK)
                 } else if row == hrow && c % 2 == 0 {
@@ -1974,6 +1971,14 @@ impl App {
             }
         }
         self.ctop.set(m);
+    }
+
+    /// The fill of a chart under its edge in row `row` (from the base) of `h`: the
+    /// plain colour's shade, light near the chart's top and deep at its base, as it is
+    /// over a picture (`FILL`: not lifted back toward the edge's by the 3:1 rule).
+    pub fn fill_shade(&self, c: u32, row: usize, h: usize) -> u32 {
+        let up = row as f32 / h.max(2).saturating_sub(1) as f32;
+        self.shade(c & 0xFF_FFFF, 0.2 + 0.45 * (1.0 - up.min(1.0))) | FILL
     }
 
     /// Graph with a y-axis label gutter.
@@ -4497,16 +4502,17 @@ mod tests {
         let a = app(4, 1, 1);
         let (ca, cb) = (0x30c0a0, 0xf08030);
         let mut scr = Screen::new(2, 4);
-        // a full column: 3 rows of the lower part, the top one of the upper
-        a.col_chart(&mut scr, 0, 0, 4, &[(32, 24, true), (0, 0, false)], (ca, cb), 9, true);
-        let fg = |r: usize| scr.buf[r * 2 + 1].fg;
+        // 30 of 32 eighths = 15 of 16 dots: 3 rows of the lower part, the top one of
+        // the upper three dots high
+        a.col_chart(&mut scr, 0, 0, 4, &[(30, 24, true), (0, 0, false)], (ca, cb), 9, true);
+        let cell = |r: usize| (scr.buf[r * 2 + 1].ch, scr.buf[r * 2 + 1].fg);
         let far = |c: u32| {
             let (p, q) = (crate::color::ch(c), crate::color::ch(a.t.bg));
             (0..3).map(|i| (p[i] as i32 - q[i] as i32).abs()).sum::<i32>()
         };
-        assert_eq!(fg(0), cb, "the top cell is the plain colour");
-        assert_eq!(fg(3), a.deep(ca, 1.0) | FILL);
-        assert!(far(fg(1)) > far(fg(2)) && far(fg(2)) > far(fg(3)));
+        assert_eq!(cell(0), ('⣶', cb), "the edge: braille in the plain colour");
+        assert_eq!(cell(3), ('█', a.fill_shade(ca, 0, 4)));
+        assert!(far(cell(1).1) > far(cell(2).1) && far(cell(2).1) > far(cell(3).1));
     }
 
     #[test]
@@ -4535,9 +4541,8 @@ mod tests {
         // one under it in the darker fill
         assert_eq!(newest.iter().map(|c| c.0).collect::<String>(), " ██");
         assert_ne!(newest[2].1, newest[1].1);
-        // the fill one cell under the edge: a quarter of the way to its base shade
-        let lit = a.shade(a.t.load.at(0.5 / 3.0), 0.3);
-        assert_eq!(newest[2].1, a.deep(lit, 0.25) | FILL);
+        // the fill: the shade of the graph's bottom row
+        assert_eq!(newest[2].1, a.fill_shade(a.t.load.at(0.5 / 3.0), 0, 3));
     }
 
     #[test]
