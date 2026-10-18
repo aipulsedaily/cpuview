@@ -169,6 +169,34 @@ pub fn bar_depth(i: usize, n: usize) -> f32 {
 const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const BRAILLE: [(u32, u32); 4] = [(0x40, 0x80), (0x04, 0x20), (0x02, 0x10), (0x01, 0x08)];
 
+/// Dots (0..=3) of a one-row history strip's column for a load `v` (0..1): none under
+/// an eighth, then a dot row per third. Three of the cell's four rows at most, like
+/// the bars' half cells, so the strips of neighbouring rows stay apart.
+fn strip_dots(v: f32) -> usize {
+    if v < 0.125 {
+        0
+    } else {
+        ((v * 3.0).ceil() as usize).clamp(1, 3)
+    }
+}
+
+/// The edge of a column `dots` (1..=4) braille dots high in its top cell: both dot
+/// columns, from the cell's base up (⣀ ⣤ ⣶ ⣿). Every chart's edge is braille in the
+/// plain colour, a full top cell too (a solid block there would read as a bright slab
+/// next to its neighbours' dots); only the cells under the edge are solid fill.
+pub fn col_edge(dots: usize) -> char {
+    braille2(dots, dots)
+}
+
+/// A braille cell with its left dot column `l` and its right one `r` dots high (0..=4)
+/// from the base.
+pub fn braille2(l: usize, r: usize) -> char {
+    let code = BRAILLE.iter().enumerate().fold(0, |m, (k, &(lb, rb))| {
+        m | if k < l { lb } else { 0 } | if k < r { rb } else { 0 }
+    });
+    char::from_u32(0x2800 + code).unwrap_or(' ')
+}
+
 /// Stack-allocated formatter (no heap allocation on the render path).
 pub struct F {
     b: [u8; 120],
@@ -1772,10 +1800,17 @@ impl App {
 
     /// Depth for every chart: colour `c` shaded `d` (0..1) of the way from its lit end
     /// (a column's top, a bar's head, a graph's top row) to its base, toward the theme's
-    /// background (deeper on a dark theme, paler on a light one). Flags are kept.
+    /// background (deeper on a dark theme, paler on a light one). Flags are kept; a
+    /// shaded cell is a fill (`FILL`): over a picture it keeps its shade (the 3:1 lift
+    /// is for the lit end, it would pale the cells behind it to the same flat colour or
+    /// lighter than the head).
     #[inline]
     pub fn deep(&self, c: u32, d: f32) -> u32 {
-        c & !0xFF_FFFF | self.shade(c & 0xFF_FFFF, DEPTH * d.clamp(0.0, 1.0))
+        let d = d.clamp(0.0, 1.0);
+        if d == 0.0 {
+            return c;
+        }
+        c & !0xFF_FFFF | self.shade(c & 0xFF_FFFF, DEPTH * d) | FILL
     }
 
     /// `c` shaded `k` (0..1) toward the background: on a dark theme its own hue,
@@ -1878,10 +1913,10 @@ impl App {
                         col
                     };
                     // the fill is solid (a full block: braille ⣿ would read as a
-                    // hatched texture); the edge keeps braille's two columns of
-                    // resolution (a full cell is a block whether edge or fill: a value
-                    // wavering at a cell boundary changes the colour, never the glyph)
-                    let g = if code == 0xff && mine {
+                    // hatched texture); the edge is always braille in the curve's
+                    // colour, a full top cell too (⣿, `col_edge`): a value on a cell
+                    // boundary isn't a bright solid block among its neighbours' dots
+                    let g = if inside && mine {
                         '█'
                     } else {
                         char::from_u32(0x2800 + code).unwrap()
@@ -1955,10 +1990,9 @@ impl App {
                         let (da, db) = sh[row.min(n - 1)];
                         ('█', if low { da } else { db })
                     } else {
-                        // the edge: both dot columns as high as the value
-                        let code = BRAILLE.iter().take(inc).fold(0, |m, &(l, r)| m | l | r);
-                        let g = if inc == 4 { '█' } else { char::from_u32(0x2800 + code).unwrap() };
-                        (g, if low { ca } else { cb })
+                        // the edge: both dot columns as high as the value (braille
+                        // even when the top cell is full, as in `graph`)
+                        (col_edge(inc), if low { ca } else { cb })
                     }
                 } else if row == 0 && has {
                     ('▁', TRACK)
@@ -1971,6 +2005,23 @@ impl App {
             }
         }
         self.ctop.set(m);
+    }
+
+    /// Row `r` (from the base) of a column bar `hb` rows high filled to `lv` eighths
+    /// in colour `c`: as every chart, its head (the top cell, eighth blocks) lit in the
+    /// plain colour and the cells under it a solid fill going deep toward the base
+    /// (`fill_shade`); an empty bar is a track line.
+    pub fn vbar_cell(&self, c: u32, lv: usize, r: usize, hb: usize) -> (char, u32) {
+        let f = lv.saturating_sub(8 * r).min(8);
+        if f > 0 && r < lv.saturating_sub(1) / 8 {
+            ('█', self.fill_shade(c, r, hb))
+        } else if f > 0 {
+            (BLOCKS[f - 1], c)
+        } else if r == 0 {
+            ('▁', TRACK)
+        } else {
+            (' ', NOPATCH)
+        }
     }
 
     /// The fill of a chart under its edge in row `row` (from the base) of `h`: the
@@ -3083,9 +3134,10 @@ impl App {
         (((len as f32 + self.phase) / STRIP_SECS as f32) as usize).min(w)
     }
 
-    /// Load history of `thr` (averaged) as a strip of eighth-blocks, newest on the
-    /// right, `STRIP_SECS` per cell; buckets are aligned to whole cells so the strip
-    /// moves once per cell, not with every point.
+    /// Load history of `thr` (averaged) as a one-row column chart, newest on the
+    /// right, `STRIP_SECS` per cell: each column a braille edge in the load colour
+    /// (`strip_dots` high), as the top of every chart. Buckets are aligned to whole
+    /// cells so the strip moves once per cell, not with every point.
     #[allow(clippy::too_many_arguments)]
     fn strip(&self, scr: &mut Screen, x: usize, y: usize, thr: &[usize], w: usize, bg: u32) {
         if self.smooth() {
@@ -3098,12 +3150,10 @@ impl App {
                     continue;
                 }
                 let u = v[w - 1 - i];
-                let lv = (u * 4.0).round() as usize;
-                if lv == 0 {
-                    scr.put(xx, y, '▁', TRACK, bg);
-                } else {
-                    let q = (u * 16.0).round() / 16.0;
-                    scr.put(xx, y, BLOCKS[lv.min(4) - 1], self.t.load.at(q), bg);
+                let c = self.t.load.at((u * 16.0).round() / 16.0);
+                match strip_dots(u) {
+                    0 => scr.put(xx, y, '▁', TRACK, bg),
+                    d => scr.put(xx, y, col_edge(d), c, bg),
                 }
             }
             return;
@@ -3128,12 +3178,9 @@ impl App {
                 }
             }
             let v = sum as f32 / (k * thr.len()) as f32 / 255.0;
-            // half a cell at most, like the bars, so neighbouring rows stay apart
-            let lv = (v * 4.0).round() as usize;
-            if lv == 0 {
-                scr.put(xx, y, '▁', TRACK, bg);
-            } else {
-                scr.put(xx, y, BLOCKS[lv.min(4) - 1], ramp.at(v), bg);
+            match strip_dots(v) {
+                0 => scr.put(xx, y, '▁', TRACK, bg),
+                d => scr.put(xx, y, col_edge(d), ramp.at(v), bg),
             }
         }
     }
@@ -4488,13 +4535,20 @@ mod tests {
         assert_eq!((cell(3) & BLEND) >> BLEND_SHIFT, 1, "edge cell covers 1/16");
         assert!((4..10).all(|i| cell(i) & TRACK != 0));
         // depth: the head is lit, the cells behind it deepen toward the theme background
+        // and keep that shade over a picture (`FILL`); the head gets the 3:1 lift
         assert_eq!(cell(3) & 0xFF_FFFF, a.t.load.at(3.0 / 9.0));
         assert_eq!(cell(0), a.deep(a.t.load.at(0.0), bar_depth(0, 49)));
+        assert!((0..3).all(|i| cell(i) & FILL != 0) && cell(3) & FILL == 0);
         assert!(bar_depth(0, 49) > bar_depth(2, 49) && bar_depth(2, 49) > 0.0);
         assert_eq!(bar_depth(3, 49), 0.0);
         // an update redraws the cells whose depth follows the head
         a.meter_to(&mut scr, 0, 0, 49, 81, 10, &a.t.load, surf(S_PANEL), LOAD);
         assert_eq!(scr.buf[2].fg, a.deep(a.t.load.at(2.0 / 9.0), bar_depth(2, 81)));
+        // a head on a cell boundary: the last whole cell is the lit one
+        let mut scr = Screen::new(12, 1);
+        a.meter(&mut scr, 0, 0, 0.3, 10, &a.t.load, surf(S_PANEL), LOAD);
+        assert_eq!(scr.buf[2].fg, a.t.load.at(2.0 / 9.0));
+        assert!(scr.buf[1].fg & FILL != 0);
     }
 
     #[test]
@@ -4537,12 +4591,70 @@ mod tests {
         assert_eq!(col(&vals, w - 3), newest);
         assert!(newest.iter().all(|&(_, fg)| fg & BLEND == 0));
         assert!(newest[2].1 & FILL != 0 && newest[1].1 & FILL == 0);
-        // 0.7 of 12 dots = 8: two full cells, the edge's in the curve's colour, the
-        // one under it in the darker fill
-        assert_eq!(newest.iter().map(|c| c.0).collect::<String>(), " ██");
-        assert_ne!(newest[2].1, newest[1].1);
+        // 0.7 of 12 dots = 8: two full cells, the edge's braille in the curve's colour
+        // (never a solid block: it would read as a bright slab), the one under it
+        // the darker fill
+        assert_eq!(newest.iter().map(|c| c.0).collect::<String>(), " ⣿█");
+        assert_eq!(newest[1].1, a.t.load.at(1.5 / 3.0));
         // the fill: the shade of the graph's bottom row
         assert_eq!(newest[2].1, a.fill_shade(a.t.load.at(0.5 / 3.0), 0, 3));
+    }
+
+    #[test]
+    fn chart_edges_are_braille_whatever_the_value() {
+        // a column's top cell is braille dots in the plain colour whether it is a
+        // quarter or exactly full; every cell under it is the solid fill
+        let a = app(4, 1, 1);
+        let (w, h) = (2usize, 3usize);
+        for dots in 1..=12usize {
+            let mut scr = Screen::new(w, h);
+            let vals = [0.0, 0.0, dots as f32 / 12.0, dots as f32 / 12.0];
+            a.graph(&mut scr, 0, 0, w, h, &vals, 1.0, &a.t.load);
+            let col: Vec<_> = (0..h).map(|r| scr.buf[r * w + 1]).collect();
+            let top = h - 1 - (dots - 1) / 4;
+            let inc = dots - 4 * ((dots - 1) / 4);
+            assert_eq!(col[top].ch, col_edge(inc), "{dots} dots");
+            assert!(col[top].fg & FILL == 0);
+            for c in &col[top + 1..] {
+                assert_eq!(c.ch, '█', "{dots} dots");
+                assert!(c.fg & FILL != 0);
+            }
+            assert!(col[..top].iter().all(|c| c.ch == ' ' || c.fg == a.t.border));
+            // the column charts: the same edge
+            let mut scr = Screen::new(1, h);
+            let t8 = 2 * dots as u16;
+            let cols = [(t8, t8, true)];
+            a.col_chart(&mut scr, 0, 0, h, &cols, (0x30c0a0, 0xf08030), 9, true);
+            assert_eq!(scr.buf[top].ch, col[top].ch, "{dots} dots");
+            let fill = |c: &Cell| c.ch == '█' && c.fg & FILL != 0;
+            assert!(scr.buf[top + 1..].iter().all(fill));
+        }
+        assert_eq!((col_edge(1), col_edge(3), col_edge(4)), ('⣀', '⣶', '⣿'));
+        // column bars (the overview's threads): a lit head, the fill under it
+        let c = 0xf08030;
+        let bar = |lv: usize| (0..3).map(|r| a.vbar_cell(c, lv, r, 3)).collect::<Vec<_>>();
+        assert_eq!(bar(0), [('▁', TRACK), (' ', NOPATCH), (' ', NOPATCH)]);
+        assert_eq!(bar(5)[0], ('▅', c));
+        assert_eq!(bar(16)[..2], [('█', a.fill_shade(c, 0, 3)), ('█', c)]);
+        assert_eq!(bar(19)[1..], [('█', a.fill_shade(c, 1, 3)), ('▃', c)]);
+        // deeper is toward the theme's background, dark or light
+        for bg in [0x0a0d14, 0xf4f1ea] {
+            let mut a = app(4, 1, 1);
+            a.t.bg = bg;
+            let far = |x: u32| {
+                let (p, q) = (crate::color::ch(x), crate::color::ch(bg));
+                (0..3)
+                    .map(|i| (p[i] as i32 - q[i] as i32).abs())
+                    .sum::<i32>()
+            };
+            let f = |row: usize| far(a.fill_shade(c, row, 4) & 0xFF_FFFF);
+            assert!(far(c) > f(3) && f(3) > f(1) && f(1) > f(0), "{bg:x}");
+            assert!(far(c) > far(a.deep(c, 0.5) & 0xFF_FFFF), "{bg:x}");
+        }
+        assert_eq!((braille2(4, 1), braille2(0, 2)), ('⣇', '⢠'));
+        // one-row strips: up to three dot rows (rows of strips stay apart)
+        let strip: Vec<_> = [0.1, 0.2, 0.5, 1.0].into_iter().map(strip_dots).collect();
+        assert_eq!(strip, [0, 1, 2, 3]);
     }
 
     #[test]

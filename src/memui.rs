@@ -1256,10 +1256,10 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// A one-line history where a chart doesn't fit: "1 min ago ▁▁▂▃▃▅ now" and then
-    /// in words what it says (`tail`). Cells are 2 s means aligned to the
-    /// history count (they step once per 2 s); `cell(k)` gives point k's (value 0..1,
-    /// colour), k = 0 the newest point; the newest cell is `head`.
+    /// A one-line history where a chart doesn't fit: "1 min ago ⣀⣠⣤⣴⣶ now" and then
+    /// in words what it says (`tail`). Cells hold 2 s (a point per dot column) aligned
+    /// to the history count (they step once per 2 s); `cell(k)` gives point k's (value
+    /// 0..1, colour), k = 0 the newest point; the newest cell is `head`.
     #[allow(clippy::too_many_arguments)]
     fn strip_row(
         &self,
@@ -1287,19 +1287,27 @@ impl App {
             scr.put(xx, y, ' ', NOPATCH, bg);
             xx += 1;
         }
+        // as the top of every chart: braille dots in the plain colour, a point per dot
+        // column (the older of a cell's two on the left; the live head in both)
+        let dots = |v: f32| {
+            if v > 0.0 {
+                (v.min(1.0) * 4.0).round().max(1.0) as usize
+            } else {
+                0
+            }
+        };
         for i in (0..n).rev() {
-            let (v, c) = if i == 0 {
-                head
+            let (l, r, c) = if i == 0 {
+                (dots(head.0), dots(head.0), head.1)
             } else {
                 let p = lag + 2 * (i - 1);
                 let (a, c) = pt(p);
-                ((a + pt(p + 1).0) / 2.0, c)
+                (dots(pt(p + 1).0), dots(a), c)
             };
-            let lv = (v.clamp(0.0, 1.0) * 8.0).round() as usize;
-            if lv == 0 {
+            if l + r == 0 {
                 scr.put(xx, y, '▁', TRACK, bg);
             } else {
-                scr.put(xx, y, BLOCKS[lv.min(8) - 1], c, bg);
+                scr.put(xx, y, braille2(l, r), c, bg);
             }
             xx += 1;
         }

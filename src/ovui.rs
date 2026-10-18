@@ -780,14 +780,7 @@ impl App {
         let col = |scr: &mut Screen, xx: usize, lv: usize| {
             let c = th.load.at(lv as f32 / e as f32);
             for r in 0..hb {
-                let f = lv.saturating_sub(8 * r).min(8);
-                let (g, fg) = if f > 0 {
-                    (BLOCKS[f - 1], c)
-                } else if r == 0 {
-                    ('▁', TRACK)
-                } else {
-                    (' ', NOPATCH)
-                };
+                let (g, fg) = self.vbar_cell(c, lv, r, hb);
                 scr.put(xx, y + hb - 1 - r, g, fg, bg);
             }
         };
