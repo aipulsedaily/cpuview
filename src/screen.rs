@@ -20,6 +20,9 @@ pub const NOPATCH: u32 = 1 << 26;
 /// blank fill cell (screen / empty panel area): a background star may be drawn here.
 /// Blanks written by widgets never get one, so a star can't be mistaken for data.
 pub const STAR_OK: u32 = 1 << 27;
+/// (the same bit on a glyph) an area under a graph's curve: its colour as it is over a
+/// picture (no 3:1 lift, which would make it as light as the curve or lighter)
+pub const FILL: u32 = 1 << 27;
 pub const DEFAULT: u32 = 1 << 24;
 /// fg bits 28..31 = k (1..15): the colour covers k/16 of the cell and is blended
 /// into the track surface in linear light (the anti-aliased edge cell of a bar)
@@ -414,7 +417,7 @@ impl Comp {
                         if c.ch == ' ' {
                             return out;
                         }
-                        if out.bg == DEFAULT && c.fg & (TRACK | BLEND) == 0 {
+                        if out.bg == DEFAULT && c.fg & (TRACK | BLEND | FILL) == 0 {
                             // text straight on the picture: its lightness adapts to the
                             // picture (Comp::guarded), a plate only where that can't help
                             let (top, bot) = pix(sid);
@@ -508,7 +511,9 @@ impl Comp {
                                 b
                             }
                         };
-                        if !is_text(c.ch) && c.fg & (TRACK | BLEND) == 0 {
+                        if c.fg & FILL != 0 {
+                            out.fg = fg_rgb;
+                        } else if !is_text(c.ch) && c.fg & (TRACK | BLEND) == 0 {
                             // frames, graph dots, bars: 3:1 against the picture
                             out.fg = self.mark(fg_rgb, out.bg);
                         }
@@ -519,10 +524,11 @@ impl Comp {
                         } else if c.fg & TRACK != 0 {
                             matches!(c.ch, '▁'..='▄')
                         } else {
-                            // (not blocks: drawn as text they look the same in every
-                            // frame, while a cell waiting for its patch would show one
-                            // look and then another as a graph scrolls)
-                            ink_glyph(c.ch)
+                            // (not blocks nor braille: graph cells, drawn as text they
+                            // look the same in every frame, while a cell waiting for its
+                            // patch would show one look and then another as a graph
+                            // scrolls)
+                            ink_glyph(c.ch) && !matches!(c.ch, '\u{2800}'..='\u{28ff}')
                         };
                     }
                 }
