@@ -155,6 +155,20 @@ pub fn speed_index(v: &str) -> usize {
         .position(|s| s.0.trim_end_matches("/s") == v)
         .unwrap_or(0)
 }
+/// How far toward the theme's background a chart's base is shaded (see `App::deep`).
+const DEPTH: f32 = 0.4;
+/// Cells under a graph's edge over which its fill deepens to its base shade.
+const GDEEP: usize = 4;
+/// Cells behind a bar's head over which it deepens to its base shade.
+const HEAD: usize = 6;
+
+/// Depth (0..1, see `App::deep`) of whole cell `i` of a bar filled to `n` sixteenths:
+/// lit at the head, deeper over the `HEAD` cells behind it (bars only go 3/5 of the way:
+/// one row of half blocks reads dim sooner than a column or an area).
+pub fn bar_depth(i: usize, n: usize) -> f32 {
+    n.div_ceil(16).saturating_sub(i + 1).min(HEAD) as f32 / HEAD as f32 * 0.6
+}
+
 const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const BRAILLE: [(u32, u32); 4] = [(0x40, 0x80), (0x04, 0x20), (0x02, 0x10), (0x01, 0x08)];
 
@@ -1759,9 +1773,31 @@ impl App {
         }
     }
 
+    /// Depth for every chart: colour `c` shaded `d` (0..1) of the way from its lit end
+    /// (a column's top, a bar's head, a graph's top row) to its base, toward the theme's
+    /// background (deeper on a dark theme, paler on a light one). Flags are kept.
+    #[inline]
+    pub fn deep(&self, c: u32, d: f32) -> u32 {
+        c & !0xFF_FFFF | self.shade(c & 0xFF_FFFF, DEPTH * d.clamp(0.0, 1.0))
+    }
+
+    /// `c` shaded `k` (0..1) toward the background: on a dark theme its own hue,
+    /// darker and a little richer (a mix toward a dark grey washes pale colours out
+    /// to grey), on a light one a mix toward the background.
+    pub fn shade(&self, c: u32, k: f32) -> u32 {
+        use crate::color::*;
+        if lum(self.t.bg) > 0.4 {
+            return mix(c, self.t.bg, k);
+        }
+        let [h, s, v] = rgb_to_hsv(chf(c));
+        // (a grey has no hue to enrich)
+        let s = if s < 0.05 { s } else { s + (1.0 - s) * 0.6 * k };
+        from_f(hsv_to_rgb([h, s, v * (1.0 - k)]))
+    }
+
     /// Braille area graph of the most recent `2 * w` values in `vals` (chronological):
     /// the curve's edge in braille (two columns of dots per cell), a solid fill under
-    /// it in a darker shade of the curve's colour. All of it is text in every mode (no
+    /// it in a darker shade of the curve's colour, deeper below the edge. All of it is text in every mode (no
     /// pixel ink), so a cell keeps its look while the graph scrolls.
     #[allow(clippy::too_many_arguments)]
     pub fn graph(
@@ -1813,8 +1849,14 @@ impl App {
             let base = (h - 1 - r) * 4;
             let col = ramp.at((h as f32 - r as f32 - 0.5) / h as f32);
             // the fill: a darker shade of the curve's colour (toward the theme's
-            // background; not a blend into the track: a grey slab over pictures)
-            let fill = crate::color::mix(col, self.t.bg, 0.5) | FILL;
+            // background; not a blend into the track: a grey slab over pictures),
+            // deeper with each cell below its column's edge (`deep` over `GDEEP` cells)
+            // so the area has depth at any height instead of reading as a flat slab
+            let lit = self.shade(col, 0.3);
+            let mut fill = [0u32; GDEEP + 1];
+            for (k, f) in fill.iter_mut().enumerate().skip(1) {
+                *f = self.deep(lit, k as f32 / GDEEP as f32) | FILL;
+            }
             let grid_bit = (0..4).find(|k| gl.contains(&(base + k + 1)));
             for i in 0..w {
                 let (a, b) = (dot(2 * i), dot(2 * i + 1));
@@ -1839,7 +1881,9 @@ impl App {
                     let c = if !mine {
                         uc
                     } else if inside {
-                        fill
+                        // k cells below the column's edge cell (row h - its cells)
+                        let k = (a.max(b).div_ceil(4) + r).saturating_sub(h);
+                        fill[k.clamp(1, GDEEP)]
                     } else {
                         col
                     };
@@ -1870,7 +1914,8 @@ impl App {
 
     /// Columns of stacked eighths (newest at the right, `cols[c]` = (total, lower part,
     /// has data)) in rows `cy..cy + ch` from `gx`, lower part in `ca`, the rest in `cb`,
-    /// a dotted line at `half`. Only the rows a column fills now or filled the last
+    /// a dotted line at `half`. Each column is lit at its top and deeper toward its base
+    /// (`deep`, by cells below its top over the chart's height). Only the rows a column fills now or filled the last
     /// time are drawn (the ones above are blank already) unless `full`.
     #[allow(clippy::too_many_arguments)]
     pub fn col_chart(
@@ -1892,6 +1937,16 @@ impl App {
         if full || m.0 != key {
             m = (key, vec![u16::MAX; gw]);
         }
+        // both colours' shade per cell below a column's top, worked out once per call
+        // (below the top: `FILL`, the shade as it is over a picture, not lifted back
+        // toward the top's by the 3:1 rule)
+        let n = ch.clamp(1, 64);
+        let mut sh = [(0u32, 0u32); 64];
+        for (k, s) in sh.iter_mut().enumerate().take(n) {
+            let d = k as f32 / (ch.max(2) - 1) as f32;
+            let f = if k > 0 { FILL } else { 0 };
+            *s = (self.deep(ca, d) | f, self.deep(cb, d) | f);
+        }
         for ((c, &(t8, a8, has)), prev) in cols.iter().enumerate().zip(m.1.iter_mut()) {
             let (t8, a8) = (t8 as usize, a8 as usize);
             let x = gx + gw - 1 - c;
@@ -1906,7 +1961,8 @@ impl App {
                 let inc = t8.saturating_sub(lo).min(8);
                 let (g, fg) = if inc > 0 {
                     let ap = a8.saturating_sub(lo).min(inc);
-                    (BLOCKS[inc - 1], if ap * 2 >= inc { ca } else { cb })
+                    let (da, db) = sh[(rows - 1 - row).min(n - 1)];
+                    (BLOCKS[inc - 1], if ap * 2 >= inc { da } else { db })
                 } else if row == 0 && has {
                     ('▁', TRACK)
                 } else if row == hrow && c % 2 == 0 {
@@ -2086,15 +2142,17 @@ impl App {
     ) {
         let n = fill16(frac, w);
         for i in 0..w {
-            Self::bar_cell(scr, x, y, i, n, w, ramp, bg, g);
+            self.bar_cell(scr, x, y, i, n, w, ramp, bg, g);
         }
     }
 
     /// Cell `i` of a half-block bar filled to `n` sixteenths: the edge cell is the bar
-    /// colour blended into the track by its covered fraction (sub-cell resolution).
+    /// colour blended into the track by its covered fraction (sub-cell resolution); the
+    /// whole cells behind it deepen toward the base (`bar_depth`).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     fn bar_cell(
+        &self,
         scr: &mut Screen,
         x: usize,
         y: usize,
@@ -2107,7 +2165,7 @@ impl App {
     ) {
         let den = (w.max(2) - 1) as f32;
         let fg = if i < n / 16 {
-            ramp.at(i as f32 / den)
+            self.deep(ramp.at(i as f32 / den), bar_depth(i, n))
         } else if i == n / 16 && n % 16 > 0 {
             ramp.at(i as f32 / den) | ((n % 16) as u32) << BLEND_SHIFT
         } else {
@@ -2117,7 +2175,8 @@ impl App {
     }
 
     /// Update a meter drawn earlier filled to `old` sixteenths: only the cells in between
-    /// change (the gradient is fixed per position).
+    /// change, and the `HEAD` cells behind them (their depth follows the head; the
+    /// gradient is fixed per position).
     #[allow(clippy::too_many_arguments)]
     fn meter_to(
         &self,
@@ -2131,8 +2190,8 @@ impl App {
         bg: u32,
         g: char,
     ) {
-        for i in old.min(n) / 16..(old.max(n) / 16 + 1).min(w) {
-            Self::bar_cell(scr, x, y, i, n, w, ramp, bg, g);
+        for i in (old.min(n) / 16).saturating_sub(HEAD)..(old.max(n) / 16 + 1).min(w) {
+            self.bar_cell(scr, x, y, i, n, w, ramp, bg, g);
         }
     }
 
@@ -2982,7 +3041,8 @@ impl App {
     }
 
     /// A core's two threads in one thin bar: full colour up to the less busy thread's
-    /// load, faded from there to the busier one's (edge cells blend, as in `meter`).
+    /// load, faded from there to the busier one's (edge cells blend and whole cells
+    /// deepen behind the head, as in `meter`).
     #[allow(clippy::too_many_arguments)]
     fn split_meter(&self, scr: &mut Screen, x: usize, y: usize, a: f32, b: f32, w: usize, bg: u32) {
         let (lo, hi) = (fill16(a.min(b), w), fill16(a.max(b), w));
@@ -2993,11 +3053,7 @@ impl App {
             // whole cells of the lower bar; its edge cell counts if at least half full
             let in_lo = i < lo / 16 || (i == lo / 16 && lo % 16 >= 8);
             let fg = if i < hi / 16 {
-                if in_lo {
-                    full.at(t)
-                } else {
-                    one.at(t)
-                }
+                self.deep(if in_lo { full.at(t) } else { one.at(t) }, bar_depth(i, hi))
             } else if i == hi / 16 && hi % 16 > 0 {
                 (if in_lo { full.at(t) } else { one.at(t) }) | ((hi % 16) as u32) << BLEND_SHIFT
             } else {
@@ -4426,6 +4482,31 @@ mod tests {
         assert!((0..3).all(|i| cell(i) & (TRACK | BLEND) == 0));
         assert_eq!((cell(3) & BLEND) >> BLEND_SHIFT, 1, "edge cell covers 1/16");
         assert!((4..10).all(|i| cell(i) & TRACK != 0));
+        // depth: the head is lit, the cells behind it deepen toward the theme background
+        assert_eq!(cell(3) & 0xFF_FFFF, a.t.load.at(3.0 / 9.0));
+        assert_eq!(cell(0), a.deep(a.t.load.at(0.0), bar_depth(0, 49)));
+        assert!(bar_depth(0, 49) > bar_depth(2, 49) && bar_depth(2, 49) > 0.0);
+        assert_eq!(bar_depth(3, 49), 0.0);
+        // an update redraws the cells whose depth follows the head
+        a.meter_to(&mut scr, 0, 0, 49, 81, 10, &a.t.load, surf(S_PANEL), LOAD);
+        assert_eq!(scr.buf[2].fg, a.deep(a.t.load.at(2.0 / 9.0), bar_depth(2, 81)));
+    }
+
+    #[test]
+    fn columns_are_lit_at_the_top_and_deeper_at_the_base() {
+        let a = app(4, 1, 1);
+        let (ca, cb) = (0x30c0a0, 0xf08030);
+        let mut scr = Screen::new(2, 4);
+        // a full column: 3 rows of the lower part, the top one of the upper
+        a.col_chart(&mut scr, 0, 0, 4, &[(32, 24, true), (0, 0, false)], (ca, cb), 9, true);
+        let fg = |r: usize| scr.buf[r * 2 + 1].fg;
+        let far = |c: u32| {
+            let (p, q) = (crate::color::ch(c), crate::color::ch(a.t.bg));
+            (0..3).map(|i| (p[i] as i32 - q[i] as i32).abs()).sum::<i32>()
+        };
+        assert_eq!(fg(0), cb, "the top cell is the plain colour");
+        assert_eq!(fg(3), a.deep(ca, 1.0) | FILL);
+        assert!(far(fg(1)) > far(fg(2)) && far(fg(2)) > far(fg(3)));
     }
 
     #[test]
@@ -4454,6 +4535,9 @@ mod tests {
         // one under it in the darker fill
         assert_eq!(newest.iter().map(|c| c.0).collect::<String>(), " ██");
         assert_ne!(newest[2].1, newest[1].1);
+        // the fill one cell under the edge: a quarter of the way to its base shade
+        let lit = a.shade(a.t.load.at(0.5 / 3.0), 0.3);
+        assert_eq!(newest[2].1, a.deep(lit, 0.25) | FILL);
     }
 
     #[test]

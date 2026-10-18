@@ -1813,7 +1813,8 @@ impl App {
         }
     }
 
-    /// A row's CPU bar filled to `fill` sixteenths (faded with the row).
+    /// A row's CPU bar filled to `fill` sixteenths (faded with the row, deeper behind
+    /// its head as in `meter`).
     #[allow(clippy::too_many_arguments)]
     fn pbar(&self, scr: &mut Screen, x: usize, y: usize, fill: usize, bg: u32, fb: u32, al: f32) {
         let bw = self.pv.lay.bw;
@@ -1823,7 +1824,7 @@ impl App {
                 if i == fill / 16 {
                     c | ((fill % 16) as u32) << BLEND_SHIFT
                 } else {
-                    c
+                    self.deep(c, bar_depth(i, fill))
                 }
             } else {
                 TRACK
