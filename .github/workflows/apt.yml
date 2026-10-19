@@ -17,10 +17,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y apt-utils
@@ -34,10 +34,10 @@ jobs:
           echo "$APT_GPG_KEY" | gpg --batch --import
           packaging/make-apt-repo.sh "$APT_GPG_KEY_ID" dist/apt
       - if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*.deb
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: dist/apt
 
@@ -49,4 +49,4 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
