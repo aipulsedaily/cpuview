@@ -37,9 +37,14 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*.deb
-      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+      # (what actions/upload-pages-artifact does, with its inner upload-artifact pinned)
+      - run: tar --dereference --hard-dereference -cvf "$RUNNER_TEMP/artifact.tar" -C dist/apt .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: dist/apt
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
 
   pages:
     needs: build
