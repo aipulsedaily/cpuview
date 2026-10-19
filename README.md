@@ -19,6 +19,43 @@ thread** (≈ 45–85 µs of CPU per second) at the default `eco` speed. Press `
 ≤ 0.5 % of one thread) or fixed rates up to
 60 updates per second.
 
+## Install
+
+Debian, Ubuntu and their derivatives (amd64 and arm64; the binary is static, so every release
+works):
+
+```sh
+curl -fsSL https://aipulsedaily.github.io/cpuview/cpuview.gpg \
+  | sudo tee /usr/share/keyrings/cpuview.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cpuview.gpg] https://aipulsedaily.github.io/cpuview stable main" \
+  | sudo tee /etc/apt/sources.list.d/cpuview.list
+sudo apt update && sudo apt install cpuview
+sudo cpuview --setup-sensors    # optional: fan chip driver, CPU watts for every user
+```
+
+`apt upgrade` then keeps it current. The .debs are also attached to every GitHub release
+(`sudo apt install ./cpuview_*.deb`). Remove with `sudo apt remove cpuview` (and
+`sudo cpuview --setup-sensors --undo` first if you ran it).
+
+From source, with a Rust toolchain (<https://rustup.rs>) on Linux:
+
+```sh
+git clone https://github.com/aipulsedaily/cpuview.git
+cd cpuview
+./install.sh        # builds, installs ~/.local/bin/cpuview and the wallpaper pack
+cpuview
+```
+
+`install.sh` runs `cargo build --release`, copies the binary to `~/.local/bin/cpuview` and the
+wallpapers to `~/.local/share/cpuview/wallpapers/`. If an older Python `cpuview` launcher is
+there it is kept as `~/.local/bin/cpuview-py`. The previous Python/Textual version lives in
+`legacy/python/` and still runs (`legacy/python/install.sh`).
+
+Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuview`. (A copy in
+`~/.local/bin` runs instead of the apt one, so remove it when switching to the package.)
+
+## Screenshots
+
 ![cpuview Overview, Midnight theme, 128×45](docs/screenshots/rust-overview-128x45.webp)
 
 *The Overview (`0`, the default page) at 128×45 (a ~1180×880 px Windows Terminal window), eco
@@ -348,40 +385,6 @@ them; `--undo` reverses everything it did):
   through perf (the kernel's `perf_event_paranoid` allows it only that way). File
   capabilities are lost when the binary is replaced, so redo it after every `./install.sh`;
   the udev rule alone gives the package's watts.
-
-## Install
-
-Debian, Ubuntu and their derivatives (amd64 and arm64; the binary is static, so every release
-works):
-
-```sh
-curl -fsSL https://aipulsedaily.github.io/cpuview/cpuview.gpg \
-  | sudo tee /usr/share/keyrings/cpuview.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/cpuview.gpg] https://aipulsedaily.github.io/cpuview stable main" \
-  | sudo tee /etc/apt/sources.list.d/cpuview.list
-sudo apt update && sudo apt install cpuview
-sudo cpuview --setup-sensors    # optional: fan chip driver, CPU watts for every user
-```
-
-`apt upgrade` then keeps it current. The .debs are also attached to every GitHub release
-(`sudo apt install ./cpuview_*.deb`). Remove with `sudo apt remove cpuview` (and
-`sudo cpuview --setup-sensors --undo` first if you ran it).
-
-From source, with a Rust toolchain (<https://rustup.rs>) on Linux:
-
-```sh
-git clone https://github.com/aipulsedaily/cpuview.git
-cd cpuview
-./install.sh        # builds, installs ~/.local/bin/cpuview and the wallpaper pack
-cpuview
-```
-
-`install.sh` runs `cargo build --release`, copies the binary to `~/.local/bin/cpuview` and the
-wallpapers to `~/.local/share/cpuview/wallpapers/`. If an older Python `cpuview` launcher is
-there it is kept as `~/.local/bin/cpuview-py`. The previous Python/Textual version lives in
-`legacy/python/` and still runs (`legacy/python/install.sh`).
-
-Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuview`.
 
 ## Keys
 
