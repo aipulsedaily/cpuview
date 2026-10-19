@@ -1,0 +1,22 @@
+# Packages the release tarball (packaging/build-tarball.sh) for Arch Linux.
+# packaging/make-pacman-repo.sh fills in pkgver and the checksum.
+pkgname=cpuview
+pkgver=0
+pkgrel=1
+pkgdesc='Terminal system monitor for the hardware and its health: cores, clocks, temperatures, fans, power'
+arch=('x86_64')
+url='https://github.com/aipulsedaily/cpuview'
+license=('MIT')
+optdepends=('lm_sensors: sensors-detect, for boards whose fan chip needs a driver')
+options=('!strip' '!debug')
+source=("cpuview-$pkgver-x86_64-linux.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "cpuview-$pkgver-$CARCH-linux"
+  install -Dm755 bin/cpuview "$pkgdir/usr/bin/cpuview"
+  install -d "$pkgdir/usr/share/cpuview/wallpapers"
+  install -m644 share/cpuview/wallpapers/* "$pkgdir/usr/share/cpuview/wallpapers/"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

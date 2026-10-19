@@ -21,8 +21,12 @@ thread** (≈ 45–85 µs of CPU per second) at the default `eco` speed. Press `
 
 ## Install
 
-Debian, Ubuntu and their derivatives (amd64 and arm64; the binary is static, so every release
-works):
+The binary is static, so every package below runs on any release of its distribution, on
+x86_64 and (apt, download) ARM64. After installing, optionally run
+`sudo cpuview --setup-sensors` for fan readings and CPU watts on boards that need it (it shows
+what it changes and asks first).
+
+### Ubuntu, Debian, Mint, Pop!_OS … (apt)
 
 ```sh
 curl -fsSL https://aipulsedaily.github.io/cpuview/cpuview.gpg \
@@ -30,14 +34,39 @@ curl -fsSL https://aipulsedaily.github.io/cpuview/cpuview.gpg \
 echo "deb [signed-by=/usr/share/keyrings/cpuview.gpg] https://aipulsedaily.github.io/cpuview stable main" \
   | sudo tee /etc/apt/sources.list.d/cpuview.list
 sudo apt update && sudo apt install cpuview
-sudo cpuview --setup-sensors    # optional: fan chip driver, CPU watts for every user
 ```
 
-`apt upgrade` then keeps it current. The .debs are also attached to every GitHub release
-(`sudo apt install ./cpuview_*.deb`). Remove with `sudo apt remove cpuview` (and
-`sudo cpuview --setup-sensors --undo` first if you ran it).
+`sudo apt upgrade` keeps it current; `sudo apt remove cpuview` removes it.
 
-From source, with a Rust toolchain (<https://rustup.rs>) on Linux:
+### Arch Linux, EndeavourOS, Manjaro … (pacman)
+
+```sh
+curl -fsSLo /tmp/cpuview.gpg https://aipulsedaily.github.io/cpuview/cpuview.gpg
+sudo pacman-key --add /tmp/cpuview.gpg
+sudo pacman-key --lsign-key 9BD5330AC96B3564D646E31AD64EA1E354AD066A
+printf '\n[cpuview]\nServer = https://aipulsedaily.github.io/cpuview/arch/$arch\n' \
+  | sudo tee -a /etc/pacman.conf
+sudo pacman -Syu cpuview
+```
+
+`sudo pacman -Syu` keeps it current; `sudo pacman -R cpuview` removes it.
+
+### Any other Linux (download)
+
+Every [release](https://github.com/aipulsedaily/cpuview/releases/latest) has
+`cpuview-<version>-x86_64-linux.tar.gz` and `…-aarch64-linux.tar.gz`:
+
+```sh
+tar -xzf cpuview-*-linux.tar.gz
+cd cpuview-*-linux && ./bin/cpuview
+```
+
+To install it for your user: `cp bin/cpuview ~/.local/bin/` and
+`mkdir -p ~/.local/share/cpuview && cp -r share/cpuview/wallpapers ~/.local/share/cpuview/`.
+
+### From source
+
+With a Rust toolchain (<https://rustup.rs>):
 
 ```sh
 git clone https://github.com/aipulsedaily/cpuview.git
@@ -52,7 +81,7 @@ there it is kept as `~/.local/bin/cpuview-py`. The previous Python/Textual versi
 `legacy/python/` and still runs (`legacy/python/install.sh`).
 
 Uninstall: `rm ~/.local/bin/cpuview; rm -r ~/.local/share/cpuview ~/.config/cpuview`. (A copy in
-`~/.local/bin` runs instead of the apt one, so remove it when switching to the package.)
+`~/.local/bin` runs instead of a packaged one, so remove it when switching to a package.)
 
 ## Screenshots
 
@@ -839,7 +868,10 @@ cargo build --release --features prof && CPUVIEW_PROFILE=/tmp/prof.txt target/re
 python3 themes/reference.py render nebula out.png   # the theme spec's reference renderer
 ```
 
-Packages: `packaging/build-deb.sh [amd64|arm64]` builds a static (musl) `.deb` into `dist/`;
+Packages: `packaging/build-deb.sh [amd64|arm64]` builds a static (musl) `.deb` and
+`packaging/build-tarball.sh [x86_64|aarch64]` a tarball into `dist/`;
 `packaging/make-apt-repo.sh KEY_ID` turns `dist/*.deb` into a signed APT repository
-(`dist/apt`). `.github/workflows/apt.yml` does both on every `v*` tag and publishes the
-repository on GitHub Pages (secrets `APT_GPG_KEY`, `APT_GPG_KEY_ID`).
+(`dist/apt`), and `packaging/make-pacman-repo.sh KEY_ID` (on Arch, with `packaging/arch/PKGBUILD`)
+adds a signed pacman repository (`dist/apt/arch/x86_64`). `.github/workflows/apt.yml` does all
+of it on every `v*` tag, attaches the packages to the release and publishes both repositories
+on GitHub Pages (secrets `APT_GPG_KEY`, `APT_GPG_KEY_ID`).

@@ -1,7 +1,9 @@
-# On a version tag (v*): build the amd64 + arm64 .debs, attach them to the GitHub release and
-# publish the signed APT repository on GitHub Pages (Settings → Pages → Source: GitHub Actions).
+# On a version tag (v*): build the amd64 + arm64 .debs and tarballs, attach them to the GitHub
+# release, and publish the signed APT and pacman repositories on GitHub Pages
+# (Settings → Pages → Source: GitHub Actions).
 # Secrets: APT_GPG_KEY (gpg --armor --export-secret-keys KEY_ID, a key without a passphrase
-# used only for this repository) and APT_GPG_KEY_ID.
+# used only for these repositories) and APT_GPG_KEY_ID.
+# (actions pinned to commit SHAs: the organisation requires it)
 name: apt
 on:
   push:
@@ -25,7 +27,9 @@ jobs:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y apt-utils
       - run: cargo test --release --locked
-      - run: packaging/build-deb.sh amd64 && packaging/build-deb.sh arm64
+      - run: |
+          packaging/build-deb.sh amd64 && packaging/build-deb.sh arm64
+          packaging/build-tarball.sh x86_64 && packaging/build-tarball.sh aarch64
       - name: Signed APT repository
         env:
           APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
@@ -36,7 +40,41 @@ jobs:
       - if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/*.deb
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 1
+
+  arch:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      - name: Signed pacman repository
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+          APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          # makepkg refuses to run as root
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          echo "$APT_GPG_KEY" > /tmp/key.asc && chmod 644 /tmp/key.asc
+          su builder -c "git config --global --add safe.directory '$GITHUB_WORKSPACE' &&
+            gpg --batch --import /tmp/key.asc &&
+            cd '$GITHUB_WORKSPACE' && packaging/make-pacman-repo.sh '$APT_GPG_KEY_ID' dist/apt/arch/x86_64"
+          rm /tmp/key.asc
       # (what actions/upload-pages-artifact does, with its inner upload-artifact pinned)
       - run: tar --dereference --hard-dereference -cvf "$RUNNER_TEMP/artifact.tar" -C dist/apt .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -47,7 +85,7 @@ jobs:
           if-no-files-found: error
 
   pages:
-    needs: build
+    needs: arch
     runs-on: ubuntu-24.04
     environment:
       name: github-pages
