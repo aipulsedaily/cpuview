@@ -36,10 +36,11 @@ gzip -9n < "$DIR/README.md" > "$D/README.md.gz"
 cat > "$D/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: cpuview
+Upstream-Contact: aipulsedaily <https://x.com/aipulseda1ly>
 Source: https://github.com/aipulsedaily/cpuview
 
 Files: *
-Copyright: cpuview contributors
+Copyright: 2026 aipulsedaily
 License: MIT
 
 Files: usr/share/cpuview/wallpapers/*
@@ -51,7 +52,7 @@ License: public-domain or CC0-1.0
 License: MIT
 $(sed 's/^$/./; s/^/ /' "$DIR/LICENSE")
 EOF
-printf 'cpuview (%s-%s) stable; urgency=medium\n\n  * Release %s.\n\n -- cpuview contributors <noreply@cpuview.invalid>  %s\n' \
+printf 'cpuview (%s-%s) stable; urgency=medium\n\n  * Release %s.\n\n -- aipulsedaily <noreply@cpuview.invalid>  %s\n' \
   "$VERSION" "$REV" "$VERSION" "$(date -R -d @"${SOURCE_DATE_EPOCH:-$(git -C "$DIR" log -1 --format=%ct)}")" \
   | gzip -9n > "$D/changelog.Debian.gz"
 
@@ -60,7 +61,7 @@ cat > "$R/DEBIAN/control" <<EOF
 Package: cpuview
 Version: $VERSION-$REV
 Architecture: $ARCH
-Maintainer: cpuview contributors <noreply@cpuview.invalid>
+Maintainer: aipulsedaily <noreply@cpuview.invalid>
 Installed-Size: $(du -sk --exclude=DEBIAN "$R" | cut -f1)
 Suggests: lm-sensors
 Section: utils

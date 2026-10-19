@@ -1,6 +1,7 @@
 [package]
 name = "cpuview"
 version = "2.0.0"
+authors = ["aipulsedaily"]
 edition = "2021"
 description = "btop-style per-core CPU clock / load / temperature monitor with themes and image backgrounds"
 license = "MIT"
