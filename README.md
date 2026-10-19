@@ -30,7 +30,7 @@ by health, and a click on it (or its number, top right) opens that page.*
 
 *`1`: the CPU view at 128×45 (a ~1180×880 px Windows Terminal window), Midnight: graph band, all 32 threads in one column per
 CCD with a load-history strip per thread, and the all-core load heatmap at the bottom. Real data on a
-Ryzen 9 9950X with a synthetic load running. Captured headlessly: the app ran in a pseudo-terminal, its
+Ryzen 9 9950X. Captured headlessly: the app ran in a pseudo-terminal, its
 output was replayed in a VT emulator (pyte) and painted with DejaVu Sans Mono.*
 
 The layout adapts from 40×12 to 4K: every core stays visible, and bigger windows get more history
@@ -824,7 +824,8 @@ What makes that possible:
   `terminal-background-wt.webp` are the **design mockups** made before the Rust version (demo
   data, Python reference compositor). `docs/screenshots/rust-*.webp` are captures of this
   version. Sixel pictures in those captures are decoded by the capture harness, not by a real
-  terminal.
+  terminal. Addresses, container names, paths and user names in them are replaced with
+  placeholders (10.0.0.x, 203.0.113.x, "app", "user").
 
 ## Development
 
