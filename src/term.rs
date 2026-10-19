@@ -186,7 +186,7 @@ pub fn suspend(fd: c_int, out: c_int) {
 /// Local time of day (h, m, s) from a realtime timestamp.
 pub fn local_hms(secs: i64) -> (i32, i32, i32) {
     unsafe {
-        let t: libc::time_t = secs as _;
+        let t = secs as _;
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&t, &mut tm);
         (tm.tm_hour, tm.tm_min, tm.tm_sec)

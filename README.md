@@ -13,7 +13,7 @@ them, connections, containers and services; a **Processes** page (`4`):
 every process with its CPU, memory and disk use, as a list, grouped by program or as a tree, with
 signals and nice; and a **Sensors & Power** page (`5`): every temperature by part with plain
 names, the fans and how the board drives them, CPU / GPU / battery watts, voltages, and the
-drivers it all comes from. Native Rust, one 1.1 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
+drivers it all comes from. Native Rust, one 1.4 MB binary, ~4 MB of RAM (< 5 MB even at 4K), and under **0.01 % of one CPU
 thread** (≈ 45–85 µs of CPU per second) at the default `eco` speed. Press `s`, `+` or `-` for
 `smooth` (bars, digits and graphs all moving continuously at a steady 60 frames per second,
 ≤ 0.5 % of one thread) or fixed rates up to
@@ -351,7 +351,23 @@ them; `--undo` reverses everything it did):
 
 ## Install
 
-Needs a Rust toolchain (<https://rustup.rs>) on Linux.
+Debian, Ubuntu and their derivatives (amd64 and arm64; the binary is static, so every release
+works):
+
+```sh
+curl -fsSL https://aipulsedaily.github.io/cpuview/cpuview.gpg \
+  | sudo tee /usr/share/keyrings/cpuview.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cpuview.gpg] https://aipulsedaily.github.io/cpuview stable main" \
+  | sudo tee /etc/apt/sources.list.d/cpuview.list
+sudo apt update && sudo apt install cpuview
+sudo cpuview --setup-sensors    # optional: fan chip driver, CPU watts for every user
+```
+
+`apt upgrade` then keeps it current. The .debs are also attached to every GitHub release
+(`sudo apt install ./cpuview_*.deb`). Remove with `sudo apt remove cpuview` (and
+`sudo cpuview --setup-sensors --undo` first if you ran it).
+
+From source, with a Rust toolchain (<https://rustup.rs>) on Linux:
 
 ```sh
 git clone https://github.com/aipulsedaily/cpuview.git
@@ -818,3 +834,8 @@ cargo clippy --release
 cargo build --release --features prof && CPUVIEW_PROFILE=/tmp/prof.txt target/release/cpuview  # per-phase CPU time, written on exit
 python3 themes/reference.py render nebula out.png   # the theme spec's reference renderer
 ```
+
+Packages: `packaging/build-deb.sh [amd64|arm64]` builds a static (musl) `.deb` into `dist/`;
+`packaging/make-apt-repo.sh KEY_ID` turns `dist/*.deb` into a signed APT repository
+(`dist/apt`). `.github/workflows/apt.yml` does both on every `v*` tag and publishes the
+repository on GitHub Pages (secrets `APT_GPG_KEY`, `APT_GPG_KEY_ID`).
