@@ -8,6 +8,7 @@ use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, RRF_RT_REG_DWORD,
 
 // (not in windows-sys: processor groups beyond the caller's)
 windows_link::link!("ntdll.dll" "system" fn NtQuerySystemInformationEx(class: i32, input: *const core::ffi::c_void, inlen: u32, info: *mut core::ffi::c_void, len: u32, retlen: *mut u32) -> i32);
+pub use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
 
 /// NUL-terminated UTF-16 for the W APIs.
 pub fn wide(s: &str) -> Vec<u16> {
@@ -57,8 +58,180 @@ pub fn reg_u32(root: HKEY, key: &str, val: &str) -> Option<u32> {
     (r == 0).then_some(d)
 }
 
+/// A handle kept in an fd field (Disk::fd, Proc::fd …): 64-bit Windows keeps handle
+/// values within 32 bits for interoperability, so they survive a round trip.
+pub fn h2fd(h: HANDLE) -> i32 {
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        -1
+    } else {
+        h as isize as i32
+    }
+}
+
 pub fn fd2h(fd: i32) -> HANDLE {
     fd as isize as HANDLE
+}
+
+/// SYSTEM_PROCESS_INFORMATION (the full process list), up to the threads.
+#[repr(C)]
+pub struct Spi {
+    pub next: u32,
+    pub threads: u32,
+    pub ws_private: i64,
+    pub hard_faults: u32,
+    pub threads_peak: u32,
+    pub cycles: u64,
+    pub create: i64,
+    pub user: i64,
+    pub kernel: i64,
+    pub name_len: u16,
+    pub name_max: u16,
+    pub name: *const u16,
+    pub prio: i32,
+    pub pid: usize,
+    pub ppid: usize,
+    pub handles: u32,
+    pub session: u32,
+    pub key: usize,
+    pub vm_peak: usize,
+    pub vm: usize,
+    pub faults: u32,
+    pub ws_peak: usize,
+    pub ws: usize,
+    pub quota: [usize; 4],
+    pub commit: usize,
+    pub commit_peak: usize,
+    pub private: usize,
+    pub io: [i64; 6],
+}
+
+/// One process of a list: pid, parent, identity (sequence number or creation time:
+/// pids are reused), name, and the full record when the list has one.
+pub struct ProcEnt<'a> {
+    pub pid: u32,
+    pub ppid: u32,
+    pub key: u64,
+    pub name: &'a [u16],
+    pub full: Option<&'a Spi>,
+}
+
+/// The system's process list. The basic list (pids, parents and names, Windows 11)
+/// costs ~0.1–0.4 ms; the full one walks every thread of every process (16 ms with
+/// 15 000 threads) and is read only when its numbers are needed.
+pub struct ProcList {
+    buf: Vec<u64>,
+    len: usize,
+    full: bool,
+    /// the basic list isn't supported (Windows 10): every list is a full one
+    pub no_basic: bool,
+}
+
+impl ProcList {
+    pub fn new() -> ProcList {
+        ProcList {
+            buf: Vec::new(),
+            len: 0,
+            full: false,
+            no_basic: false,
+        }
+    }
+
+    /// Read the list (`full`: with sizes and times). False if it couldn't be read.
+    pub fn read(&mut self, full: bool) -> bool {
+        let full = full || self.no_basic;
+        // SystemBasicProcessInformation (252), SystemProcessInformation (5)
+        let class = if full { 5 } else { 252 };
+        if self.buf.is_empty() {
+            self.buf = vec![0u64; if full { 1 << 15 } else { 1 << 12 }];
+        }
+        loop {
+            let mut got = 0u32;
+            let st = unsafe {
+                NtQuerySystemInformation(class, self.buf.as_mut_ptr() as *mut _, (self.buf.len() * 8) as u32, &mut got)
+            };
+            // STATUS_INFO_LENGTH_MISMATCH: grow (with room for new processes)
+            if st == 0xc000_0004u32 as i32 && self.buf.len() < 1 << 22 {
+                let want = (got as usize).div_ceil(8) + (got as usize).div_ceil(32) + 512;
+                self.buf = vec![0u64; want.max(self.buf.len() * 2)];
+                continue;
+            }
+            if st < 0 {
+                if !full {
+                    self.no_basic = true;
+                    return self.read(true);
+                }
+                self.len = 0;
+                return false;
+            }
+            self.len = got as usize;
+            self.full = full;
+            return true;
+        }
+    }
+
+    /// Give the buffer back (the next read allocates it again).
+    pub fn release(&mut self) {
+        self.buf = Vec::new();
+        self.len = 0;
+    }
+
+    pub fn each<'a>(&'a self, f: &mut dyn FnMut(ProcEnt<'a>)) {
+        let p = self.buf.as_ptr() as *const u8;
+        let mut o = 0usize;
+        while self.len > 0 && o + 48 <= self.len {
+            let e = unsafe { p.add(o) };
+            let next = unsafe { *(e as *const u32) } as usize;
+            let ent = if self.full {
+                let s = unsafe { &*(e as *const Spi) };
+                ProcEnt {
+                    pid: s.pid as u32,
+                    ppid: s.ppid as u32,
+                    key: s.create as u64,
+                    name: unsafe { wstr(s.name, s.name_len) },
+                    full: Some(s),
+                }
+            } else {
+                // SYSTEM_BASICPROCESS_INFORMATION: next, pid, parent, sequence number,
+                // image name (UNICODE_STRING)
+                let w = |k: usize| unsafe { *(e.add(8 * k) as *const usize) };
+                ProcEnt {
+                    pid: w(1) as u32,
+                    ppid: w(2) as u32,
+                    key: w(3) as u64,
+                    name: unsafe { wstr(w(5) as *const u16, *(e.add(32) as *const u16)) },
+                    full: None,
+                }
+            };
+            f(ent);
+            if next == 0 {
+                break;
+            }
+            o += next;
+        }
+    }
+}
+
+/// A UNICODE_STRING's characters (`len` in bytes).
+unsafe fn wstr<'a>(p: *const u16, len: u16) -> &'a [u16] {
+    if p.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(p, len as usize / 2)
+    }
+}
+
+/// A program's name for display: the image name without ".exe" (pid 0 is "Idle").
+pub fn prog_name(w: &[u16], pid: u32) -> String {
+    if w.is_empty() {
+        return if pid == 0 { "Idle".into() } else { String::new() };
+    }
+    let s = String::from_utf16_lossy(w);
+    let l = s.len();
+    if l > 4 && s[l - 4..].eq_ignore_ascii_case(".exe") {
+        s[..l - 4].to_string()
+    } else {
+        s
+    }
 }
 
 pub fn close(h: HANDLE) {
