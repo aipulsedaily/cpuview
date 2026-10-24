@@ -900,6 +900,26 @@ mod tests {
         assert_eq!(p.renice(me, start + 1, 0), Err(ESRCH));
     }
 
+    /// Suspend, resume, a lower priority and end on a child of ours.
+    #[test]
+    fn actions_on_a_child() {
+        let mut c = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut p = Procs::new("");
+        let pid = c.id();
+        let start = p.start_of(pid).expect("child's start");
+        assert_eq!(p.signal(pid, start, 1), Ok(()));
+        assert_eq!(p.signal(pid, start, 2), Ok(()));
+        assert_eq!(p.renice(pid, start, 10), Ok(()));
+        assert_eq!(p.signal(pid, start, 0), Ok(()));
+        let st = c.wait().unwrap();
+        assert!(!st.success());
+        assert_eq!(p.start_of(pid), None);
+    }
+
     #[test]
     fn names_and_priorities() {
         assert_eq!(args_at(r#""C:\Program Files\x.exe" --a b"#), 25);
