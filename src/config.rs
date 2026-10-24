@@ -124,7 +124,8 @@ pub fn wallpaper_dirs() -> Vec<PathBuf> {
     v.into_iter().filter(|p| p.is_dir()).collect()
 }
 
-/// Windows: next to cpuview.exe (the release zip), else the repository's.
+/// Windows: next to cpuview.exe (the release zip; also where a link to it, such as
+/// winget's command alias, points), else the repository's.
 #[cfg(windows)]
 pub fn wallpaper_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
@@ -132,8 +133,13 @@ pub fn wallpaper_dirs() -> Vec<PathBuf> {
         v.push(PathBuf::from(p));
     }
     if let Ok(exe) = std::env::current_exe() {
+        let real = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+        for e in [&exe, &real] {
+            if let Some(d) = e.parent() {
+                v.push(d.join("wallpapers"));
+            }
+        }
         if let Some(d) = exe.parent() {
-            v.push(d.join("wallpapers"));
             v.push(d.join("../../wallpapers")); // cargo run from the repo
         }
     }

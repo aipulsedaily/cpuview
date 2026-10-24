@@ -33,9 +33,9 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist/cpuview | Out-Null
+          New-Item -ItemType Directory -Force dist/cpuview/wallpapers | Out-Null
           Copy-Item target/release/cpuview.exe, LICENSE, README.md dist/cpuview/
-          Copy-Item -Recurse wallpapers dist/cpuview/wallpapers
+          Copy-Item wallpapers/*.jpg, wallpapers/*.png, wallpapers/CREDITS.md, wallpapers/credits.toml dist/cpuview/wallpapers/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cpuview-windows-x86_64

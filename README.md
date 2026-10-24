@@ -64,6 +64,29 @@ cd cpuview-*-linux && ./bin/cpuview
 To install it for your user: `cp bin/cpuview ~/.local/bin/` and
 `mkdir -p ~/.local/share/cpuview && cp -r share/cpuview/wallpapers ~/.local/share/cpuview/`.
 
+### Windows 10 and 11
+
+Every release has `cpuview-<version>-x86_64-windows.zip`: unpack it anywhere and run
+`cpuview.exe` in Windows Terminal (the classic console window and VS Code's terminal work
+too). No installer, no administrator rights, no Visual C++ runtime; the `wallpapers` folder
+next to it holds the picture themes, settings go to `%APPDATA%\cpuview`. (winget: later.)
+
+From source: `cargo build --release` with the MSVC toolchain (rustup's default on Windows,
+with Visual Studio's C++ build tools).
+
+**What Windows can and can't show.** CPU load per thread, the clocks the cores really run at,
+cores and their threads (P- and E-cores), the power plan, RAM and the page file, disks,
+volumes, the network, processes (end, suspend, resume, priority), the battery, NVMe drives'
+temperatures and the firmware's ACPI thermal zones all come from Windows itself. CPU
+temperatures, fans, voltages and CPU / GPU power don't: Windows has no interface for them
+without a kernel driver, and cpuview loads none. Run
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) with its
+web server on (Options → Remote Web Server) and cpuview shows them on the Sensors & Power
+page and the CPU page (`cpuview --setup-sensors` explains). Linux-only: containers, systemd
+services, a server board's BMC, per-core RAPL, Ctrl-Z. The load average is an estimate (the
+busy CPUs, decayed like Linux's); processes' read / write counts are all their I/O (disk,
+network and pipes together).
+
 ### From source
 
 With a Rust toolchain (<https://rustup.rs>):

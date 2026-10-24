@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# (a template: make-manifest.ps1 fills in {version})
+PackageIdentifier: aipulsedaily.cpuview
+PackageVersion: {version}
+PackageLocale: en-US
+Publisher: aipulsedaily
+PublisherUrl: https://github.com/aipulsedaily
+PackageName: cpuview
+PackageUrl: https://github.com/aipulsedaily/cpuview
+License: MIT
+LicenseUrl: https://github.com/aipulsedaily/cpuview/blob/main/LICENSE
+ShortDescription: Terminal monitor of every core's clock and load, memory, disks, network, processes and sensors
+Description: |-
+  A btop-style terminal monitor: every CPU thread's clock and load at once, grouped by
+  core, with memory & storage, network, processes and sensors pages, themes and picture
+  backgrounds. Light: at its default speed it uses well under 0.01 % of one CPU thread.
+Tags:
+  - cpu
+  - monitor
+  - system-monitor
+  - terminal
+  - tui
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
