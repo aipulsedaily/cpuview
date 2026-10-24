@@ -496,10 +496,12 @@ fn guid_eq(a: &windows_sys::core::GUID, b: &windows_sys::core::GUID) -> bool {
     a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
 }
 
-/// Keep the process on one physical core the scheduler uses least (the lowest rank:
-/// an efficiency core on hybrid CPUs, else the last core), as on Linux: the next
-/// wakeup finds its code and data in that core's cache. Only on single-group machines
-/// whose affinity wasn't narrowed already (a narrower one is kept, and pinned inside);
+/// Keep the process on one physical core the scheduler uses least, as on Linux: the
+/// next wakeup finds its code and data in that core's cache. On hybrid CPUs a
+/// performance core (the least preferred of them): an efficiency core makes each
+/// wakeup twice as dear (measured on an i9-13900K), against the CPU-time budget.
+/// Else the lowest-ranked core, ties the last. Only on single-group machines whose
+/// affinity wasn't narrowed already (a narrower one is kept, and pinned inside);
 /// CPUVIEW_PIN=off or =N.
 pub fn auto_pin(t: &Topo) {
     let env = std::env::var("CPUVIEW_PIN").unwrap_or_default();
@@ -520,9 +522,10 @@ pub fn auto_pin(t: &Topo) {
         if ok.len() < 2 {
             return;
         }
-        // (ties: the last of them)
+        // (rank: efficiency class << 8 | scheduling class; ties: the last of them)
+        let top = ok.iter().map(|&g| t.rank[g] >> 8).max().unwrap_or(-1);
         let key = |g: usize| (t.rank[g].max(-1), -(g as i64));
-        let Some(&g) = ok.iter().min_by_key(|&&g| key(g)) else {
+        let Some(&g) = ok.iter().filter(|&&g| t.rank[g] >> 8 == top).min_by_key(|&&g| key(g)) else {
             return;
         };
         for &i in &t.groups[g] {

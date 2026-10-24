@@ -514,9 +514,12 @@ pub struct Sampler {
     /// SMT sibling of each CPU index (first other thread of the same core)
     sibling: Vec<usize>,
     f_copy: Option<(usize, usize)>,
-    /// Windows: the system calls and counters that stand in for /proc and sysfs
+    /// Windows: the system calls and counters that stand in for /proc and sysfs,
+    /// and whether the speed is eco (the clocks' counter collection is dear)
     #[cfg(windows)]
     w: win::Cpu,
+    #[cfg(windows)]
+    pub eco: bool,
 }
 
 /// (Windows has no CPU temperature interface: LibreHardwareMonitor's, if it runs)
@@ -689,6 +692,8 @@ impl Sampler {
             f_copy: None,
             #[cfg(windows)]
             w: win::Cpu::new(&t),
+            #[cfg(windows)]
+            eco: false,
             t,
         };
         // size the /proc/stat buffer once (it can be large on many-CPU machines)
@@ -745,8 +750,13 @@ impl Sampler {
     /// read round-robin (a quarter per sample) and fully idle ones show their
     /// minimum clock, which is what scaling_cur_freq reports for them anyway.
     /// (Windows: one counter collection for all of them, see win::Cpu::clocks)
+    /// (eco: every other sample; a collection costs 30-100 µs, most of a sample)
     #[cfg(windows)]
     fn read_freq(&mut self) {
+        self.freq_rr = self.freq_rr.wrapping_add(1);
+        if self.eco && self.freq_rr % 2 == 0 {
+            return;
+        }
         self.w.clocks(&self.ur, &mut self.fr, &mut self.t);
     }
 
@@ -1295,6 +1305,8 @@ impl Sampler {
             f_copy: None,
             #[cfg(windows)]
             w: win::Cpu::none(),
+            #[cfg(windows)]
+            eco: false,
         }
     }
     fn parse_stat_buf(&mut self, n: usize) {

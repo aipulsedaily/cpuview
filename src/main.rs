@@ -1684,6 +1684,10 @@ fn main() {
             next_frame = Some(anim::next_frame(term::mono() + offset, fps) - offset);
         }
         let eco = fixed.is_none() && ui::SPEEDS[speed].1 == 0;
+        #[cfg(windows)]
+        {
+            st.app.s.eco = eco;
+        }
         // account the CPU time of the wakeup that just finished (eco only: reading
         // the process clock is a syscall, which faster speeds needn't pay per frame)
         let c = if eco { term::cpu_ns() } else { cpu_mark };
