@@ -1902,6 +1902,9 @@ fn main() {
             // cadence (sensors::Sens::tick)
             if zpage {
                 prof(4, || st.app.z.tick(now, push, eco));
+            } else if st.app.page == ui::PG_CPU {
+                // (the CPU page: its package watts only)
+                prof(4, || st.app.z.tick_power(now, eco));
             }
             // the overview (view 0): its sensors (no per-core power, a dear chip rarely
             // in eco) and processes (sensors::Sens::tick_ov, App::ov_sample)

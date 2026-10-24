@@ -182,7 +182,8 @@ that text erases the image in its cell; not shown by a real terminal.
 - **Detail statistics** for the selected core: average / peak clock, time spent boosting, average
   load and the amd-pstate preferred-core rank
 - **Sensors**: k10temp / zenpower / coretemp / cpu_thermal temperatures with their window maximum,
-  governor and EPP, load average, busy and boosting thread counts, peak clock
+  governor and EPP, load average, busy and boosting thread counts, peak clock, and CPU power
+  (package watts, and the RAM's where the CPU reports it; only those counters are read here)
 - **10 themes** with procedural backgrounds (Midnight, Aurora, Deep Ocean, Ember, Mono, Nebula,
   Night Forest, Space, Synthwave Sunset, Terminal background) and **picture themes**
   (8 bundled wallpapers, your own JPEG/PNG files, or a URL)

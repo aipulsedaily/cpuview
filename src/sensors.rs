@@ -1331,6 +1331,29 @@ impl Sens {
         self.last_seen = now;
     }
 
+    /// The CPU page (view 1): only the CPU package's power (RAPL or perf, with the
+    /// RAM's where the same source has it), on its own cadence.
+    pub fn tick_power(&mut self, now: i64, eco: bool) {
+        if !self.detected {
+            // (finding the sensors, once, is sensor time too: eco mustn't charge the
+            // page's own budget for it)
+            let (t0, s0) = (thread_ns(), self.spent);
+            self.detect(now);
+            self.spent = s0 + (thread_ns() - t0).max(0);
+        }
+        let Some(s) = self.role(R_PKG).map(|i| self.rd[i].src as usize) else { return };
+        let (p, l) = (self.period(s, eco), self.srcs[s].last);
+        if l == i64::MIN || now - l >= p - p / 10 {
+            self.read_src(s, now);
+        }
+    }
+
+    /// The CPU package's watts and the RAM's (where read), for the CPU page.
+    pub fn cpu_watts(&self) -> (Option<f32>, Option<f32>) {
+        let w = |role| self.role(role).filter(|&i| self.cpu_power == P_OK && self.rd[i].ok).map(|i| self.rd[i].val);
+        (w(R_PKG), w(R_DRAM))
+    }
+
     /// The overview (view 0) reads source `i`: not the per-core power counters, not
     /// the CPU's temperatures when the CPU sampler has them (`cpu_t`), not the slow
     /// ones (RAM sticks and drives on the SMBus / admin queue block for up to ~10 ms:

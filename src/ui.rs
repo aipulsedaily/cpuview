@@ -1410,7 +1410,9 @@ impl App {
             let (u, f, topf) = self.totals();
             let ku = (u * 100.0).round() as u64;
             let kf = mixk(&[(f / 10.0) as u64, (topf / 10.0) as u64]);
-            let ks = mixk(&[sensors_key(&self.s), hn / 2]);
+            let (pw, rw) = self.z.cpu_watts();
+            let wk = |w: Option<f32>| w.map_or(u64::MAX, |w| (w * 100.0).round() as u64);
+            let ks = mixk(&[sensors_key(&self.s), hn / 2, wk(pw), wk(rw), self.z.cpu_power as u64]);
             let kd = self.sensors_dyn_key();
             let kh = self.body_key(2);
             let body = self.memo(SLOT_GBODY, self.body_key(0));
@@ -2410,11 +2412,36 @@ impl App {
                 &[("peak ", th.dim), (pk.s(), pks)],
             ],
         ];
-        for vs in rows {
+        // CPU power: package watts (and the RAM's), or how to make them readable
+        let (pw, rw) = self.z.cpu_watts();
+        let (w1, w2) = (pw.map_or(F::new(), watts), rw.map_or(F::new(), |w| fc(&["  RAM ", watts(w).s()])));
+        let locked = pw.is_none() && self.z.cpu_power == crate::sensors::P_LOCKED;
+        let power: &[&[(&str, u32)]] = if pw.is_some() {
+            &[
+                &[("power   ", th.dim), (w1.s(), th.fg | BOLD), (" CPU", th.mid), (w2.s(), th.mid)],
+                &[("power   ", th.dim), (w1.s(), th.fg | BOLD), (" CPU", th.mid)],
+                &[("power ", th.dim), (w1.s(), th.fg | BOLD)],
+            ]
+        } else if locked {
+            &[
+                &[("power   ", th.dim), ("run cpuview --setup-sensors", th.dim)],
+                &[("power   ", th.dim), ("root-only", th.dim)],
+            ]
+        } else {
+            &[]
+        };
+        let power = (self.z.role(crate::sensors::R_PKG).is_some() || locked).then_some(power);
+        for vs in rows.into_iter().chain(power) {
             if y >= maxy {
                 break;
             }
             if parts & 1 == 0 {
+                y += 1;
+                continue;
+            }
+            // (power before its first reading: the row's place, blank)
+            if vs.is_empty() {
+                Self::line(scr, ir.x, y, maxx, bg, &[("", 0)]);
                 y += 1;
                 continue;
             }
