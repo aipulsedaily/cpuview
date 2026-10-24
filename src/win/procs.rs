@@ -693,7 +693,9 @@ impl Procs {
             let i = self.w.rr % n;
             self.w.rr = self.w.rr.wrapping_add(1);
             let (pid, _, start, fd, t0) = self.w.hs[i];
-            if fd < 0 || self.tr.iter().any(|t| t.pid == pid) {
+            // (times move in 15.6 ms ticks: a rate over less than 0.1 s means nothing,
+            // the last one stays)
+            if fd < 0 || now - t0 < 100_000_000 || self.tr.iter().any(|t| t.pid == pid) {
                 continue;
             }
             let Some((_, ticks, exited)) = times(fd2h(fd), boot) else {
