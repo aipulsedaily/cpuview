@@ -753,10 +753,11 @@ fn exists(parts: &[&str]) -> bool {
     unsafe { libc::access(pb(parts).b.as_ptr() as *const _, libc::F_OK) == 0 }
 }
 
-/// The network interface a device belongs to (a `net` directory on its way up).
+/// The network interface a device belongs to (a `net` directory on its way up, short of
+/// /sys/devices/virtual, whose net/ holds every virtual interface: lo, bridges, …).
 fn iface_of(dev: &str, root: &str) -> Option<String> {
     let mut p = dev;
-    while p.len() > root.len() + 5 {
+    while p.len() > root.len() + 5 && !p.ends_with("/devices/virtual") {
         if let Some(n) = list(&[p, "/net"].concat()).into_iter().next() {
             return Some(n);
         }

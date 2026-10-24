@@ -481,9 +481,16 @@ fn bmc_fans_are_not_a_missing_driver() {
     fx.dir("/sys/class/dmi/id", &[("board_vendor", "Supermicro"), ("board_name", "X12SCZ-TLN4F")])
         .dir("/sys/class/hwmon/hwmon0", &[("name", "coretemp"), ("temp1_input", "41000"), ("temp1_label", "Package id 0")])
         .dir("/sys/class/ipmi/ipmi0", &[("dev", "243:0")])
+        // the ACPI zone sits under /sys/devices/virtual, next to every virtual interface
+        .dir("/sys/class/hwmon/hwmon1", &[("name", "acpitz"), ("temp1_input", "27800")])
+        .link("/sys/class/hwmon/hwmon1/device", "/sys/devices/virtual/thermal/thermal_zone0")
+        .dir("/sys/devices/virtual/thermal/thermal_zone0", &[("type", "acpitz")])
+        .dir("/sys/devices/virtual/net/br-bdf23f2534a4", &[])
         .dir(&format!("/lib/modules/{}/kernel/drivers/hwmon", release()), &[("nct6775.ko.zst", "")]);
     let s = fx.sens();
     assert_eq!(s.fan_hint, Some(("ipmi".to_string(), 3)));
+    let z = s.srcs.iter().find(|x| x.chip == "acpitz").unwrap();
+    assert!(z.what != "network chip" && !z.dev.contains("br-"), "{} {}", z.what, z.dev);
     let t = page(fx.sens(), 128, 45);
     assert!(t.contains("BMC runs the fans"), "{t}");
 }
