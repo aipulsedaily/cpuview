@@ -403,8 +403,9 @@ is read for the page while it isn't shown.
 changes and why, asks, and only then runs exactly those with sudo (`--dry-run` only shows
 them; `--undo` reverses everything it did):
 
-- the board's fan driver, if one is known and installed but not loaded: written to
-  `/etc/modules-load.d/cpuview-<module>.conf` and loaded now;
+- the board's fan driver, if one is known and installed but not loaded: loaded now and, only
+  if it finds the fan chip, written to `/etc/modules-load.d/cpuview-<module>.conf` for every
+  boot (a driver that finds nothing is left out and the other steps still run);
 - CPU power: a udev rule (`/etc/udev/rules.d/70-cpuview-rapl.rules`) that makes the RAPL
   `energy_uj` counters readable by everyone at every boot, and the same now. Caveat: RAPL
   readings can leak information about what other users' programs do (power side channels,

@@ -1642,8 +1642,14 @@ pub fn setup(undo: bool, per_core: bool, dry: bool) -> i32 {
         let mut s = Sens::empty();
         s.detect(crate::term::mono());
         match &s.fan_hint {
+            // a guess by the board's maker: kept for every boot only if it finds the chip,
+            // and a miss doesn't stop the other steps
             Some((m, 0)) => step(&mut sh, &[
-                "load the ", m, " driver now and at every boot: no fan sensors are visible,\n# and boards like this one report their fans through it\necho ", m, " > /etc/modules-load.d/cpuview-", m, ".conf\nmodprobe ", m,
+                "try the ", m, " driver: no fan sensors are visible, and boards from this maker\n",
+                "# usually report their fans through it. Loaded at every boot only if it finds the chip.\n",
+                "if modprobe ", m, "; then\n  echo ", m, " > /etc/modules-load.d/cpuview-", m, ".conf\n",
+                "else\n  echo 'fans: the ", m, " driver found no fan chip on this board; `sudo sensors-detect` (lm-sensors) can look for the right one'\n",
+                "  rm -f /etc/modules-load.d/cpuview-", m, ".conf\nfi",
             ]),
             Some((m, 1)) => note += &["fans: the ", m, " driver is loaded but shows no fans; `sudo sensors-detect` (lm-sensors) may find the right one\n"].concat(),
             Some(_) => note += "fans: no fan sensors and no known driver for this board; `sudo sensors-detect` (lm-sensors) can look for one\n",
