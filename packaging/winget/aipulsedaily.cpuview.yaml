@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
-# (a template: make-manifest.ps1 fills in {version})
+# (a template: make-manifest.ps1 fills in the version)
 PackageIdentifier: aipulsedaily.cpuview
 PackageVersion: {version}
 DefaultLocale: en-US

@@ -3,12 +3,14 @@
 #   packaging/build-zip.ps1            x86_64
 #   packaging/build-zip.ps1 aarch64
 param([string]$Arch = "x86_64")
-$ErrorActionPreference = "Stop"
 if ($Arch -ne "x86_64" -and $Arch -ne "aarch64") { throw "unknown arch: $Arch (x86_64 or aarch64)" }
 $Dir = (Resolve-Path "$PSScriptRoot/..").Path
 $Target = "$Arch-pc-windows-msvc"
+# (cargo's progress goes to stderr: Windows PowerShell 5.1 would take it for an error
+# under "Stop", so that is set after; the exit code says whether it worked)
 cargo build --release --locked --target $Target --manifest-path "$Dir/Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+$ErrorActionPreference = "Stop"
 
 $Version = (Select-String -Path "$Dir/Cargo.toml" -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 $Name = "cpuview-$Version-$Arch-windows"

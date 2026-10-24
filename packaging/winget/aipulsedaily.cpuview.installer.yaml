@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-# (a template: make-manifest.ps1 fills in {version} and {sha256})
+# (a template: make-manifest.ps1 fills in the version and the zip's hash)
 PackageIdentifier: aipulsedaily.cpuview
 PackageVersion: {version}
 InstallerType: zip
