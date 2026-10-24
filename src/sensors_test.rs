@@ -489,10 +489,32 @@ fn bmc_fans_are_not_a_missing_driver() {
         .dir(&format!("/lib/modules/{}/kernel/drivers/hwmon", release()), &[("nct6775.ko.zst", "")]);
     let s = fx.sens();
     assert_eq!(s.fan_hint, Some(("ipmi".to_string(), 3)));
+    assert!(s.bmc_locked, "no /dev/ipmi0 this user may open");
     let z = s.srcs.iter().find(|x| x.chip == "acpitz").unwrap();
     assert!(z.what != "network chip" && !z.dev.contains("br-"), "{} {}", z.what, z.dev);
     let t = page(fx.sens(), 128, 45);
-    assert!(t.contains("BMC runs the fans"), "{t}");
+    assert!(t.contains("BMC runs the fans") && t.contains("--setup-sensors --bmc"), "{t}");
+}
+
+#[test]
+fn bmc_setup_step_is_valid_shell() {
+    // the step's commands, run against a scratch directory instead of /etc and /dev
+    let fx = Fx::new("bmcstep");
+    let d = format!("{}/x", fx.0);
+    std::fs::create_dir_all(format!("{d}/etc/udev/rules.d")).unwrap();
+    std::fs::create_dir_all(format!("{d}/dev")).unwrap();
+    let sh = format!("# {}", bmc_step("alice"))
+        .replace(BMC_RULE, &format!("{d}{BMC_RULE}"))
+        .replace("/dev/ipmi", &format!("{d}/dev/ipmi"))
+        .replace("udevadm control --reload", "true");
+    let out = std::process::Command::new("sh").args(["-ec", &sh]).output().unwrap();
+    assert!(out.status.success(), "{sh}\n{}", String::from_utf8_lossy(&out.stderr));
+    let rule = std::fs::read_to_string(format!("{d}{BMC_RULE}")).unwrap();
+    assert_eq!(
+        rule.lines().last().unwrap(),
+        r#"SUBSYSTEM=="ipmi", KERNEL=="ipmi[0-9]*", OWNER="alice", MODE="0600""#
+    );
+    assert!(rule.starts_with("# cpuview --setup-sensors --bmc: let alice read the BMC (IPMI)\n"));
 }
 
 #[test]

@@ -851,9 +851,13 @@ impl App {
                 l.s("no fan sensors: the ").s(m).s(" driver isn't loaded");
                 "run `cpuview --setup-sensors` to load it (asks first)"
             }
+            Some(3) if z.bmc_locked => {
+                l.s("no fan sensors: the board's BMC runs the fans (IPMI), root-only");
+                "run `cpuview --setup-sensors --bmc` to read them (asks first)"
+            }
             Some(3) => {
-                l.s("no fan sensors: the board's BMC runs the fans (IPMI)");
-                "`sudo ipmitool sdr type Fan` lists them"
+                l.s("no fan sensors: the board's BMC runs the fans (IPMI) and lists none");
+                "`sudo ipmitool sdr type Fan` shows what it has"
             }
             Some(1) => {
                 l.s("no fan sensors, although ").s(m).s(" is loaded");

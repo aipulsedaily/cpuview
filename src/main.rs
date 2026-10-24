@@ -7,6 +7,7 @@ mod config;
 mod gfx;
 mod image;
 mod input;
+mod ipmi;
 mod mem;
 mod menu;
 mod mosaic;
@@ -68,7 +69,9 @@ usage: cpuview [options]
                         (if missing) now and at boot; makes the RAPL energy counters
                         readable with a udev rule. Options: --per-core (per-core
                         power: cap_perfmon on this binary, redo after reinstalling),
-                        --undo (reverse it all), --dry-run (only show the plan)
+                        --bmc (a server board's BMC: fans, temperatures, voltages
+                        through IPMI, for this user), --undo (reverse it all),
+                        --dry-run (only show the plan)
   --no-probe            don't query the terminal (assume what TERM/COLORTERM say)
   --doctor              show what the terminal supports and which image mode is used
   -h, --help            this help
@@ -1302,7 +1305,7 @@ fn main() {
     let mut speed_arg = None;
     let mut page_arg = None;
     let mut fit_arg = None;
-    let (mut setup, mut undo, mut per_core, mut dry) = (false, false, false, false);
+    let (mut setup, mut undo, mut per_core, mut bmc, mut dry) = (false, false, false, false, false);
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1332,6 +1335,7 @@ fn main() {
             "--setup-sensors" => setup = true,
             "--undo" => undo = true,
             "--per-core" => per_core = true,
+            "--bmc" => bmc = true,
             "--dry-run" => dry = true,
             "--no-probe" => no_probe = true,
             "--theme" => theme_arg = Some(val()),
@@ -1383,11 +1387,11 @@ fn main() {
         }
         i += 1;
     }
-    if setup || undo || per_core || dry {
+    if setup || undo || per_core || bmc || dry {
         if !setup {
-            die("--undo, --per-core and --dry-run go with --setup-sensors");
+            die("--undo, --per-core, --bmc and --dry-run go with --setup-sensors");
         }
-        std::process::exit(sensors::setup(undo, per_core, dry));
+        std::process::exit(sensors::setup(undo, per_core, bmc, dry));
     }
     if let Some(n) = speed_arg {
         cfg.speed = n;

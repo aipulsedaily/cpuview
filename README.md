@@ -381,6 +381,12 @@ is read for the page while it isn't shown.
   from Dell, ThinkPad, Apple and ASUS EC drivers; otherwise "fan 3". Headers with nothing
   connected share one line. A CPU fan that spun and reads 0 turns the headline red. Speed over
   time with both CPU fans.
+- **Server boards** (Supermicro, Dell PowerEdge, HPE, …): the BMC runs the fans and has its own
+  temperature and voltage sensors, which no hwmon driver shows. cpuview reads them through the
+  kernel's IPMI device (`/dev/ipmi0`): the sensor list once (cached in
+  `~/.cache/cpuview/bmc-sdr` until the BMC's list changes), then the readings without ever
+  waiting for the BMC (each read collects the answers to the last one's requests). The device
+  is root-only; `cpuview --setup-sensors --bmc` (below) gives it to your user.
 - **Power**: CPU package watts and, where the CPU counts it per core (AMD Zen, through perf),
   each core and "cores vs the rest of the CPU"; Intel's core / uncore / DRAM / platform domains;
   the GPU's own meter (amdgpu, nouveau, Intel energy counters); a laptop's battery (watts,
@@ -395,7 +401,8 @@ is read for the page while it isn't shown.
   the board (DMI), how CPU power is read or why not; with no fan sensors, the driver this
   board's maker usually needs (nct6775, it87, asus_ec_sensors, asus_wmi_sensors,
   dell_smm_hwmon, thinkpad_acpi, applesmc, …, found by DMI vendor, not modinfo) and whether
-  it's installed, else `sudo sensors-detect`. cpuview never loads modules itself.
+  it's installed, else `sudo sensors-detect`; on a board with a BMC, that the BMC runs them.
+  cpuview never loads modules itself.
 - 40×12 shows the temperatures and the fans; from 100 columns the page has two columns, from
   200 three.
 
@@ -411,6 +418,11 @@ them; `--undo` reverses everything it did):
   readings can leak information about what other users' programs do (power side channels,
   e.g. the 2020 PLATYPUS attack), which is why distributions lock them down; on a single-user
   machine that is no concern;
+- with `--bmc`, on a server board: a udev rule (`/etc/udev/rules.d/70-cpuview-ipmi.rules`)
+  that makes the BMC's device (`/dev/ipmi0`) yours at every boot, and the same now. Caveat:
+  the device takes any IPMI command, not only readings, so whoever opens it can also power the
+  machine off or change the BMC's users and network; the rule gives it to your user alone (who
+  can already do that with sudo), not to everyone;
 - with `--per-core`: the perfmon capability on the installed binary, for per-core power
   through perf (the kernel's `perf_event_paranoid` allows it only that way). File
   capabilities are lost when the binary is replaced, so redo it after every `./install.sh`;

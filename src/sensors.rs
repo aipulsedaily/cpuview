@@ -61,6 +61,7 @@ const S_ZONES: u8 = 1;
 const S_RAPL: u8 = 2;
 const S_PERF: u8 = 3;
 const S_BAT: u8 = 4;
+const S_BMC: u8 = 5;
 
 // cadence classes (CPU, board, GPU, slow, power, cores, battery: `CHIPS` names
 // them for hwmon chips): (eco base ms, base ms, eco share µs/s, share µs/s). A
@@ -96,6 +97,8 @@ const F_AUX: u8 = 2;
 const F_DROP: u8 = 4;
 /// the motherboard's own temperature (reference for the aux inputs)
 const F_REF: u8 = 8;
+/// a BMC reading asked for, its answer not in yet
+const F_ASKED: u8 = 16;
 
 /// An energy counter: watts from the difference of two readings.
 #[derive(Clone, Copy, Default)]
@@ -285,6 +288,11 @@ pub struct Sens {
     pub perf_paranoid: i32,
     /// the overview's last dear read (not counting the one when it came into view)
     ov_dear: i64,
+    /// a server board's BMC (IPMI) and its sensors (a BMC reading's `fd` is its index)
+    bmc: Option<crate::ipmi::Bmc>,
+    sdr: Vec<crate::ipmi::Sdr>,
+    /// there is a BMC but its device is root-only
+    pub bmc_locked: bool,
 }
 
 fn thread_ns() -> i64 {
@@ -753,6 +761,14 @@ fn exists(parts: &[&str]) -> bool {
     unsafe { libc::access(pb(parts).b.as_ptr() as *const _, libc::F_OK) == 0 }
 }
 
+/// Where the BMC's sensor list is cached (walking it takes the BMC a while).
+fn bmc_cache() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
+    base.join("cpuview").join("bmc-sdr")
+}
+
 /// The network interface a device belongs to (a `net` directory on its way up, short of
 /// /sys/devices/virtual, whose net/ holds every virtual interface: lo, bridges, …).
 fn iface_of(dev: &str, root: &str) -> Option<String> {
@@ -836,6 +852,9 @@ impl Sens {
             spent: 0,
             perf_paranoid: -9,
             ov_dear: i64::MIN / 2,
+            bmc: None,
+            sdr: Vec::new(),
+            bmc_locked: false,
         }
     }
 
@@ -929,17 +948,27 @@ impl Sens {
         }
         self.rapl();
         self.batteries();
+        let has_bmc = ["/sys/class/ipmi/ipmi0", "/dev/ipmi0", "/dev/ipmi/0", "/dev/ipmidev/0"].iter().any(|p| exists(&[root, p]));
+        if has_bmc {
+            match crate::ipmi::Bmc::open(root) {
+                Some(b) => {
+                    let sdr = b.sensors(&bmc_cache());
+                    self.bmc = Some(b);
+                    self.add_bmc(sdr);
+                }
+                None => self.bmc_locked = true,
+            }
+        }
         self.finish_names();
         // no fans: which driver would show them (by the board's maker), unless a BMC
         // (IPMI) runs them, as on server boards
         if !self.rd.iter().any(|r| r.kind == K_FAN) && !self.vm && !vendor.is_empty() {
             let key = [&vendor, " ", &dmi("product_version")].concat().to_ascii_lowercase();
             let mut hint = (String::new(), 2);
-            let bmc = exists(&[root, "/sys/class/ipmi/ipmi0"]);
-            if bmc {
+            if has_bmc {
                 hint = ("ipmi".to_string(), 3);
             }
-            for m in lookup(MODS, &key, "")[0].split(',').filter(|m| !bmc && !m.is_empty()) {
+            for m in lookup(MODS, &key, "")[0].split(',').filter(|m| !has_bmc && !m.is_empty()) {
                 if exists(&[root, "/sys/module/", m]) {
                     if hint.1 == 2 {
                         hint = (m.to_string(), 1);
@@ -957,6 +986,10 @@ impl Sens {
             self.read_src(i, now);
             if matches!(self.srcs[i].kind, S_RAPL | S_PERF) {
                 self.srcs[i].last = now - 10 * SEC;
+            }
+            // (the BMC answers in milliseconds: its first readings now, not a read later)
+            if self.srcs[i].kind == S_BMC {
+                self.read_bmc(i, 300);
             }
         }
     }
@@ -1418,8 +1451,11 @@ impl Sens {
         if kind == S_BAT {
             self.read_bats(now);
         }
+        if kind == S_BMC {
+            self.read_bmc(i, 0);
+        }
         for r in &mut self.rd {
-            if r.src as usize != i || r.fd < 0 {
+            if r.src as usize != i || r.fd < 0 || kind == S_BMC {
                 continue;
             }
             match r.kind {
@@ -1491,6 +1527,98 @@ impl Sens {
         s.last = now;
         s.reads += 1;
         self.spent += c;
+    }
+
+    /// The BMC's answers to the last read's requests (waiting up to `wait_ms` for
+    /// them), then the next requests.
+    fn read_bmc(&mut self, i: usize, wait_ms: i32) {
+        use crate::ipmi::reading;
+        let Some(b) = self.bmc.as_ref() else { return };
+        let mut buf = [0u8; 288];
+        let mut left = self.rd.iter().filter(|r| r.src as usize == i && r.flags & F_ASKED != 0).count();
+        let t0 = crate::term::mono();
+        loop {
+            while let Some((id, d)) = b.recv(&mut buf) {
+                let Some(r) = self.rd.get_mut(id as usize).filter(|r| r.src as usize == i && r.flags & F_ASKED != 0) else { continue };
+                r.flags &= !F_ASKED;
+                left = left.saturating_sub(1);
+                let v = reading(d).map(|x| self.sdr[r.fd as usize].value(x));
+                r.val = v.unwrap_or(0.0);
+                r.ok = match r.kind {
+                    K_FAN => v.is_some_and(|v| (0.0..60000.0).contains(&v)),
+                    K_TEMP => v.is_some_and(|v| temp_ok(v, false, None)),
+                    _ => v.is_some_and(|v| v.is_finite() && v > 0.0),
+                };
+                if r.ok {
+                    r.seen |= r.kind != K_FAN || r.val > 0.0;
+                    r.max = r.max.max(r.val);
+                }
+            }
+            let gone = (crate::term::mono() - t0) / 1_000_000;
+            if left == 0 || gone >= wait_ms as i64 {
+                break;
+            }
+            let mut p = libc::pollfd {
+                fd: b.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(&mut p, 1, wait_ms - gone as i32) };
+        }
+        for k in 0..self.rd.len() {
+            let r = &mut self.rd[k];
+            if r.src as usize == i && b.ask(&self.sdr[r.fd as usize], k) {
+                r.flags |= F_ASKED;
+            }
+        }
+    }
+
+    /// The BMC's sensors: fans, temperatures (by what their names say they
+    /// measure) and voltages, with the limits the BMC sets.
+    fn add_bmc(&mut self, sdr: Vec<crate::ipmi::Sdr>) {
+        use crate::ipmi::{T_FAN, T_TEMP};
+        if sdr.is_empty() {
+            return;
+        }
+        // (read as often as a board chip: cadence class 1)
+        let s = self.src("BMC", "ipmi_si", "server board's BMC (IPMI)", "", S_BMC, 1, G_BOARD);
+        let cpu_t = self.rd.iter().any(|r| r.kind == K_TEMP && r.group == G_CPU);
+        for (k, x) in sdr.iter().enumerate() {
+            let lc = x.name.to_ascii_lowercase();
+            let (kind, name) = match x.typ {
+                // ("FAN1" → "fan 1", "FANA" → "fan A")
+                T_FAN => {
+                    let n = x.name.get(..3).filter(|p| p.eq_ignore_ascii_case("fan")).map_or(x.name.as_str(), |_| &x.name[3..]);
+                    (K_FAN, ["fan ", n.trim_start_matches([' ', '_'])].concat())
+                }
+                T_TEMP => (K_TEMP, x.name.trim_end_matches(" Temp").trim_end_matches("_Temp").to_string()),
+                _ => (K_VOLT, x.name.clone()),
+            };
+            let g = if lc.contains("cpu") {
+                G_CPU
+            } else if lc.contains("dimm") || lc.contains("mem") {
+                G_MEM
+            } else if lc.contains("nvme") || lc.contains("ssd") || lc.contains("hdd") {
+                G_DISK
+            } else if lc.contains("nic") || lc.contains("lan") {
+                G_NET
+            } else {
+                G_BOARD
+            };
+            let mut r = rd(kind, s, if kind == K_FAN { G_BOARD } else { g }, k as c_int, &x.name, if name.trim().is_empty() { &x.name } else { &name });
+            match kind {
+                K_TEMP => {
+                    let ml = |v: Option<f32>| v.map(|v| (v * 1000.0) as i64);
+                    (r.warn, r.crit) = temp_limits(r.group, ml(x.unc), ml(x.uc));
+                    // (the CPU's own sensor is the one to watch)
+                    r.minor = g == G_CPU && cpu_t;
+                }
+                K_VOLT => (r.warn, r.crit) = (x.lc.or(x.lnc).unwrap_or(0.0), x.uc.or(x.unc).unwrap_or(0.0)),
+                _ => {}
+            }
+            self.add(s, r);
+        }
+        self.sdr = sdr;
     }
 
     fn read_bats(&mut self, _now: i64) {
@@ -1594,6 +1722,34 @@ impl Sens {
 // ── cpuview --setup-sensors ─────────────────────────────────────────────────
 
 const UDEV_RULE: &str = "/etc/udev/rules.d/70-cpuview-rapl.rules";
+const BMC_RULE: &str = "/etc/udev/rules.d/70-cpuview-ipmi.rules";
+
+/// The `--bmc` step for user `u`: what it does and why, then the commands.
+fn bmc_step(u: &str) -> String {
+    [
+        "let ", u, " read the board's BMC (fans, temperatures, voltages through\n",
+        "# IPMI), now and after every boot. /dev/ipmi0 takes any command, not only\n",
+        "# readings: whoever opens it can also power the machine off or change the\n",
+        "# BMC's users and network. This gives it to ", u, " alone (who can do all\n",
+        "# that with sudo already), not to other users.\n",
+        "printf '%s\\n' '# cpuview --setup-sensors --bmc: let ", u, " read the BMC (IPMI)' \\\n",
+        "  '# remove with: cpuview --setup-sensors --undo' \\\n",
+        "  'SUBSYSTEM==\"ipmi\", KERNEL==\"ipmi[0-9]*\", OWNER=\"", u, "\", MODE=\"0600\"' > ", BMC_RULE,
+        "\nudevadm control --reload\nfor d in /dev/ipmi[0-9]*; do [ -e \"$d\" ] && chown ", u, " \"$d\"; done; true",
+    ]
+    .concat()
+}
+
+/// This user's login name, if it is a plain one (it goes into a shell command and a
+/// udev rule).
+fn user_name() -> Option<String> {
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() {
+        return None;
+    }
+    let n = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }.to_string_lossy().into_owned();
+    (!n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) && !n.starts_with('-')).then_some(n)
+}
 
 /// The RAPL zones' energy_uj files whose readability (by others) is `readable`.
 fn rapl_files(readable: bool) -> String {
@@ -1613,10 +1769,10 @@ fn has_cap(exe: &str) -> bool {
     unsafe { libc::getxattr(pb(&[exe]).b.as_ptr() as *const _, c"security.capability".as_ptr(), std::ptr::null_mut(), 0) > 0 }
 }
 
-/// `cpuview --setup-sensors [--undo] [--per-core] [--dry-run]`: show the shell
-/// commands it would run as root (each step with what it changes and why), ask,
-/// then run exactly those with sudo. Returns the exit code.
-pub fn setup(undo: bool, per_core: bool, dry: bool) -> i32 {
+/// `cpuview --setup-sensors [--undo] [--per-core] [--bmc] [--dry-run]`: show the
+/// shell commands it would run as root (each step with what it changes and why),
+/// ask, then run exactly those with sudo. Returns the exit code.
+pub fn setup(undo: bool, per_core: bool, bmc: bool, dry: bool) -> i32 {
     let exe = std::fs::read_link("/proc/self/exe").map_or("cpuview".into(), |p| p.to_string_lossy().into_owned());
     let mut sh = String::new();
     let mut note = String::new();
@@ -1645,6 +1801,9 @@ pub fn setup(undo: bool, per_core: bool, dry: bool) -> i32 {
         if cap {
             step(&mut sh, &["remove the perfmon capability\nsetcap -r ", &exe]);
         }
+        if exists(&[BMC_RULE]) {
+            step(&mut sh, &["make the BMC's device root-only again\nrm -f ", BMC_RULE, "\nudevadm control --reload\nfor d in /dev/ipmi[0-9]*; do [ -e \"$d\" ] && chown root \"$d\"; done; true"]);
+        }
     } else {
         let mut s = Sens::empty();
         s.detect(crate::term::mono());
@@ -1658,7 +1817,8 @@ pub fn setup(undo: bool, per_core: bool, dry: bool) -> i32 {
                 "else\n  echo 'fans: the ", m, " driver found no fan chip on this board; `sudo sensors-detect` (lm-sensors) can look for the right one'\n",
                 "  rm -f /etc/modules-load.d/cpuview-", m, ".conf\nfi",
             ]),
-            Some((_, 3)) => note += "fans: this board's BMC runs the fans (IPMI), which cpuview can't read; `sudo ipmitool sdr type Fan` lists them\n",
+            Some((_, 3)) if !s.bmc_locked => note += "fans: this board's BMC runs the fans (IPMI) but lists none; `sudo ipmitool sdr type Fan` shows what it has\n",
+            Some((_, 3)) => {}
             Some((m, 1)) => note += &["fans: the ", m, " driver is loaded but shows no fans; `sudo sensors-detect` (lm-sensors) may find the right one\n"].concat(),
             Some(_) => note += "fans: no fan sensors and no known driver for this board; `sudo sensors-detect` (lm-sensors) can look for one\n",
             None if s.vm => note += "this is a virtual machine: fans, temperatures and power belong to the host\n",
@@ -1681,6 +1841,12 @@ pub fn setup(undo: bool, per_core: bool, dry: bool) -> i32 {
             note += "CPU power: this CPU has no RAPL energy counters in /sys/class/powercap\n";
         } else {
             note += "CPU power: the RAPL counters are already readable\n";
+        }
+        let root = unsafe { libc::geteuid() } == 0;
+        match (s.bmc_locked, bmc, user_name()) {
+            (true, true, Some(u)) if !root => step(&mut sh, &[&bmc_step(&u)]),
+            (true, false, _) if !root => note += "fans: this board's BMC runs the fans (IPMI), root-only: cpuview --setup-sensors --bmc lets you read them\n",
+            _ => {}
         }
         if per_core && pmu && !cap {
             step(&mut sh, &[
