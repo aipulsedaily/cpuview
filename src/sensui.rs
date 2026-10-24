@@ -851,6 +851,10 @@ impl App {
                 l.s("no fan sensors: the ").s(m).s(" driver isn't loaded");
                 "run `cpuview --setup-sensors` to load it (asks first)"
             }
+            Some(3) => {
+                l.s("no fan sensors: the board's BMC runs the fans (IPMI)");
+                "`sudo ipmitool sdr type Fan` lists them"
+            }
             Some(1) => {
                 l.s("no fan sensors, although ").s(m).s(" is loaded");
                 "`sudo sensors-detect` (lm-sensors) may find the right driver"

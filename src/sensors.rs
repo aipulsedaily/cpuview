@@ -270,7 +270,8 @@ pub struct Sens {
     pub vm: bool,
     amd: bool,
     /// no fans found: the driver that would likely show them, and whether it is
-    /// available (0), already loaded (1) or unknown (2: run sensors-detect)
+    /// available (0), already loaded (1) or unknown (2: run sensors-detect); or 3: the
+    /// board's BMC runs the fans (IPMI), which no hwmon driver shows
     pub fan_hint: Option<(String, u8)>,
     pub cpu_power: u8,
     /// RAPL exists but is root-only; perf energy counters exist but are denied
@@ -928,11 +929,16 @@ impl Sens {
         self.rapl();
         self.batteries();
         self.finish_names();
-        // no fans: which driver would show them (by the board's maker)
+        // no fans: which driver would show them (by the board's maker), unless a BMC
+        // (IPMI) runs them, as on server boards
         if !self.rd.iter().any(|r| r.kind == K_FAN) && !self.vm && !vendor.is_empty() {
             let key = [&vendor, " ", &dmi("product_version")].concat().to_ascii_lowercase();
             let mut hint = (String::new(), 2);
-            for m in lookup(MODS, &key, "")[0].split(',').filter(|m| !m.is_empty()) {
+            let bmc = exists(&[root, "/sys/class/ipmi/ipmi0"]);
+            if bmc {
+                hint = ("ipmi".to_string(), 3);
+            }
+            for m in lookup(MODS, &key, "")[0].split(',').filter(|m| !bmc && !m.is_empty()) {
                 if exists(&[root, "/sys/module/", m]) {
                     if hint.1 == 2 {
                         hint = (m.to_string(), 1);
@@ -1651,6 +1657,7 @@ pub fn setup(undo: bool, per_core: bool, dry: bool) -> i32 {
                 "else\n  echo 'fans: the ", m, " driver found no fan chip on this board; `sudo sensors-detect` (lm-sensors) can look for the right one'\n",
                 "  rm -f /etc/modules-load.d/cpuview-", m, ".conf\nfi",
             ]),
+            Some((_, 3)) => note += "fans: this board's BMC runs the fans (IPMI), which cpuview can't read; `sudo ipmitool sdr type Fan` lists them\n",
             Some((m, 1)) => note += &["fans: the ", m, " driver is loaded but shows no fans; `sudo sensors-detect` (lm-sensors) may find the right one\n"].concat(),
             Some(_) => note += "fans: no fan sensors and no known driver for this board; `sudo sensors-detect` (lm-sensors) can look for one\n",
             None if s.vm => note += "this is a virtual machine: fans, temperatures and power belong to the host\n",

@@ -475,6 +475,20 @@ fn missing_fan_driver_is_named() {
 }
 
 #[test]
+fn bmc_fans_are_not_a_missing_driver() {
+    // a server board: the BMC runs the fans, so no Super-I/O driver to suggest
+    let fx = Fx::new("bmcfan");
+    fx.dir("/sys/class/dmi/id", &[("board_vendor", "Supermicro"), ("board_name", "X12SCZ-TLN4F")])
+        .dir("/sys/class/hwmon/hwmon0", &[("name", "coretemp"), ("temp1_input", "41000"), ("temp1_label", "Package id 0")])
+        .dir("/sys/class/ipmi/ipmi0", &[("dev", "243:0")])
+        .dir(&format!("/lib/modules/{}/kernel/drivers/hwmon", release()), &[("nct6775.ko.zst", "")]);
+    let s = fx.sens();
+    assert_eq!(s.fan_hint, Some(("ipmi".to_string(), 3)));
+    let t = page(fx.sens(), 128, 45);
+    assert!(t.contains("BMC runs the fans"), "{t}");
+}
+
+#[test]
 fn rapl_counter_wraparound() {
     let r = 65_532_610_987u64;
     assert_eq!(wrap_delta(100, 300, r), 200);
