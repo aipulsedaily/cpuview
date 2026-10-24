@@ -230,16 +230,26 @@ fn process_ns() -> i64 {
 /// The main thread (a real handle: its time is read from wherever cpu_ns is called).
 #[cfg(target_arch = "x86_64")]
 static MAIN: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-/// Cycles spent outside the main thread (helper threads, threads of system DLLs) as
-/// of the last reconciliation, and its time.
+/// Cycles spent outside the main thread (helper threads, threads of system DLLs):
+/// charged so far, found and not charged yet; the main thread's cycles at the last
+/// reconciliation and in the minute before it; its time (0: none yet).
 #[cfg(target_arch = "x86_64")]
 static OTHER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "x86_64")]
-static REC_NS: AtomicI64 = AtomicI64::new(i64::MIN);
+static SPREAD: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static M_REC: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static M_MIN: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_arch = "x86_64")]
+static REC_NS: AtomicI64 = AtomicI64::new(0);
 
 /// Process CPU cycles: the main thread's (0.1 µs to read) plus the rest of the
 /// process as of the last QueryProcessCycleTime, which costs 50–150 µs and so runs
-/// once a minute (what the other threads use is charged then, never lost).
+/// once a minute. What the other threads used is charged on the main thread's work
+/// in the next minute, in proportion to it (at the last minute's rate; what's left
+/// carries over): never lost, and neither in the one wakeup that finds it nor in
+/// the one after a long sleep (the eco planner would take that for a sample's cost).
 #[cfg(target_arch = "x86_64")]
 fn process_cycles() -> u64 {
     unsafe {
@@ -251,14 +261,23 @@ fn process_cycles() -> u64 {
         }
         let mut m = 0u64;
         QueryThreadCycleTime(h, &mut m);
+        let spread = SPREAD.load(Ordering::Relaxed);
+        let ran = m.saturating_sub(M_REC.load(Ordering::Relaxed));
+        let mut part = (spread as u128 * ran as u128 / M_MIN.load(Ordering::Relaxed) as u128).min(spread as u128) as u64;
         let now = qpc_ns();
-        if now - REC_NS.load(Ordering::Relaxed) >= 60_000_000_000 {
-            REC_NS.store(now, Ordering::Relaxed);
+        let rec = REC_NS.load(Ordering::Relaxed);
+        if rec == 0 || now - rec >= 60_000_000_000 {
+            let done = OTHER.load(Ordering::Relaxed) + part;
             let mut p = 0u64;
             QueryProcessCycleTime(GetCurrentProcess(), &mut p);
-            OTHER.fetch_max(p.saturating_sub(m), Ordering::Relaxed);
+            OTHER.store(done, Ordering::Relaxed);
+            SPREAD.store(p.saturating_sub(m).saturating_sub(done), Ordering::Relaxed);
+            M_MIN.store(ran.max(1), Ordering::Relaxed);
+            M_REC.store(m, Ordering::Relaxed);
+            REC_NS.store(now, Ordering::Relaxed);
+            part = 0;
         }
-        m + OTHER.load(Ordering::Relaxed)
+        m + OTHER.load(Ordering::Relaxed) + part
     }
 }
 
