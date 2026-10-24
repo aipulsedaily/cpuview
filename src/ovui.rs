@@ -259,6 +259,10 @@ impl App {
             m.shrink();
             let c = crate::term::cpu_ns() - t0;
             self.ov.spent += c;
+            // (Windows: the first scan reads the full process list, milliseconds once;
+            // the plan is for the later ones)
+            #[cfg(windows)]
+            let c = if m.scanned_full() { 0 } else { c };
             self.ov.mscan = if c > self.ov.mscan { c } else { self.ov.mscan - (self.ov.mscan - c) / 8 };
             true
         } else if now - m.last_top >= live * SEC - SEC / 20 {

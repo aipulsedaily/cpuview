@@ -346,8 +346,8 @@ fn num_of(s: &str) -> Option<u32> {
     v
 }
 
-#[cfg(unix)]
 /// Directory entries (names), "fan2" before "fan10".
+#[cfg(unix)]
 fn list(d: &str) -> Vec<String> {
     let mut v: Vec<String> = match std::fs::read_dir(d) {
         Ok(rd) => rd
@@ -647,8 +647,8 @@ fn temp_ok(v: f32, aux: bool, board: Option<f32>) -> bool {
     !aux || (v >= 10.0 && board.is_none_or(|b| v >= b - 8.0))
 }
 
-#[cfg(unix)]
 /// perf_event_open for a system-wide counter on `cpu`; -errno on failure.
+#[cfg(unix)]
 fn perf_open(typ: u32, config: u64, cpu: i32) -> c_int {
     let mut attr = [0u64; 16];
     attr[0] = typ as u64 | (128u64 << 32);
@@ -670,8 +670,8 @@ fn perf_open(typ: u32, config: u64, cpu: i32) -> c_int {
     }
 }
 
-#[cfg(unix)]
 /// "event=0x02" → 2.
+#[cfg(unix)]
 fn perf_event_cfg(s: &str) -> Option<u64> {
     let v = s.trim().strip_prefix("event=")?;
     if v.contains(',') {
@@ -738,14 +738,14 @@ fn pb(parts: &[&str]) -> Pb {
     p
 }
 
-#[cfg(unix)]
 /// open(2) read-only (`p` NUL-terminated on the stack).
+#[cfg(unix)]
 fn openp(p: &Pb) -> c_int {
     unsafe { libc::open(p.b.as_ptr() as *const _, libc::O_RDONLY | libc::O_CLOEXEC) }
 }
 
-#[cfg(unix)]
 /// A small file's text, trimmed (in `b`).
+#[cfg(unix)]
 fn slurp<'a>(p: &Pb, b: &'a mut [u8; 256]) -> &'a str {
     let fd = openp(p);
     let n = pread(fd, b);
@@ -755,16 +755,16 @@ fn slurp<'a>(p: &Pb, b: &'a mut [u8; 256]) -> &'a str {
     std::str::from_utf8(&b[..n]).unwrap_or("").trim()
 }
 
-#[cfg(unix)]
 /// A small file's text, trimmed.
+#[cfg(unix)]
 #[inline(never)]
 fn rstr(parts: &[&str]) -> String {
     let mut b = [0u8; 256];
     slurp(&pb(parts), &mut b).to_string()
 }
 
-#[cfg(unix)]
 /// A file's leading integer.
+#[cfg(unix)]
 #[inline(never)]
 fn rint(parts: &[&str]) -> Option<i64> {
     let mut b = [0u8; 256];
@@ -783,8 +783,8 @@ fn exists(parts: &[&str]) -> bool {
     unsafe { libc::access(pb(parts).b.as_ptr() as *const _, libc::F_OK) == 0 }
 }
 
-#[cfg(unix)]
 /// Where the BMC's sensor list is cached (walking it takes the BMC a while).
+#[cfg(unix)]
 fn bmc_cache() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
@@ -792,9 +792,9 @@ fn bmc_cache() -> std::path::PathBuf {
     base.join("cpuview").join("bmc-sdr")
 }
 
-#[cfg(unix)]
 /// The network interface a device belongs to (a `net` directory on its way up, short of
 /// /sys/devices/virtual, whose net/ holds every virtual interface: lo, bridges, …).
+#[cfg(unix)]
 fn iface_of(dev: &str, root: &str) -> Option<String> {
     let mut p = dev;
     while p.len() > root.len() + 5 && !p.ends_with("/devices/virtual") {
@@ -806,8 +806,8 @@ fn iface_of(dev: &str, root: &str) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
 /// Kernel release (`uname -r`).
+#[cfg(unix)]
 fn release() -> String {
     unsafe {
         let mut u: libc::utsname = std::mem::zeroed();
@@ -816,9 +816,9 @@ fn release() -> String {
     }
 }
 
-#[cfg(unix)]
 /// Drivers that likely show a board's fans: "vendor (and product) prefix|*|modules"
 /// (`lookup` on the lower-case DMI vendor and product version).
+#[cfg(unix)]
 const MODS: &str = "\
 asus|*|nct6775,asus_ec_sensors,asus_wmi_sensors
 micro-star,msi|*|nct6775,nct6683
@@ -830,14 +830,14 @@ apple|*|applesmc
 hp,hewlett|*|hp_wmi_sensors
 supermicro|*|nct6775";
 
-#[cfg(unix)]
 /// `s` with byte `a` replaced by `b` (both ASCII).
+#[cfg(unix)]
 fn us_dash(s: &str, a: u8, b: u8) -> String {
     s.bytes().map(|c| (if c == a { b } else { c }) as char).collect()
 }
 
-#[cfg(unix)]
 /// Is kernel module `m` installed (no modinfo: the usual places)?
+#[cfg(unix)]
 fn module_file(root: &str, m: &str) -> bool {
     let base = [root, "/lib/modules/", &release(), "/kernel/drivers/"].concat();
     let dash = us_dash(m, b'_', b'-');
@@ -1036,8 +1036,8 @@ impl Sens {
         }
     }
 
-#[cfg(unix)]
     /// One hwmon chip's fans, temperatures, voltages and power readings.
+#[cfg(unix)]
     fn hwmon(&mut self, d: &str, name: &str, asus: bool) {
         let dev = std::fs::canonicalize(pb(&[d, "/device"]).s()).map_or(String::new(), |p| p.to_string_lossy().into_owned());
         let driver = std::fs::read_link(pb(&[d, "/device/driver"]).s())
@@ -1133,9 +1133,9 @@ impl Sens {
         }
     }
 
-#[cfg(unix)]
     /// RAPL energy counters: powercap if readable, else perf (package; per core on
     /// AMD), else note that they exist but are locked.
+#[cfg(unix)]
     fn rapl(&mut self) {
         let root = self.root.clone();
         let pc = [&root, "/sys/class/powercap/"].concat();
@@ -1607,9 +1607,9 @@ impl Sens {
         self.spent += c;
     }
 
-#[cfg(unix)]
     /// The BMC's answers to the last read's requests (waiting up to `wait_ms` for
     /// them), then the next requests.
+#[cfg(unix)]
     fn read_bmc(&mut self, i: usize, wait_ms: i32) {
         use crate::ipmi::reading;
         let Some(b) = self.bmc.as_ref() else { return };
@@ -1652,9 +1652,9 @@ impl Sens {
         }
     }
 
-#[cfg(unix)]
     /// The BMC's sensors: fans, temperatures (by what their names say they
     /// measure) and voltages, with the limits the BMC sets.
+#[cfg(unix)]
     fn add_bmc(&mut self, sdr: Vec<crate::ipmi::Sdr>) {
         use crate::ipmi::{T_FAN, T_TEMP};
         if sdr.is_empty() {
@@ -1810,8 +1810,8 @@ const UDEV_RULE: &str = "/etc/udev/rules.d/70-cpuview-rapl.rules";
 #[cfg(unix)]
 const BMC_RULE: &str = "/etc/udev/rules.d/70-cpuview-ipmi.rules";
 
-#[cfg(unix)]
 /// The `--bmc` step for user `u`: what it does and why, then the commands.
+#[cfg(unix)]
 fn bmc_step(u: &str) -> String {
     [
         "let ", u, " read the board's BMC (fans, temperatures, voltages through\n",

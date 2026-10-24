@@ -279,6 +279,12 @@ impl Mem {
         self.w.eco = eco;
     }
 
+    /// The last process scan read the full list (milliseconds; the others cost a
+    /// fraction of that).
+    pub fn scanned_full(&self) -> bool {
+        self.w.since_full == 0
+    }
+
     /// Volumes with a drive letter on local disks (fixed and removable: network
     /// drives can hang, as on Linux).
     fn read_mounts(&mut self) {
