@@ -6,7 +6,9 @@
 //! none: estimated from the busy CPUs).
 
 use crate::win::{from_wide, wide, NtQuerySystemInformationEx};
-use crate::sys::{isort, Topo};
+use crate::sensors::cpu_temp_label;
+use crate::sys::{isort, Ring, Sensor, Topo};
+use crate::win::lhm;
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
 use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::{CallNtPowerInformation, PowerGetActiveScheme, PowerReadFriendlyName, ProcessorInformation};
@@ -42,6 +44,8 @@ pub struct Cpu {
     nominal: f32,
     /// load average: the time of its last update
     la_t: i64,
+    /// LibreHardwareMonitor's CPU temperatures: when a fresh snapshot was last asked for
+    lhm_t: i64,
     /// active power plan
     plan: windows_sys::core::GUID,
 }
@@ -130,6 +134,33 @@ fn rated_max() -> f32 {
         }
     }
     0.0
+}
+
+/// The CPU's temperatures where LibreHardwareMonitor's web server runs (Windows has
+/// none of its own): the package (Intel), Tctl and the CCDs' (AMD).
+pub fn find_sensors() -> Vec<Sensor> {
+    let mut out = Vec::new();
+    if !lhm::listening() {
+        return out;
+    }
+    let Some(v) = lhm::fetch() else {
+        return out;
+    };
+    for x in &v {
+        if let (true, Some(l)) = (x.typ == "Temperature" && x.hwid.contains("cpu"), cpu_temp_label(&x.text)) {
+            if !out.iter().any(|s: &Sensor| s.label == l) {
+                out.push(Sensor {
+                    label: l,
+                    fd: -1,
+                    val: if x.val.is_finite() { x.val } else { 0.0 },
+                    hist: Ring::new(),
+                    max: 0.0,
+                });
+            }
+        }
+    }
+    lhm::set(v);
+    out
 }
 
 pub fn topo() -> Topo {
@@ -271,6 +302,7 @@ impl Cpu {
             map: Vec::new(),
             nominal: 0.0,
             la_t: 0,
+            lhm_t: 0,
             plan: unsafe { std::mem::zeroed() },
         }
     }
@@ -291,6 +323,7 @@ impl Cpu {
             map: Vec::new(),
             nominal: nominal_mhz(n),
             la_t: 0,
+            lhm_t: 0,
             plan: unsafe { std::mem::zeroed() },
         };
         if t.has_freq {
@@ -412,6 +445,24 @@ impl Cpu {
             }
         }
         self.la_t = now;
+    }
+
+    /// The CPU temperatures from LibreHardwareMonitor's last snapshot; a fresh one is
+    /// asked for every 2 s (`all`: smooth) or 30 s (its parse costs a few hundred µs).
+    pub fn lhm_temps(&mut self, temps: &mut [Sensor], all: bool) {
+        let now = crate::term::mono();
+        if now - self.lhm_t >= if all { 2 } else { 30 } * 1_000_000_000 {
+            self.lhm_t = now;
+            lhm::request();
+        }
+        lhm::with(|v| {
+            for s in temps.iter_mut() {
+                let x = v.iter().find(|x| x.typ == "Temperature" && x.hwid.contains("cpu") && cpu_temp_label(&x.text).as_deref() == Some(s.label.as_str()));
+                if let Some(x) = x.filter(|x| x.val.is_finite()) {
+                    s.val = x.val;
+                }
+            }
+        });
     }
 
     /// The active power plan's name (read again only when the plan changes).

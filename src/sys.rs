@@ -519,10 +519,10 @@ pub struct Sampler {
     w: win::Cpu,
 }
 
-/// (Windows has no CPU temperature interface: see sensors.rs)
+/// (Windows has no CPU temperature interface: LibreHardwareMonitor's, if it runs)
 #[cfg(windows)]
 fn find_sensors() -> Vec<Sensor> {
-    Vec::new()
+    win::find_sensors()
 }
 
 #[cfg(unix)]
@@ -943,8 +943,17 @@ impl Sampler {
         }
     }
 
+    /// Temperatures (Windows: LibreHardwareMonitor's snapshot, see win::Cpu::lhm_temps).
+    #[cfg(windows)]
+    pub fn read_temps(&mut self, all: bool) {
+        if !self.temps.is_empty() {
+            self.w.lhm_temps(&mut self.temps, all);
+        }
+    }
+
     /// Temperatures: k10temp reads go over SMN and cost ~10 µs each on a cold core,
     /// so the caller reads one sensor at a time (round robin). `all` reads every one.
+    #[cfg(unix)]
     pub fn read_temps(&mut self, all: bool) {
         let mut buf = [0u8; 16];
         let n = self.temps.len();

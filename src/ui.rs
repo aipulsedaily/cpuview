@@ -2281,7 +2281,14 @@ impl App {
                 y,
                 maxx,
                 bg,
-                &[("no CPU temperature sensor found", th.dim)],
+                &[(
+                    if cfg!(windows) {
+                        "CPU temperature: Windows has none (LibreHardwareMonitor can)"
+                    } else {
+                        "no CPU temperature sensor found"
+                    },
+                    th.dim,
+                )],
             );
             y += 1;
         }

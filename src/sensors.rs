@@ -20,7 +20,7 @@ use std::os::raw::c_int;
 #[path = "win/sensors.rs"]
 mod win;
 #[cfg(windows)]
-pub use win::setup;
+pub use win::{cpu_temp_label, setup};
 
 pub const SEC: i64 = 1_000_000_000;
 

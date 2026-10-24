@@ -855,6 +855,10 @@ impl App {
                 l.s("no fan sensors: the board's BMC runs the fans (IPMI), root-only");
                 "run `cpuview --setup-sensors --bmc` to read them (asks first)"
             }
+            Some(4) => {
+                l.s("no fans, CPU temperature or CPU power: Windows has no interface for them");
+                "run LibreHardwareMonitor with its web server on (cpuview --setup-sensors says how)"
+            }
             Some(3) => {
                 l.s("no fan sensors: the board's BMC runs the fans (IPMI) and lists none");
                 "`sudo ipmitool sdr type Fan` shows what it has"
@@ -983,7 +987,13 @@ impl App {
         }
         if z.cpu_power == P_NONE && others.is_empty() && z.bats.is_empty() {
             l.row(2, th.dim, 0, -1.0, 0);
-            l.s(if z.vm { "no power meters (a virtual machine)" } else { "no power meters on this machine" });
+            l.s(if z.vm {
+                "no power meters (a virtual machine)"
+            } else if cfg!(windows) {
+                "no power meters: Windows has none (LibreHardwareMonitor can)"
+            } else {
+                "no power meters on this machine"
+            });
         }
         let end = ir.y + ih - if chart { gh + 1 } else { 0 };
         let all = zm(&mut self.zcache, Z_PBODY, mixk(&[iw as u64, ih as u64, l.rows.len() as u64])) || full;
@@ -1193,7 +1203,7 @@ impl App {
         l.row(2, th.mid, th.dim, -1.0, 0);
         match z.cpu_power {
             P_OK => {
-                l.s("CPU power: RAPL energy counters");
+                l.s(if cfg!(windows) { "CPU power: LibreHardwareMonitor" } else { "CPU power: RAPL energy counters" });
                 if !z.rd.iter().any(|r| r.role == R_CORE) && z.has_core_pmu() {
                     l.f().s(" · per core: cpuview --setup-sensors --per-core");
                 }
@@ -1207,7 +1217,11 @@ impl App {
                 l.s("  to allow it: ").f().s("cpuview --setup-sensors");
             }
             _ => {
-                l.s("CPU power: no energy counters on this CPU");
+                l.s(if cfg!(windows) {
+                    "CPU power: not readable on Windows without LibreHardwareMonitor"
+                } else {
+                    "CPU power: no energy counters on this CPU"
+                });
             }
         }
         if z.fan_hint.is_some() || (z.vm && !z.rd.iter().any(|r| r.kind == K_FAN)) {

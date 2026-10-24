@@ -1,29 +1,460 @@
-//! Sensors on Windows (the Windows half of sensors.rs). First step: nothing found yet.
+//! Sensors on Windows (the Windows half of sensors.rs). Windows has no user-mode
+//! interface for CPU temperatures, fans, voltages or CPU power, and cpuview loads no
+//! kernel driver; what it reads:
+//! - the battery and mains (GetSystemPowerStatus; watts from the battery's IOCTLs),
+//! - the firmware's ACPI thermal zones (PDH "Thermal Zone Information": often a fixed
+//!   or board value, so never called the CPU's),
+//! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence),
+//! - LibreHardwareMonitor's readings when it runs with its web server (see win/lhm.rs):
+//!   CPU, GPU and board temperatures, fans, voltages, CPU package power.
 
 use super::*;
+use crate::win::{close, fd2h, from_pwstr, h2fd, lhm, reg_str, wide};
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::Ioctl::*;
+use windows_sys::Win32::System::Performance::*;
+use windows_sys::Win32::System::Power::*;
+use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+use windows_sys::Win32::System::IO::DeviceIoControl;
 
-pub struct State;
+/// Windows sources (beyond S_BAT): ACPI zones, a drive, LibreHardwareMonitor
+pub(super) const S_ACPI: u8 = 6;
+pub(super) const S_DRIVE: u8 = 7;
+pub(super) const S_LHM: u8 = 8;
+
+/// What the Windows sources keep: the thermal zones' query, LHM sensor ids by
+/// reading, the snapshot last copied.
+pub struct State {
+    zq: PDH_HQUERY,
+    zc: PDH_HCOUNTER,
+    zarr: Vec<u64>,
+    /// tenths of a kelvin ("High Precision Temperature") or kelvin
+    ztenths: bool,
+    lhm_id: Vec<(usize, String)>,
+    lhm_gen: u32,
+}
 
 impl State {
     pub fn new() -> State {
-        State
+        State {
+            zq: std::ptr::null_mut(),
+            zc: std::ptr::null_mut(),
+            zarr: Vec::new(),
+            ztenths: false,
+            lhm_id: Vec::new(),
+            lhm_gen: 0,
+        }
+    }
+}
+
+fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
+    let mut got = 0u32;
+    unsafe {
+        DeviceIoControl(
+            h,
+            code,
+            if inp.is_empty() { std::ptr::null() } else { inp.as_ptr() as *const _ },
+            inp.len() as u32,
+            out as *mut T as *mut _,
+            std::mem::size_of::<T>() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+/// A drive's temperature (°C), as mem.rs's helper thread reads it.
+fn drive_temp(h: HANDLE) -> Option<f32> {
+    let mut q = [0u8; 12];
+    q[..4].copy_from_slice(&(StorageDeviceTemperatureProperty as u32).to_le_bytes());
+    let mut d: STORAGE_TEMPERATURE_DATA_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    if !ioctl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, &mut d) || d.InfoCount == 0 {
+        return None;
+    }
+    Some(d.TemperatureInfo[0].Temperature as f32)
+}
+
+/// LibreHardwareMonitor's hardware id → group.
+fn lhm_group(hwid: &str) -> u8 {
+    let h = hwid.trim_start_matches('/');
+    let p = |s: &str| h.starts_with(s);
+    if p("intelcpu") || p("amdcpu") || p("cpu") {
+        G_CPU
+    } else if p("gpu") {
+        G_GPU
+    } else if p("lpc") || p("mainboard") || p("motherboard") || p("ec") {
+        G_BOARD
+    } else if p("nvme") || p("hdd") || p("ssd") || p("storage") || p("ata") || p("scsi") {
+        G_DISK
+    } else if p("ram") || p("memory") || p("dimm") {
+        G_MEM
+    } else if p("nic") {
+        G_NET
+    } else {
+        G_OTHER
+    }
+}
+
+/// Plain names for LibreHardwareMonitor's CPU temperatures on the CPU page: the
+/// package (Intel), Tctl and the CCDs' (AMD); the labels sys.rs's domains look for.
+pub fn cpu_temp_label(text: &str) -> Option<String> {
+    if text == "CPU Package" {
+        Some("Pkg".into())
+    } else if text.starts_with("Core (Tctl") {
+        Some("Tctl".into())
+    } else if let Some(n) = text.strip_prefix("CCD").and_then(|r| r.split([' ', '(']).next()) {
+        n.parse::<u32>().ok().map(|n| ["Tccd", &n2s(n)].concat())
+    } else {
+        None
     }
 }
 
 impl Sens {
-    pub fn detect(&mut self, _now: i64) {
+    /// Find everything, once, and read it.
+    pub fn detect(&mut self, now: i64) {
         self.detected = true;
+        let bios = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+        let r = |v: &str| reg_str(HKEY_LOCAL_MACHINE, bios, v).unwrap_or_default();
+        let (bv, bn, sv, pn) = (r("BaseBoardManufacturer"), r("BaseBoardProduct"), r("SystemManufacturer"), r("SystemProductName"));
+        let vendor = short_vendor(if bv.is_empty() { sv.clone() } else { bv });
+        let model = if !bn.is_empty() && !bn.starts_with("To be filled") { &bn } else { &pn };
+        self.board = if model.is_empty() { String::new() } else { [&vendor, " ", model].concat() };
+        self.vm = is_vm(&[&sv, " ", &pn].concat().to_ascii_lowercase());
+        self.zones();
+        self.drives();
+        self.lhm();
+        self.batteries();
+        self.finish_names();
+        self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
+        if !self.rd.iter().any(|r| r.kind == K_FAN) && !self.vm {
+            self.fan_hint = Some(("LibreHardwareMonitor".into(), 4));
+        }
+        for i in 0..self.srcs.len() {
+            self.read_src(i, now);
+        }
     }
 
-    pub(super) fn read_bats(&mut self, _now: i64) {}
+    /// The firmware's thermal zones (one PDH query for all of them).
+    fn zones(&mut self) {
+        let w = &mut self.w;
+        unsafe {
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut w.zq) != 0 {
+                return;
+            }
+            for (path, tenths) in [("\\Thermal Zone Information(*)\\High Precision Temperature", true), ("\\Thermal Zone Information(*)\\Temperature", false)] {
+                if PdhAddEnglishCounterW(w.zq, wide(path).as_ptr(), 0, &mut w.zc) == 0 {
+                    w.ztenths = tenths;
+                    break;
+                }
+                w.zc = std::ptr::null_mut();
+            }
+            if w.zc.is_null() || PdhCollectQueryData(w.zq) != 0 {
+                PdhCloseQuery(w.zq);
+                w.zq = std::ptr::null_mut();
+                return;
+            }
+        }
+        let mut names = Vec::new();
+        self.zone_values(&mut |n, _| names.push(n.to_string()));
+        if names.is_empty() {
+            return;
+        }
+        let (g, what, class) = chip_info("acpitz");
+        let s = self.src("acpitz", "ACPI", what, "", S_ACPI, class, g);
+        for (k, n) in names.iter().enumerate() {
+            // ("\_TZ.TZ00" → "TZ00")
+            let raw = n.rsplit('.').next().unwrap_or(n);
+            let (name, tg, fl) = temp_name("acpitz", "", k as u32 + 1);
+            let mut r = rd(K_TEMP, s, tg, k as c_int, raw, if names.len() == 1 { "firmware (ACPI) zone" } else { &name });
+            r.minor = fl & F_MINOR != 0 && names.len() > 1;
+            (r.warn, r.crit) = temp_limits(tg, None, None);
+            self.add(s, r);
+        }
+    }
 
-    pub(super) fn read_win(&mut self, _i: usize) {}
+    /// Each zone's instance name and °C (one collection).
+    fn zone_values(&mut self, f: &mut dyn FnMut(&str, f32)) {
+        let w = &mut self.w;
+        if w.zq.is_null() || unsafe { PdhCollectQueryData(w.zq) } != 0 {
+            return;
+        }
+        let (mut size, mut n) = ((w.zarr.len() * 8) as u32, 0u32);
+        let mut r = unsafe { PdhGetFormattedCounterArrayW(w.zc, PDH_FMT_DOUBLE, &mut size, &mut n, w.zarr.as_mut_ptr() as *mut _) };
+        if r == PDH_MORE_DATA {
+            w.zarr = vec![0u64; (size as usize).div_ceil(8) + 16];
+            size = (w.zarr.len() * 8) as u32;
+            r = unsafe { PdhGetFormattedCounterArrayW(w.zc, PDH_FMT_DOUBLE, &mut size, &mut n, w.zarr.as_mut_ptr() as *mut _) };
+        }
+        if r != 0 {
+            return;
+        }
+        let it = unsafe { std::slice::from_raw_parts(w.zarr.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, n as usize) };
+        for x in it {
+            let k = unsafe { x.FmtValue.Anonymous.doubleValue } as f32;
+            let c = if w.ztenths { k / 10.0 } else { k } - 273.15;
+            f(&unsafe { from_pwstr(x.szName) }, if x.FmtValue.CStatus == 0 { c } else { f32::NAN });
+        }
+    }
 
+    /// NVMe drives that report a temperature: one source each (read slowly).
+    fn drives(&mut self) {
+        let (g, what, class) = chip_info("nvme");
+        let mut miss = 0;
+        for i in 0..64 {
+            let p = wide(&["\\\\.\\PhysicalDrive", &n2s(i)].concat());
+            let h = unsafe { CreateFileW(p.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+            if h == INVALID_HANDLE_VALUE {
+                miss += 1;
+                if miss > 8 {
+                    break;
+                }
+                continue;
+            }
+            miss = 0;
+            if drive_temp(h).is_none() {
+                close(h);
+                continue;
+            }
+            let dev = ["disk", &n2s(i)].concat();
+            let s = self.src("nvme", "stornvme", what, &dev, S_DRIVE, class, g);
+            let (name, tg, _) = temp_name("nvme", "Composite", 1);
+            let mut r = rd(K_TEMP, s, tg, h2fd(h), "Composite", &name);
+            (r.warn, r.crit) = temp_limits(tg, None, None);
+            self.add(s, r);
+        }
+    }
+
+    /// LibreHardwareMonitor's sensors, if its web server answers: its temperatures,
+    /// fans, voltages and power readings, grouped by the hardware they belong to.
+    fn lhm(&mut self) {
+        if !lhm::listening() {
+            return;
+        }
+        let Some(v) = lhm::fetch() else { return };
+        let mut s = usize::MAX;
+        let mut gpu = false;
+        for (k, x) in v.iter().enumerate() {
+            let kind = match x.typ.as_str() {
+                "Temperature" => K_TEMP,
+                "Fan" => K_FAN,
+                "Voltage" => K_VOLT,
+                "Power" => K_POWER,
+                _ => continue,
+            };
+            // (TjMax distances repeat the temperatures; the cores' are too many)
+            if x.text.starts_with("Distance to TjMax") {
+                continue;
+            }
+            if s == usize::MAX {
+                s = self.src("LibreHardwareMonitor", "LHM", "LibreHardwareMonitor (web server)", "", S_LHM, 1, G_BOARD);
+            }
+            let g = lhm_group(&x.hwid);
+            let generic = matches!(x.text.as_str(), "Temperature" | "Composite Temperature" | "Power" | "Fan" | "Total");
+            let name = if generic || g == G_GPU && !x.text.starts_with("GPU") { [&x.hw, " ", &x.text].concat() } else { x.text.clone() };
+            let mut r = rd(kind, s, g, k as c_int, &x.id, &name);
+            match kind {
+                K_TEMP => {
+                    (r.warn, r.crit) = temp_limits(g, None, None);
+                    r.minor = g == G_CPU && (x.text.starts_with("CPU Core #") || x.text.starts_with("Core #") || x.text.starts_with("P-Core #") || x.text.starts_with("E-Core #"));
+                }
+                K_FAN => r.group = G_BOARD,
+                K_POWER => {
+                    r.role = match (g, x.text.as_str()) {
+                        (G_CPU, "CPU Package" | "Package") => R_PKG,
+                        (G_CPU, "CPU Cores" | "Cores") => R_CORES,
+                        (G_CPU, "CPU Memory") => R_DRAM,
+                        (G_CPU, t) if t.contains("Core #") => R_CORE,
+                        (G_GPU, t) if !gpu && (t.contains("Package") || t.contains("Power") || t.contains("Total")) => {
+                            gpu = true;
+                            R_GPU
+                        }
+                        _ => R_OTHER,
+                    };
+                    r.minor = r.role == R_CORE;
+                }
+                _ => {}
+            }
+            self.w.lhm_id.push((self.rd.len(), x.id.clone()));
+            self.add(s, r);
+        }
+        lhm::set(v);
+    }
+
+    /// The battery (GetSystemPowerStatus) and, where its driver answers, its watts.
+    fn batteries(&mut self) {
+        let mut ps: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+        if unsafe { GetSystemPowerStatus(&mut ps) } == 0 || ps.BatteryFlag & 128 != 0 || ps.BatteryFlag == 255 {
+            return;
+        }
+        let src = self.src("battery", "battery", "battery & charger", "", S_BAT, C_BAT, G_OTHER);
+        let mut r = rd(K_POWER, src, G_OTHER, -1, "BAT0", "battery");
+        r.role = R_BAT;
+        self.add(src, r);
+        let (h, tag) = battery_device().unwrap_or((INVALID_HANDLE_VALUE, 0));
+        self.bats.push(Bat {
+            name: "BAT0".into(),
+            fds: [h2fd(h), tag as c_int, -1, -1, -1, -1, -1],
+            charge: false,
+            pct: -1.0,
+            w: 0.0,
+            st: 0,
+            left: 0.0,
+            rd: self.rd.len() - 1,
+        });
+    }
+
+    pub(super) fn read_bats(&mut self, _now: i64) {
+        let mut ps: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+        if unsafe { GetSystemPowerStatus(&mut ps) } == 0 {
+            return;
+        }
+        self.ac_on = match ps.ACLineStatus {
+            0 => 0,
+            1 => 1,
+            _ => -1,
+        };
+        for b in &mut self.bats {
+            b.pct = if ps.BatteryLifePercent <= 100 { ps.BatteryLifePercent as f32 } else { -1.0 };
+            b.st = if ps.BatteryFlag & 8 != 0 {
+                1
+            } else if ps.ACLineStatus == 0 {
+                2
+            } else if b.pct >= 99.0 {
+                3
+            } else {
+                4
+            };
+            b.left = if b.st == 2 && ps.BatteryLifeTime != u32::MAX { ps.BatteryLifeTime as f32 } else { 0.0 };
+            // the rate (mW, negative while discharging) from the battery's driver
+            let mut ws: BATTERY_WAIT_STATUS = unsafe { std::mem::zeroed() };
+            ws.BatteryTag = b.fds[1] as u32;
+            let mut st: BATTERY_STATUS = unsafe { std::mem::zeroed() };
+            let inp = unsafe { std::slice::from_raw_parts(&ws as *const _ as *const u8, std::mem::size_of_val(&ws)) };
+            b.w = if b.fds[0] >= 0 && ioctl(fd2h(b.fds[0]), IOCTL_BATTERY_QUERY_STATUS, inp, &mut st) && st.Rate != i32::MIN {
+                st.Rate.unsigned_abs() as f32 / 1000.0
+            } else {
+                0.0
+            };
+        }
+        for k in 0..self.bats.len() {
+            let (i, w) = (self.bats[k].rd, self.bats[k].w);
+            self.rd[i].val = w;
+            self.rd[i].ok = self.bats[k].pct >= 0.0;
+        }
+    }
+
+    /// Read a Windows source (ACPI zones, a drive, LibreHardwareMonitor's snapshot).
+    pub(super) fn read_win(&mut self, i: usize) {
+        match self.srcs[i].kind {
+            S_ACPI => {
+                let mut v = Vec::new();
+                self.zone_values(&mut |_, c| v.push(c));
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
+                    let c = v.get(r.fd as usize).copied().unwrap_or(f32::NAN);
+                    r.ok = temp_ok(c, false, None);
+                    r.val = if r.ok { c } else { 0.0 };
+                }
+            }
+            S_DRIVE => {
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
+                    let c = drive_temp(fd2h(r.fd));
+                    r.ok = c.is_some_and(|c| temp_ok(c, false, None));
+                    r.val = c.unwrap_or(0.0);
+                }
+            }
+            S_LHM => {
+                // the helper's last snapshot, and a fresh one asked for (its cost: the
+                // helper's last fetch)
+                let g = lhm::gen();
+                if g != self.w.lhm_gen {
+                    self.w.lhm_gen = g;
+                    self.srcs[i].cost = self.srcs[i].cost.max(lhm::COST.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                lhm::request();
+                let (ids, rd) = (&self.w.lhm_id, &mut self.rd);
+                lhm::with(|v| {
+                    for (k, id) in ids {
+                        let r = &mut rd[*k];
+                        let x = v.get(r.fd as usize).filter(|x| x.id == *id).or_else(|| v.iter().find(|x| x.id == *id));
+                        let val = x.map_or(f32::NAN, |x| x.val);
+                        r.ok = match r.kind {
+                            K_TEMP => temp_ok(val, false, None),
+                            K_FAN => (0.0..30000.0).contains(&val),
+                            _ => val.is_finite(),
+                        };
+                        r.val = if r.ok { val } else { 0.0 };
+                        if r.ok && (r.kind != K_FAN || r.val > 0.0) {
+                            r.seen = true;
+                            r.max = r.max.max(r.val);
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// (no BMC on Windows here)
     pub(super) fn read_bmc(&mut self, _i: usize, _wait_ms: i32) {}
 }
 
-/// `cpuview --setup-sensors` on Windows: nothing to set up.
+/// The first battery's device and tag (for its rate in watts).
+fn battery_device() -> Option<(HANDLE, u32)> {
+    unsafe {
+        let set = SetupDiGetClassDevsW(&GUID_DEVCLASS_BATTERY, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if set as isize == -1 {
+            return None;
+        }
+        let mut did: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
+        did.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+        let mut out = None;
+        if SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &GUID_DEVCLASS_BATTERY, 0, &mut did) != 0 {
+            let mut b = [0u64; 128];
+            let d = b.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            (*d).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            if SetupDiGetDeviceInterfaceDetailW(set, &did, d, 1024, std::ptr::null_mut(), std::ptr::null_mut()) != 0 {
+                let path = (*d).DevicePath.as_ptr();
+                let h = CreateFileW(path, FILE_GENERIC_READ | FILE_GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut());
+                if h != INVALID_HANDLE_VALUE {
+                    let mut tag = 0u32;
+                    let wait = 0u32.to_le_bytes();
+                    if ioctl(h, IOCTL_BATTERY_QUERY_TAG, &wait, &mut tag) && tag != 0 {
+                        out = Some((h, tag));
+                    } else {
+                        close(h);
+                    }
+                }
+            }
+        }
+        SetupDiDestroyDeviceInfoList(set);
+        out
+    }
+}
+
+/// `cpuview --setup-sensors` on Windows: nothing to set up, only what to run.
 pub fn setup(_undo: bool, _per_core: bool, _bmc: bool, _dry: bool) -> i32 {
-    println!("cpuview: --setup-sensors has nothing to set up on Windows");
+    println!(
+        "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
+disks, network, processes, the battery, NVMe drive temperatures and the firmware's
+ACPI thermal zones. Windows has no interface for CPU temperatures, fans, voltages
+or CPU power without a kernel driver, and cpuview installs none.
+
+To see them, run LibreHardwareMonitor (https://github.com/LibreHardwareMonitor/
+LibreHardwareMonitor, free) and turn on Options → Remote Web Server (port 8085;
+it listens on your network too: allow it in the firewall only for this computer).
+cpuview then reads its sensors from http://localhost:8085/data.json, on the
+Sensors & Power page and the CPU page (set CPUVIEW_LHM=host:port for another port).
+Nothing needs administrator rights."
+    );
+    if lhm::listening() {
+        match lhm::fetch() {
+            Some(v) => println!("\nLibreHardwareMonitor answers: {} readings.", v.len()),
+            None => println!("\nSomething listens on its port, but data.json didn't come back."),
+        }
+    } else {
+        println!("\nLibreHardwareMonitor's web server isn't running now.");
+    }
     0
 }
