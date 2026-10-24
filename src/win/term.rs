@@ -4,14 +4,19 @@
 //! terminal would send (keys, SGR mouse), resizes into WINCH.
 
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+#[cfg(target_arch = "x86_64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, Ordering};
+#[cfg(target_arch = "x86_64")]
+use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::Console::*;
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimePreciseAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+#[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::WindowsProgramming::{QueryProcessCycleTime, QueryThreadCycleTime};
 
 pub static WINCH: AtomicBool = AtomicBool::new(false);
@@ -205,25 +210,37 @@ pub fn now_ns(clock: c_int) -> i64 {
             (t - 116_444_736_000_000_000) * 100
         },
         CLOCK_BOOTTIME => unsafe { GetTickCount64() as i64 * 1_000_000 },
-        CLOCK_THREAD_CPUTIME_ID => {
-            let mut c = 0u64;
-            unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
-            cycles_ns(c, false)
-        }
-        _ => cycles_ns(process_cycles(), true),
+        CLOCK_THREAD_CPUTIME_ID => thread_ns(),
+        _ => process_ns(),
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn thread_ns() -> i64 {
+    let mut c = 0u64;
+    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+    cycles_ns(c)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn process_ns() -> i64 {
+    cycles_ns(process_cycles())
+}
+
 /// The main thread (a real handle: its time is read from wherever cpu_ns is called).
+#[cfg(target_arch = "x86_64")]
 static MAIN: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// Cycles spent outside the main thread (helper threads, threads of system DLLs) as
 /// of the last reconciliation, and its time.
+#[cfg(target_arch = "x86_64")]
 static OTHER: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
 static REC_NS: AtomicI64 = AtomicI64::new(i64::MIN);
 
 /// Process CPU cycles: the main thread's (0.1 µs to read) plus the rest of the
 /// process as of the last QueryProcessCycleTime, which costs 50–150 µs and so runs
 /// once a minute (what the other threads use is charged then, never lost).
+#[cfg(target_arch = "x86_64")]
 fn process_cycles() -> u64 {
     unsafe {
         let mut h = MAIN.load(Ordering::Relaxed);
@@ -249,13 +266,16 @@ fn process_cycles() -> u64 {
 /// passed; 3 GHz for the first 20 ms). Process and thread times count TSC cycles
 /// exactly (GetProcessTimes only moves on the 15.6 ms clock tick, too coarse for
 /// wakeups of ~50 µs).
+#[cfg(target_arch = "x86_64")]
 static TSC0: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
 static NS0: AtomicI64 = AtomicI64::new(0);
 /// ns per 2^32 cycles, once measured
+#[cfg(target_arch = "x86_64")]
 static RATIO: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "x86_64")]
-fn cycles_ns(c: u64, _process: bool) -> i64 {
+fn cycles_ns(c: u64) -> i64 {
     let r = RATIO.load(Ordering::Relaxed);
     let r = if r != 0 {
         r
@@ -281,21 +301,43 @@ fn cycles_ns(c: u64, _process: bool) -> i64 {
     ((c as u128 * r as u128) >> 32) as i64
 }
 
+/// Other CPUs (ARM64): the cycle counts' rate isn't known here, and GetProcessTimes
+/// moves in 15.6 ms ticks. The main thread's time awake (from a wakeup to the next
+/// wait: a short wakeup's CPU time) stands in for the process's CPU time, wall time
+/// for a thread's.
 #[cfg(not(target_arch = "x86_64"))]
-fn cycles_ns(_c: u64, process: bool) -> i64 {
-    unsafe {
-        let mut t: [FILETIME; 4] = std::mem::zeroed();
-        let ok = if process {
-            GetProcessTimes(GetCurrentProcess(), &mut t[0], &mut t[1], &mut t[2], &mut t[3])
-        } else {
-            GetThreadTimes(GetCurrentThread(), &mut t[0], &mut t[1], &mut t[2], &mut t[3])
-        };
-        if ok == 0 {
-            return 0;
-        }
-        let v = |f: &FILETIME| (f.dwHighDateTime as i64) << 32 | f.dwLowDateTime as i64;
-        (v(&t[2]) + v(&t[3])) * 100
+static AWAKE: AtomicI64 = AtomicI64::new(0);
+#[cfg(not(target_arch = "x86_64"))]
+static WOKE: AtomicI64 = AtomicI64::new(0);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn thread_ns() -> i64 {
+    qpc_ns()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn process_ns() -> i64 {
+    let now = qpc_ns();
+    if WOKE.load(Ordering::Relaxed) == 0 {
+        WOKE.store(now, Ordering::Relaxed);
     }
+    AWAKE.load(Ordering::Relaxed) + now - WOKE.load(Ordering::Relaxed)
+}
+
+/// Going to sleep in `wait` (`true`) or waking up: the time awake, see process_ns.
+fn sleeping(on: bool) {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let now = qpc_ns();
+        if on {
+            let w = WOKE.load(Ordering::Relaxed);
+            if w != 0 {
+                AWAKE.fetch_add(now - w, Ordering::Relaxed);
+            }
+        }
+        WOKE.store(now, Ordering::Relaxed);
+    }
+    let _ = on;
 }
 
 pub fn mono() -> i64 {
@@ -441,6 +483,13 @@ fn pending() -> bool {
 /// Wait for input on `fd` until `timeout_ns` (or a resize / quit). Returns true if
 /// there are bytes to `read`.
 pub fn wait(fd: c_int, timeout_ns: i64, _mask: &()) -> bool {
+    sleeping(true);
+    let r = wait_for(fd, timeout_ns);
+    sleeping(false);
+    r
+}
+
+fn wait_for(fd: c_int, timeout_ns: i64) -> bool {
     let h = handle(fd);
     let end = mono() + timeout_ns.max(0);
     let (timer, quit) = (TIMER.load(Ordering::Relaxed), QUIT_EV.load(Ordering::Relaxed));
