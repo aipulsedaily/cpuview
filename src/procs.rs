@@ -1187,6 +1187,8 @@ impl Procs {
 impl Procs {
     /// Forget everything (leaving the page): the next scan starts afresh.
     pub fn reset(&mut self) {
+        #[cfg(windows)]
+        self.w.clear();
         for t in self.tr.iter_mut() {
             t.close();
         }

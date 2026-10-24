@@ -458,10 +458,12 @@ impl App {
         let Some(d) = self.pv.d.as_mut() else {
             return;
         };
-        // (Windows: no /proc/loadavg; the CPU sampler's estimate)
+        // (Windows: no /proc/loadavg, the CPU sampler's estimate; no full process
+        // lists in eco after the first, see win/procs.rs)
         #[cfg(windows)]
         {
             d.load = self.s.loadavg;
+            d.set_eco(eco);
         }
         let scan_gap = if eco {
             // (eco: a minute apart or more, so scans take at most ~17 µs/s)

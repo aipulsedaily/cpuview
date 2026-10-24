@@ -30,6 +30,8 @@ pub struct State {
     /// the last full list, and how many scans ago that was
     denied: Vec<(u32, u64, u64)>,
     since_full: u32,
+    /// eco: no full list after the first (it costs milliseconds on a busy desktop)
+    eco: bool,
     /// logical drives at the last volume listing
     drives: u32,
 }
@@ -41,6 +43,7 @@ impl State {
             open: Vec::new(),
             denied: Vec::new(),
             since_full: u32::MAX,
+            eco: false,
             drives: 0,
         }
     }
@@ -271,6 +274,11 @@ impl Mem {
         m
     }
 
+    /// The speed is eco: no full process list after the first.
+    pub fn set_eco(&mut self, eco: bool) {
+        self.w.eco = eco;
+    }
+
     /// Volumes with a drive letter on local disks (fixed and removable: network
     /// drives can hang, as on Linux).
     fn read_mounts(&mut self) {
@@ -365,11 +373,11 @@ impl Mem {
     /// Full scan: every process from the basic list, its memory through a handle kept
     /// open (opened once per process); the processes that can't be opened (other
     /// users' services when not elevated) from the full list, read again every
-    /// tenth scan (it costs milliseconds on a busy desktop). Then as on Linux: grouped
-    /// by program, the `NPROC` biggest followed live.
+    /// tenth scan, not in eco (it costs milliseconds on a busy desktop). Then as on
+    /// Linux: grouped by program, the `NPROC` biggest followed live.
     pub fn scan_procs(&mut self) {
         self.w.since_full = self.w.since_full.saturating_add(1);
-        let full = self.w.since_full >= 10 || self.w.list.no_basic;
+        let full = (self.w.since_full >= 10 && (!self.w.eco || !self.proc_ok)) || self.w.list.no_basic;
         if !self.w.list.read(full) {
             return;
         }

@@ -1,10 +1,14 @@
 //! Processes on Windows (the Windows half of procs.rs). A full scan is one read of the
 //! system's process list (CPU times, working set, I/O, priority and every thread's
-//! state of every process: ~5 ms with 4 000 threads, 16 ms with 15 000), so it is
-//! spaced by its cost as on Linux; tracked processes keep a process handle open
-//! (~2–5 µs to read their times and memory). Names and command lines are read once
-//! per process, users from its token (both only where Windows lets this user open the
-//! process: other users' services show their name and numbers only).
+//! state of every process: ~5 ms with 4 000 threads, 16 ms with 15 000): when the page
+//! is entered, then (not in eco: no wakeup there may cost milliseconds) every
+//! FULL_EVERY scans. The scans in between read the basic list (pids and names,
+//! ~0.1–0.4 ms) for new and exited processes; every process this user may open keeps a
+//! handle, and between scans a few dozen of them have their times and memory read
+//! each sample (~2–5 µs each), round robin, so the order and totals stay current at a
+//! bounded cost per sample. Names and command lines are read once per process, users
+//! from its token (both only where Windows lets this user open the process: other
+//! users' services show their name and numbers from the full scans only).
 //!
 //! Units as on Linux: `start` and `ticks` count `hz` ticks (100 ns here), `start`
 //! from boot.
@@ -23,6 +27,10 @@ windows_link::link!("ntdll.dll" "system" fn NtResumeProcess(h: HANDLE) -> i32);
 windows_link::link!("kernel32.dll" "system" fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32);
 
 pub const HZ: f32 = 1e7;
+/// full scans: one in this many (not in eco)
+const FULL_EVERY: u32 = 30;
+/// processes whose times are read per sample between scans
+const CHUNK: usize = 24;
 
 /// What the Windows source keeps: the list buffer, the boot time (FILETIME), users'
 /// SIDs by uid (0 is SYSTEM, also for services whose token can't be read), and a
@@ -32,6 +40,26 @@ pub struct State {
     boot: i64,
     sids: Vec<Vec<u8>>,
     cbuf: Vec<u64>,
+    /// processes seen: pid, identity in the basic list (0: not known yet), start,
+    /// handle (as an fd; -1: can't be opened), when its times were last read; by pid
+    hs: Vec<(u32, u64, u64, i32, i64)>,
+    /// the next of them to read between scans, and when that last ran
+    rr: usize,
+    rr_t: i64,
+    /// tracked processes: their last read
+    tr_t: i64,
+    /// eco (no full scans after the first), scans since the last full one
+    eco: bool,
+    light: u32,
+}
+
+impl State {
+    /// Close the handles (leaving the page).
+    pub fn clear(&mut self) {
+        for h in self.hs.drain(..) {
+            close(fd2h(h.3));
+        }
+    }
 }
 
 fn ft(f: &FILETIME) -> i64 {
@@ -48,6 +76,12 @@ impl State {
             // S-1-5-18 (LocalSystem)
             sids: vec![vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]],
             cbuf: vec![0; 1024],
+            hs: Vec::new(),
+            rr: 0,
+            rr_t: 0,
+            tr_t: 0,
+            eco: false,
+            light: 0,
         }
     }
 }
@@ -235,11 +269,182 @@ impl Procs {
         (txt, nlen, aoff as u8, uid)
     }
 
-    /// A full scan: the system's process list, every process's times, memory, state,
-    /// priority (and I/O with `io_all`); new and exited processes noted. `keep_ms`:
-    /// exited ones stay that long (fading).
+    /// The speed is eco: no full scans after the first.
+    pub fn set_eco(&mut self, eco: bool) {
+        self.w.eco = eco;
+    }
+
+    /// A scan: a full one when the page was entered (and every FULL_EVERY scans, not
+    /// in eco), else the basic list's new and exited processes. `keep_ms`: exited ones
+    /// stay that long (fading).
     pub fn scan(&mut self, now: i64, keep_ms: u32) {
         let c0 = crate::term::cpu_ns();
+        if self.ok && !self.w.list.no_basic && (self.w.eco || self.w.light + 1 < FULL_EVERY) {
+            self.w.light += 1;
+            self.light_scan(now);
+        } else {
+            self.w.light = 0;
+            self.full_scan(now);
+        }
+        let ms = (now / 1_000_000) as u32 | 1;
+        let gen = self.gen;
+        for p in self.list.iter_mut() {
+            if p.seen != gen && p.gone == 0 {
+                p.gone = ms;
+                p.cpu = 0.0;
+            }
+        }
+        self.list
+            .retain(|p| p.gone == 0 || (ms.wrapping_sub(p.gone) < keep_ms && keep_ms > 0));
+        let list = &self.list;
+        self.tr.retain_mut(|t| {
+            let alive = bsearch(list, t.pid)
+                .ok()
+                .and_then(|j| list.get(j))
+                .is_some_and(|p| p.start == t.start && p.gone == 0);
+            if !alive {
+                t.close();
+            }
+            alive
+        });
+        // handles: the processes listed (opened once), the others' closed
+        let mut hs = Vec::with_capacity(self.list.len());
+        let mut old = std::mem::take(&mut self.w.hs);
+        for p in self.list.iter().filter(|p| p.gone == 0) {
+            match old.binary_search_by_key(&p.pid, |h| h.0) {
+                Ok(i) if old[i].2 == p.start => {
+                    hs.push(old[i]);
+                    old[i].3 = -1;
+                }
+                _ => {
+                    let h = open(p.pid, PROCESS_QUERY_LIMITED_INFORMATION);
+                    hs.push((p.pid, 0, p.start, h2fd(h), now));
+                }
+            }
+        }
+        for h in old {
+            close(fd2h(h.3));
+        }
+        self.w.hs = hs;
+        self.ok = true;
+        // (procui spaces scans by their cost: a light one counts as 0.8 ms, so smooth
+        // looks for new processes every 2 s, its reads between scans do the rest)
+        self.cost = (crate::term::cpu_ns() - c0).max(if self.w.light > 0 { 800_000 } else { 0 });
+    }
+
+    /// The process `pid` of the basic list, known by its handle entry `i`?
+    fn same(&self, i: usize, key: u64) -> bool {
+        let h = self.w.hs[i];
+        if h.1 != 0 {
+            return h.1 == key;
+        }
+        // (seen in a full scan, whose list has no sequence numbers: the handle says
+        // whether that process still runs; one that can't be opened is taken as it)
+        let mut code = 0u32;
+        h.3 < 0 || unsafe { GetExitCodeProcess(fd2h(h.3), &mut code) != 0 && code == 259 /* STILL_ACTIVE */ }
+    }
+
+    /// The basic list: processes that appeared (their name, user, times and memory
+    /// through a new handle) and those that exited (`seen` not this generation).
+    fn light_scan(&mut self, now: i64) {
+        let mut list = std::mem::replace(&mut self.w.list, ProcList::new());
+        if !list.read(false) {
+            self.w.list = list;
+            return;
+        }
+        self.gen = self.gen.wrapping_add(1);
+        self.scans += 1;
+        let gen = self.gen;
+        let mut nk = 0;
+        let mut ents: Vec<(u32, u32, u64, &[u16])> = Vec::new();
+        list.each(&mut |e| {
+            if e.pid != 0 {
+                ents.push((e.pid, e.ppid, e.key, e.name));
+            }
+        });
+        for &(pid, ppid, key, name) in &ents {
+            let kt = pid == 4 || (ppid == 4 && !is_exe(name));
+            if kt {
+                nk += 1;
+                if !self.show_k {
+                    continue;
+                }
+            }
+            if let Ok(i) = self.w.hs.binary_search_by_key(&pid, |h| h.0) {
+                if self.same(i, key) {
+                    self.w.hs[i].1 = key;
+                    let start = self.w.hs[i].2;
+                    if let Some(p) = bsearch(&self.list, pid).ok().and_then(|j| self.list.get_mut(j)).filter(|p| p.start == start) {
+                        p.seen = gen;
+                        p.ppid = ppid;
+                    }
+                    continue;
+                }
+            }
+            // new (or the pid was reused): only what this user may open, until the
+            // next full scan
+            let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION);
+            let Some((start, ticks, false)) = (!h.is_null()).then(|| times(h, self.w.boot)).flatten() else {
+                close(h);
+                continue;
+            };
+            let (txt, nlen, aoff, uid) = self.read_txt(pid, name, 1);
+            let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+            unsafe { K32GetProcessMemoryInfo(h, &mut m, std::mem::size_of_val(&m) as u32) };
+            let class = unsafe { GetPriorityClass(h) };
+            let p = P {
+                pid,
+                ppid,
+                uid,
+                threads: 1,
+                start,
+                ticks,
+                rss: m.WorkingSetSize as u64,
+                io: [0; 2],
+                cpu: 0.0,
+                rd: 0.0,
+                wr: 0.0,
+                sv: 0.0,
+                svt: 0,
+                gone: 0,
+                rank: u32::MAX,
+                prank: u32::MAX,
+                comm_h: 0,
+                seen: gen,
+                state: b'S',
+                nice: nice_of(match class {
+                    IDLE_PRIORITY_CLASS => 4,
+                    BELOW_NORMAL_PRIORITY_CLASS => 6,
+                    ABOVE_NORMAL_PRIORITY_CLASS => 10,
+                    HIGH_PRIORITY_CLASS => 13,
+                    REALTIME_PRIORITY_CLASS => 24,
+                    _ => 8,
+                }),
+                flags: NORATE | NEW | if kt { KTHREAD } else { 0 },
+                nlen,
+                aoff,
+                txt,
+            };
+            match bsearch(&self.list, pid) {
+                Ok(j) => self.list[j] = p,
+                Err(j) => self.list.insert(j, p),
+            }
+            match self.w.hs.binary_search_by_key(&pid, |h| h.0) {
+                Ok(i) => {
+                    close(fd2h(self.w.hs[i].3));
+                    self.w.hs[i] = (pid, key, start, h2fd(h), now);
+                }
+                Err(i) => self.w.hs.insert(i, (pid, key, start, h2fd(h), now)),
+            }
+        }
+        drop(ents);
+        self.w.list = list;
+        self.nk = nk;
+    }
+
+    /// A full scan: the system's process list, every process's times, memory, state,
+    /// priority (and I/O with `io_all`).
+    fn full_scan(&mut self, now: i64) {
         if !self.w.list.read(true) {
             return;
         }
@@ -325,11 +530,18 @@ impl Procs {
             let Some(p) = self.list.get_mut(j) else {
                 continue;
             };
-            if p.seen == gen.wrapping_sub(1) && dt > 0.0 {
-                p.cpu = ticks.saturating_sub(p.ticks) as f32 / (dt * HZ);
+            // (rates over the time since this process's times were last read: a full
+            // scan, or a read between scans)
+            let last = self.w.hs.binary_search_by_key(&pid, |h| h.0).ok().filter(|&i| self.w.hs[i].2 == start);
+            let t0 = last.map_or(0, |i| self.w.hs[i].4);
+            if p.seen == gen.wrapping_sub(1) && t0 > 0 && now > t0 {
+                p.cpu = ticks.saturating_sub(p.ticks) as f32 / ((now - t0) as f32 / 1e9 * HZ);
                 p.flags &= !NORATE;
             } else {
                 p.flags |= NORATE;
+            }
+            if let Some(i) = last {
+                self.w.hs[i].4 = now;
             }
             p.seen = gen;
             p.ticks = ticks;
@@ -354,28 +566,6 @@ impl Procs {
         self.w.list = list;
         self.nk = nk;
         self.denied = 0;
-        let ms = (now / 1_000_000) as u32 | 1;
-        for p in self.list.iter_mut() {
-            if p.seen != gen && p.gone == 0 {
-                p.gone = ms;
-                p.cpu = 0.0;
-            }
-        }
-        self.list
-            .retain(|p| p.gone == 0 || (ms.wrapping_sub(p.gone) < keep_ms && keep_ms > 0));
-        let list = &self.list;
-        self.tr.retain_mut(|t| {
-            let alive = bsearch(list, t.pid)
-                .ok()
-                .and_then(|j| list.get(j))
-                .is_some_and(|p| p.start == t.start && p.gone == 0);
-            if !alive {
-                t.close();
-            }
-            alive
-        });
-        self.ok = true;
-        self.cost = crate::term::cpu_ns() - c0;
     }
 
     /// (Windows has no load average: the CPU page's estimate is used, see sys.rs)
@@ -426,8 +616,14 @@ impl Procs {
     }
 
     /// Re-read the tracked processes (times and memory through their handles, I/O
-    /// when `io`): CPU and I/O rates over about the last second.
+    /// when `io`): CPU and I/O rates over about the last second. At most every 0.75 s:
+    /// a process's times sum its threads' (~3–10 µs a process, and a grouped table
+    /// tracks every member of the groups shown).
     pub fn read_tracked(&mut self, now: i64, io: bool) {
+        if !io && now - self.w.tr_t < 750_000_000 {
+            return;
+        }
+        self.w.tr_t = now;
         self.last_track = now;
         let ms = (now / 1_000_000) as u32 | 1;
         let boot = self.w.boot;
@@ -485,6 +681,45 @@ impl Procs {
             }
         }
         self.tr.retain(|t| t.fd >= 0);
+        // between scans, a few dozen of the other processes' times and memory (round
+        // robin through the handles, at most once a second): the order and totals stay
+        // current
+        if now - self.w.rr_t < 950_000_000 {
+            return;
+        }
+        self.w.rr_t = now;
+        let n = self.w.hs.len();
+        for _ in 0..n.min(CHUNK) {
+            let i = self.w.rr % n;
+            self.w.rr = self.w.rr.wrapping_add(1);
+            let (pid, _, start, fd, t0) = self.w.hs[i];
+            if fd < 0 || self.tr.iter().any(|t| t.pid == pid) {
+                continue;
+            }
+            let Some((_, ticks, exited)) = times(fd2h(fd), boot) else {
+                continue;
+            };
+            let Some(p) = bsearch(&self.list, pid).ok().and_then(|j| self.list.get_mut(j)).filter(|p| p.start == start) else {
+                continue;
+            };
+            if exited {
+                if p.gone == 0 {
+                    p.gone = ms;
+                    p.cpu = 0.0;
+                }
+                continue;
+            }
+            if t0 > 0 && now > t0 {
+                p.cpu = ticks.saturating_sub(p.ticks) as f32 / ((now - t0) as f32 / 1e9 * HZ);
+                p.flags &= !NORATE;
+            }
+            p.ticks = ticks;
+            let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+            if unsafe { K32GetProcessMemoryInfo(fd2h(fd), &mut m, std::mem::size_of_val(&m) as u32) } != 0 {
+                p.rss = m.WorkingSetSize as u64;
+            }
+            self.w.hs[i].4 = now;
+        }
     }
 
     /// The start of the process now holding `pid` (None if there is none, or it can't
@@ -629,11 +864,27 @@ mod tests {
             x = x.wrapping_mul(31).wrapping_add(7);
         }
         std::hint::black_box(x);
+        // (a full scan again: rates from the full list)
+        p.w.light = FULL_EVERY;
         p.scan(crate::term::mono(), 0);
         let me = std::process::id();
         let j = p.find(me).expect("own process listed");
         let q = &p.list[j];
         assert!(q.rss > 0 && q.threads >= 1 && q.cpu > 0.2, "{} {}", q.rss, q.cpu);
+        // a light scan, then the round-robin reads between scans: the rate again
+        let t0 = std::time::Instant::now();
+        while t0.elapsed().as_millis() < 120 {
+            x = x.wrapping_mul(31).wrapping_add(7);
+        }
+        std::hint::black_box(x);
+        p.scan(crate::term::mono(), 0);
+        assert!(p.w.light == 1 && p.find(me).is_some());
+        for _ in 0..p.w.hs.len() / CHUNK + 2 {
+            (p.w.rr_t, p.w.tr_t) = (0, 0);
+            p.read_tracked(crate::term::mono(), false);
+        }
+        let q = &p.list[p.find(me).unwrap()];
+        assert!(q.cpu > 0.2, "{}", q.cpu);
         assert_eq!(q.uid, p.me);
         assert!(p.user(q.uid) != "?");
         let start = q.start;

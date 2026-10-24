@@ -1687,6 +1687,7 @@ fn main() {
         #[cfg(windows)]
         {
             st.app.s.eco = eco;
+            st.app.m.set_eco(eco);
         }
         // account the CPU time of the wakeup that just finished (eco only: reading
         // the process clock is a syscall, which faster speeds needn't pay per frame)

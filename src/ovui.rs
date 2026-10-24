@@ -238,6 +238,8 @@ impl App {
         let track = now - d.last_track >= if eco { 6 * SEC } else { 2 * SEC / 5 } - SEC / 20;
         if scan {
             let t0 = crate::term::cpu_ns();
+            #[cfg(windows)]
+            d.set_eco(eco);
             d.scan(now, 0);
             d.release();
             self.ov.last_scan = now;
