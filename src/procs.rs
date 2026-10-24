@@ -444,7 +444,7 @@ impl Track {
     }
     #[cfg(windows)]
     fn close(&mut self) {
-        crate::win::close(crate::win::fd2h(self.fd));
+        crate::win::close_later(crate::win::fd2h(self.fd));
         self.fd = -1;
         self.iofd = -1;
     }

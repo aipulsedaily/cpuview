@@ -7,6 +7,9 @@ pub mod lhm;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{VirtualQuery, VirtualUnlock, MEMORY_BASIC_INFORMATION, MEM_IMAGE};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+use windows_sys::Win32::System::Threading::{WaitOnAddress, WakeByAddressSingle, INFINITE};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::Mutex;
 
 // (not in windows-sys: processor groups beyond the caller's)
 windows_link::link!("ntdll.dll" "system" fn NtQuerySystemInformationEx(class: i32, input: *const core::ffi::c_void, inlen: u32, info: *mut core::ffi::c_void, len: u32, retlen: *mut u32) -> i32);
@@ -245,6 +248,41 @@ pub fn prog_name(w: &[u16], pid: u32) -> String {
 pub fn close(h: HANDLE) {
     if !h.is_null() && h != INVALID_HANDLE_VALUE {
         unsafe { CloseHandle(h) };
+    }
+}
+
+/// Handles of processes that may have ended, closed on a helper thread (started on
+/// first use). Closing the last handle to an ended process frees what's left of it
+/// (address space, handle table) in the closing thread: ~50–150 µs each, which a
+/// scan after a minute would pay for every process that ended meanwhile. The
+/// helper's time still counts (term::cpu_ns has every thread's), off the wakeups.
+pub fn close_later(h: HANDLE) {
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        return;
+    }
+    CLOSING.lock().unwrap_or_else(|e| e.into_inner()).push(h as usize);
+    CLOSE_ASK.fetch_add(1, Relaxed);
+    if !CLOSER_UP.swap(true, Relaxed) {
+        let _ = std::thread::Builder::new().stack_size(64 * 1024).spawn(closer);
+    } else {
+        unsafe { WakeByAddressSingle(CLOSE_ASK.as_ptr() as *const _) };
+    }
+}
+
+static CLOSING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static CLOSE_ASK: AtomicU32 = AtomicU32::new(0);
+static CLOSER_UP: AtomicBool = AtomicBool::new(false);
+
+fn closer() {
+    loop {
+        let a = CLOSE_ASK.load(Relaxed);
+        let hs = std::mem::take(&mut *CLOSING.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in hs {
+            close(h as HANDLE);
+        }
+        while CLOSE_ASK.load(Relaxed) == a {
+            unsafe { WaitOnAddress(CLOSE_ASK.as_ptr() as *const _, &a as *const u32 as *const _, 4, INFINITE) };
+        }
     }
 }
 

@@ -14,7 +14,7 @@
 //! from boot.
 
 use super::*;
-use crate::win::{close, fd2h, from_wide, h2fd, is_exe, prog_name, ProcList, Spi};
+use crate::win::{close, close_later, fd2h, from_wide, h2fd, is_exe, prog_name, ProcList, Spi};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, FILETIME, HANDLE};
 use windows_sys::Win32::Security::{GetTokenInformation, LookupAccountSidW, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -57,7 +57,7 @@ impl State {
     /// Close the handles (leaving the page).
     pub fn clear(&mut self) {
         for h in self.hs.drain(..) {
-            close(fd2h(h.3));
+            close_later(fd2h(h.3));
         }
     }
 }
@@ -323,7 +323,7 @@ impl Procs {
             }
         }
         for h in old {
-            close(fd2h(h.3));
+            close_later(fd2h(h.3));
         }
         self.w.hs = hs;
         self.ok = true;
@@ -431,7 +431,7 @@ impl Procs {
             }
             match self.w.hs.binary_search_by_key(&pid, |h| h.0) {
                 Ok(i) => {
-                    close(fd2h(self.w.hs[i].3));
+                    close_later(fd2h(self.w.hs[i].3));
                     self.w.hs[i] = (pid, key, start, h2fd(h), now);
                 }
                 Err(i) => self.w.hs.insert(i, (pid, key, start, h2fd(h), now)),

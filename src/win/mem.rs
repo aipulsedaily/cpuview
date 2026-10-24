@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::sys::isort;
-use crate::win::{close, fd2h, h2fd, prog_name, wide, NtQuerySystemInformation, ProcList};
+use crate::win::{close, close_later, fd2h, h2fd, prog_name, wide, NtQuerySystemInformation, ProcEnt, ProcList};
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS};
@@ -24,12 +24,17 @@ const PAGE: u64 = 4096;
 pub struct State {
     list: ProcList,
     /// processes seen: pid, identity, handle (as an fd; -1: can't be opened, its
-    /// numbers come from the full list), sorted by pid
-    open: Vec<(u32, u64, i32)>,
+    /// numbers come from the full list), resident and shared bytes, sorted by pid
+    open: Vec<(u32, u64, i32, u64, u64)>,
     /// memory of the processes that can't be opened (pid, resident, shared), from
     /// the last full list, and how many scans ago that was
     denied: Vec<(u32, u64, u64)>,
     since_full: u32,
+    /// newcomers found small since the last scan (pid, identity: need_scan opens
+    /// each once)
+    small: Vec<(u32, u64)>,
+    /// eco: the list was read for a scan, to be gone through by the next call
+    pending: bool,
     /// eco: no full list after the first (it costs milliseconds on a busy desktop)
     eco: bool,
     /// logical drives at the last volume listing
@@ -43,6 +48,8 @@ impl State {
             open: Vec::new(),
             denied: Vec::new(),
             since_full: u32::MAX,
+            small: Vec::new(),
+            pending: false,
             eco: false,
             drives: 0,
         }
@@ -359,6 +366,7 @@ impl Mem {
     /// names stay (they are what the next scan starts from).
     pub fn shrink(&mut self) {
         self.w.list.release();
+        self.w.pending = false;
         self.all = Vec::new();
         for g in &mut self.groups {
             g.name.shrink_to_fit();
@@ -381,44 +389,68 @@ impl Mem {
     /// users' services when not elevated) from the full list, read again every
     /// tenth scan, not in eco (it costs milliseconds on a busy desktop). Then as on
     /// Linux: grouped by program, the `NPROC` biggest followed live.
+    ///
+    /// In eco the list is read by one call and gone through by the next (the next
+    /// sample: `last_proc` hasn't moved): each half costs ~0.5 ms on a busy desktop
+    /// with cold caches, together more than an eco wakeup may.
     pub fn scan_procs(&mut self) {
-        self.w.since_full = self.w.since_full.saturating_add(1);
-        let full = (self.w.since_full >= 10 && (!self.w.eco || !self.proc_ok)) || self.w.list.no_basic;
-        if !self.w.list.read(full) {
+        let full = (self.w.since_full.saturating_add(1) >= 10 && (!self.w.eco || !self.proc_ok)) || self.w.list.no_basic;
+        let pending = std::mem::take(&mut self.w.pending) && !full;
+        if self.w.eco && !full && !pending {
+            self.w.pending = self.w.list.read(false);
             return;
         }
-        if full {
-            self.w.since_full = 0;
+        if !pending && !self.w.list.read(full) {
+            return;
         }
+        self.w.since_full = if full { 0 } else { self.w.since_full.saturating_add(1) };
         self.scans += 1;
+        self.w.small.clear();
         self.last_proc = crate::term::mono();
         self.last_top = self.last_proc;
         self.all.clear();
-        let mut seen: Vec<(u32, u64, i32)> = Vec::with_capacity(self.w.open.len() + 8);
+        let mut seen: Vec<(u32, u64, i32, u64, u64)> = Vec::with_capacity(self.w.open.len() + 8);
         let mut names: Vec<(u32, String)> = Vec::new();
         let mut denied = Vec::new();
-        let (open, old_denied) = (&self.w.open, &self.w.denied);
+        let (open, old_denied, scans, eco, live) = (&self.w.open, &self.w.denied, self.scans, self.w.eco, &self.procs);
         self.w.list.each(&mut |e| {
             if e.pid == 0 {
                 return;
             }
             // the handle of this process (same pid and identity), else a new one
-            let fd = match open.binary_search_by_key(&e.pid, |x| x.0) {
-                Ok(i) if open[i].1 == e.key => open[i].2,
+            let (fd, last) = match known(open, &e) {
+                Some(i) => (open[i].2, Some((open[i].3, open[i].4))),
                 _ => {
                     let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.pid) };
                     names.push((e.pid, prog_name(e.name, e.pid)));
-                    h2fd(h)
+                    (h2fd(h), None)
                 }
             };
-            seen.push((e.pid, e.key, fd));
-            let m = if fd >= 0 { Self::query(fd) } else { None };
+            // a known process is read again now and then, staggered by pid: under 16 MB
+            // every fifth scan (a desktop has hundreds of them, a query each: ~2-6 µs,
+            // and they hardly move the totals); in eco (scans minutes apart: every
+            // query a cold one, ~7 µs) the others every third and the small ones every
+            // fifteenth. Those followed live keep their live numbers.
+            let k = match last {
+                None => 1,
+                Some(l) if l.0 < 16 << 20 => if eco { 15 } else { 5 },
+                Some(_) => if eco { 3 } else { 1 },
+            };
+            let m = if !full && (e.pid / 4 + scans) % k != 0 {
+                live.iter().find(|p| p.pid == e.pid && p.fd >= 0).map(|p| (p.rss, p.shared)).or(last)
+            } else if fd >= 0 {
+                Self::query(fd)
+            } else {
+                None
+            };
             let m = m.or_else(|| {
                 let s = e.full?;
                 Some((s.ws as u64, (s.ws as u64).saturating_sub(s.ws_private as u64)))
             });
             let m = m.or_else(|| old_denied.iter().find(|d| d.0 == e.pid).map(|d| (d.1, d.2)));
-            if let Some((rss, sh)) = m {
+            let (rss, sh) = m.unwrap_or((0, 0));
+            seen.push((e.pid, e.key, fd, rss, sh));
+            if m.is_some() {
                 if fd < 0 {
                     denied.push((e.pid, rss, sh));
                 }
@@ -427,11 +459,12 @@ impl Mem {
                 }
             }
         });
-        isort(&mut seen, &|a, b| a.0 < b.0);
+        // (the list comes in creation order: an insertion sort would be quadratic)
+        seen.sort_unstable_by_key(|x| x.0);
         // handles of processes that ended
-        for &(pid, key, fd) in &self.w.open {
-            if fd >= 0 && seen.binary_search_by_key(&pid, |x| x.0).map_or(true, |i| seen[i].1 != key) {
-                close(fd2h(fd));
+        for &(pid, _, fd, _, _) in &self.w.open {
+            if fd >= 0 && seen.binary_search_by_key(&pid, |x| x.0).map_or(true, |i| seen[i].2 != fd) {
+                close_later(fd2h(fd));
             }
         }
         self.w.open = seen;
@@ -517,8 +550,12 @@ impl Mem {
     }
 
     /// Between full scans: RAM in use changed by more than the followed processes
-    /// explain, or (every third check) a process of 64 MB or more appeared.
+    /// explain, or (every third check) a process of 64 MB or more appeared. (A
+    /// newcomer's list is kept for the next check, which says yes: see scan_procs.)
     pub fn need_scan(&mut self) -> bool {
+        if self.w.pending {
+            return true;
+        }
         let live: u64 = self.procs.iter().map(|p| p.rss).sum();
         let d_used = self.mi.used() as i64 - self.scan_used as i64;
         let d_live = live as i64 - self.scan_live as i64;
@@ -530,9 +567,9 @@ impl Mem {
             return false;
         }
         let mut big = false;
-        let open = &self.w.open;
+        let (open, small) = (&self.w.open, &mut self.w.small);
         self.w.list.each(&mut |e| {
-            if big || open.binary_search_by_key(&e.pid, |x| x.0).is_ok_and(|i| open[i].1 == e.key) {
+            if big || known(open, &e).is_some() || small.contains(&(e.pid, e.key)) {
                 return;
             }
             let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.pid) };
@@ -540,8 +577,13 @@ impl Mem {
                 big = Self::query(h2fd(h)).is_some_and(|(r, _)| r >= 64 << 20);
                 close(h);
             }
+            if !big {
+                small.push((e.pid, e.key));
+            }
         });
-        big
+        // (eco: the list just read is the scan's, gone through at the next check)
+        self.w.pending = big && self.w.eco;
+        big && !self.w.eco
     }
 
     /// Re-read the processes followed live (one query each); the ones that ended
@@ -564,4 +606,12 @@ impl Mem {
         isort(&mut self.procs, &|a, b| a.rss > b.rss);
         self.regroup();
     }
+}
+
+/// The scan's entry for a process of the list. A pid isn't reused while a handle to
+/// its process is open, so with one the pid is enough (the full and the basic list
+/// have different identities: creation time, sequence number).
+fn known(open: &[(u32, u64, i32, u64, u64)], e: &ProcEnt) -> Option<usize> {
+    let i = open.binary_search_by_key(&e.pid, |x| x.0).ok()?;
+    (open[i].2 >= 0 || open[i].1 == e.key).then_some(i)
 }
