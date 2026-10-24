@@ -253,7 +253,9 @@ impl Sens {
             let g = lhm_group(&x.hwid);
             let generic = matches!(x.text.as_str(), "Temperature" | "Composite Temperature" | "Power" | "Fan" | "Total");
             let name = if generic || g == G_GPU && !x.text.starts_with("GPU") { [&x.hw, " ", &x.text].concat() } else { x.text.clone() };
-            let mut r = rd(kind, s, g, k as c_int, &x.id, &name);
+            // (beside the name: the hardware it belongs to; fans keep their own)
+            let raw = if kind == K_FAN { &x.text } else { &x.hw };
+            let mut r = rd(kind, s, g, k as c_int, raw, &name);
             match kind {
                 K_TEMP => {
                     (r.warn, r.crit) = temp_limits(g, None, None);

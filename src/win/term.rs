@@ -5,7 +5,7 @@
 
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::Console::*;
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -86,11 +86,12 @@ pub fn is_tty(fd: c_int) -> bool {
 }
 
 /// Window size in cells (the visible window, not the scroll-back buffer); pixel sizes
-/// are unknown here (the probe asks the terminal).
+/// are unknown here (the probe asks the terminal). (The console's input handle has no
+/// size: fd 0 asks the output.)
 pub fn size(fd: c_int) -> (u16, u16, u16, u16) {
     unsafe {
         let mut i: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-        if GetConsoleScreenBufferInfo(handle(fd), &mut i) != 0 {
+        if GetConsoleScreenBufferInfo(handle(fd.max(1)), &mut i) != 0 {
             let w = i.srWindow.Right - i.srWindow.Left + 1;
             let h = i.srWindow.Bottom - i.srWindow.Top + 1;
             if w > 0 && h > 0 {
@@ -155,12 +156,19 @@ pub fn restore_mode() {
     }
 }
 
+/// The console went away (its host ended: a closed tab, a crashed terminal): end
+/// the main loop, as a read of 0 bytes does on Linux.
+fn gone() {
+    QUIT.store(true, Ordering::Relaxed);
+}
+
 pub fn write_all(fd: c_int, mut b: &[u8]) {
     let h = handle(fd);
     while !b.is_empty() {
         let mut n = 0u32;
         let len = b.len().min(1 << 20) as u32;
         if unsafe { WriteFile(h, b.as_ptr(), len, &mut n, std::ptr::null_mut()) } == 0 || n == 0 {
+            gone();
             return;
         }
         b = &b[n as usize..];
@@ -387,11 +395,16 @@ fn drain(h: HANDLE) {
     let mut recs: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
     loop {
         let mut n = 0u32;
-        if unsafe { GetNumberOfConsoleInputEvents(h, &mut n) } == 0 || n == 0 {
+        if unsafe { GetNumberOfConsoleInputEvents(h, &mut n) } == 0 {
+            gone();
+            return;
+        }
+        if n == 0 {
             return;
         }
         let mut got = 0u32;
         if unsafe { ReadConsoleInputW(h, recs.as_mut_ptr(), recs.len() as u32, &mut got) } == 0 {
+            gone();
             return;
         }
         for r in &recs[..got as usize] {
@@ -456,6 +469,10 @@ pub fn wait(fd: c_int, timeout_ns: i64, _mask: &()) -> bool {
             ((left + 999_999) / 1_000_000) as u32
         };
         let r = unsafe { WaitForMultipleObjects(n, hs.as_ptr(), 0, ms) };
+        if r == WAIT_FAILED {
+            gone();
+            return false;
+        }
         if r == WAIT_OBJECT_0 {
             drain(h);
         } else if r == WAIT_OBJECT_0 + 1 && !quit.is_null() {
