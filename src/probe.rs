@@ -405,17 +405,25 @@ pub fn probe(fd_in: c_int, fd_out: c_int, tmux: bool) -> Caps {
         if now >= end {
             break;
         }
-        let mut p = libc::pollfd {
-            fd: fd_in,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ms = ((end - now) / 1_000_000).max(1) as c_int;
-        let r = unsafe { libc::poll(&mut p, 1, ms) };
-        if r <= 0 {
-            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+        #[cfg(unix)]
+        {
+            let mut p = libc::pollfd {
+                fd: fd_in,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = ((end - now) / 1_000_000).max(1) as c_int;
+            let r = unsafe { libc::poll(&mut p, 1, ms) };
+            if r <= 0 {
+                if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
             }
+        }
+        // (the console's input records, turned into bytes, until the deadline)
+        #[cfg(windows)]
+        if !crate::term::wait(fd_in, end - now, &()) {
             break;
         }
         let n = crate::term::read(fd_in, &mut tmp);

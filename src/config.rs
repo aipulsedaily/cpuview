@@ -1,4 +1,5 @@
-//! ~/.config/cpuview/config: a tiny `key = value` file, plus image import (copy / curl).
+//! ~/.config/cpuview/config (Windows: %APPDATA%\cpuview\config): a tiny `key = value`
+//! file, plus image import (copy / curl).
 
 use crate::image::Fit;
 use crate::mosaic::Glyphs;
@@ -62,16 +63,34 @@ impl Default for Config {
     }
 }
 
+#[cfg(unix)]
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+#[cfg(windows)]
+pub fn home() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(unix)]
 pub fn config_dir() -> PathBuf {
     match std::env::var_os("XDG_CONFIG_HOME") {
         Some(p) if !p.is_empty() => PathBuf::from(p).join("cpuview"),
         _ => home().join(".config/cpuview"),
+    }
+}
+
+/// %APPDATA%\cpuview (the roaming profile: settings and the user's pictures).
+#[cfg(windows)]
+pub fn config_dir() -> PathBuf {
+    match std::env::var_os("APPDATA") {
+        Some(p) if !p.is_empty() => PathBuf::from(p).join("cpuview"),
+        _ => home().join("AppData/Roaming/cpuview"),
     }
 }
 
@@ -80,6 +99,7 @@ pub fn images_dir() -> PathBuf {
 }
 
 /// Directories holding the bundled wallpapers, first existing wins.
+#[cfg(unix)]
 pub fn wallpaper_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(p) = std::env::var_os("CPUVIEW_WALLPAPERS") {
@@ -97,6 +117,26 @@ pub fn wallpaper_dirs() -> Vec<PathBuf> {
         }
     }
     v.push(PathBuf::from("/usr/share/cpuview/wallpapers"));
+    v.push(PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/wallpapers"
+    )));
+    v.into_iter().filter(|p| p.is_dir()).collect()
+}
+
+/// Windows: next to cpuview.exe (the release zip), else the repository's.
+#[cfg(windows)]
+pub fn wallpaper_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(p) = std::env::var_os("CPUVIEW_WALLPAPERS") {
+        v.push(PathBuf::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            v.push(d.join("wallpapers"));
+            v.push(d.join("../../wallpapers")); // cargo run from the repo
+        }
+    }
     v.push(PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/wallpapers"
@@ -298,6 +338,7 @@ fn sanitize(name: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 extern "C" {
     static environ: *const *mut libc::c_char;
 }
@@ -310,6 +351,7 @@ fn run_quiet(args: &[&str]) -> Result<i32, String> {
 /// and stderr on /dev/null, else the terminal's); returns its exit code (-1 if a
 /// signal ended it). posix_spawn instead of std::process::Command keeps ~15 KB of
 /// std out of the binary.
+#[cfg(unix)]
 pub fn run(args: &[&str], quiet: bool) -> Result<i32, String> {
     let cs = args
         .iter()
@@ -353,6 +395,20 @@ pub fn run(args: &[&str], quiet: bool) -> Result<i32, String> {
             -1
         })
     }
+}
+
+/// Windows: std's CreateProcessW (curl.exe ships with Windows 10 1803 and later).
+#[cfg(windows)]
+pub fn run(args: &[&str], quiet: bool) -> Result<i32, String> {
+    use std::process::{Command, Stdio};
+    let (prog, rest) = args.split_first().ok_or("no program")?;
+    let mut c = Command::new(prog);
+    c.args(rest);
+    if quiet {
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let st = c.status().map_err(|e| e.to_string())?;
+    Ok(st.code().unwrap_or(-1))
 }
 
 const MAX_BYTES: u64 = 25 * 1024 * 1024;
@@ -446,10 +502,19 @@ pub fn import_image(src: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     #[test]
     fn spawned_programs_report_their_exit_code() {
         assert_eq!(super::run_quiet(&["true"]), Ok(0));
         assert_eq!(super::run_quiet(&["sh", "-c", "echo noise; exit 3"]), Ok(3));
+        assert!(super::run_quiet(&["no-such-program-cpuview-test"]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawned_programs_report_their_exit_code() {
+        assert_eq!(super::run_quiet(&["cmd", "/c", "exit 0"]), Ok(0));
+        assert_eq!(super::run_quiet(&["cmd", "/c", "echo noise & exit 3"]), Ok(3));
         assert!(super::run_quiet(&["no-such-program-cpuview-test"]).is_err());
     }
 

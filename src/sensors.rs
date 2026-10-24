@@ -10,8 +10,17 @@
 //! every source is read on its own cadence, stretched by its measured cost to a share
 //! of the CPU budget (`period`), and nothing is read while the page is hidden.
 
+// (the Linux parsers stay compiled, and tested, on Windows too)
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 use crate::sys::{isort, pread, Ring};
 use std::os::raw::c_int;
+
+/// The Windows sources (battery, ACPI zones, drives, LibreHardwareMonitor).
+#[cfg(windows)]
+#[path = "win/sensors.rs"]
+mod win;
+#[cfg(windows)]
+pub use win::setup;
 
 pub const SEC: i64 = 1_000_000_000;
 
@@ -289,14 +298,18 @@ pub struct Sens {
     /// the overview's last dear read (not counting the one when it came into view)
     ov_dear: i64,
     /// a server board's BMC (IPMI) and its sensors (a BMC reading's `fd` is its index)
+    #[cfg(unix)]
     bmc: Option<crate::ipmi::Bmc>,
+    #[cfg(unix)]
     sdr: Vec<crate::ipmi::Sdr>,
+    #[cfg(windows)]
+    w: win::State,
     /// there is a BMC but its device is root-only
     pub bmc_locked: bool,
 }
 
 fn thread_ns() -> i64 {
-    crate::term::now_ns(libc::CLOCK_THREAD_CPUTIME_ID)
+    crate::term::now_ns(crate::term::CLOCK_THREAD_CPUTIME_ID)
 }
 
 
@@ -333,6 +346,7 @@ fn num_of(s: &str) -> Option<u32> {
     v
 }
 
+#[cfg(unix)]
 /// Directory entries (names), "fan2" before "fan10".
 fn list(d: &str) -> Vec<String> {
     let mut v: Vec<String> = match std::fs::read_dir(d) {
@@ -633,6 +647,7 @@ fn temp_ok(v: f32, aux: bool, board: Option<f32>) -> bool {
     !aux || (v >= 10.0 && board.is_none_or(|b| v >= b - 8.0))
 }
 
+#[cfg(unix)]
 /// perf_event_open for a system-wide counter on `cpu`; -errno on failure.
 fn perf_open(typ: u32, config: u64, cpu: i32) -> c_int {
     let mut attr = [0u64; 16];
@@ -655,6 +670,7 @@ fn perf_open(typ: u32, config: u64, cpu: i32) -> c_int {
     }
 }
 
+#[cfg(unix)]
 /// "event=0x02" → 2.
 fn perf_event_cfg(s: &str) -> Option<u64> {
     let v = s.trim().strip_prefix("event=")?;
@@ -670,7 +686,7 @@ fn perf_event_cfg(s: &str) -> Option<u64> {
 }
 
 /// "2.3283064365386962890625e-10" (no float parser in the binary).
-fn parse_sci(s: &str) -> Option<f64> {
+pub(crate) fn parse_sci(s: &str) -> Option<f64> {
     let s = s.trim();
     let (m, e) = match s.split_once(['e', 'E']) {
         Some((m, e)) => (m, parse_i64(e.as_bytes())? as i32),
@@ -722,11 +738,13 @@ fn pb(parts: &[&str]) -> Pb {
     p
 }
 
+#[cfg(unix)]
 /// open(2) read-only (`p` NUL-terminated on the stack).
 fn openp(p: &Pb) -> c_int {
     unsafe { libc::open(p.b.as_ptr() as *const _, libc::O_RDONLY | libc::O_CLOEXEC) }
 }
 
+#[cfg(unix)]
 /// A small file's text, trimmed (in `b`).
 fn slurp<'a>(p: &Pb, b: &'a mut [u8; 256]) -> &'a str {
     let fd = openp(p);
@@ -737,6 +755,7 @@ fn slurp<'a>(p: &Pb, b: &'a mut [u8; 256]) -> &'a str {
     std::str::from_utf8(&b[..n]).unwrap_or("").trim()
 }
 
+#[cfg(unix)]
 /// A small file's text, trimmed.
 #[inline(never)]
 fn rstr(parts: &[&str]) -> String {
@@ -744,6 +763,7 @@ fn rstr(parts: &[&str]) -> String {
     slurp(&pb(parts), &mut b).to_string()
 }
 
+#[cfg(unix)]
 /// A file's leading integer.
 #[inline(never)]
 fn rint(parts: &[&str]) -> Option<i64> {
@@ -751,16 +771,19 @@ fn rint(parts: &[&str]) -> Option<i64> {
     parse_i64(slurp(&pb(parts), &mut b).as_bytes())
 }
 
+#[cfg(unix)]
 #[inline(never)]
 fn open_at(parts: &[&str]) -> c_int {
     openp(&pb(parts))
 }
 
+#[cfg(unix)]
 #[inline(never)]
 fn exists(parts: &[&str]) -> bool {
     unsafe { libc::access(pb(parts).b.as_ptr() as *const _, libc::F_OK) == 0 }
 }
 
+#[cfg(unix)]
 /// Where the BMC's sensor list is cached (walking it takes the BMC a while).
 fn bmc_cache() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
@@ -769,6 +792,7 @@ fn bmc_cache() -> std::path::PathBuf {
     base.join("cpuview").join("bmc-sdr")
 }
 
+#[cfg(unix)]
 /// The network interface a device belongs to (a `net` directory on its way up, short of
 /// /sys/devices/virtual, whose net/ holds every virtual interface: lo, bridges, …).
 fn iface_of(dev: &str, root: &str) -> Option<String> {
@@ -782,6 +806,7 @@ fn iface_of(dev: &str, root: &str) -> Option<String> {
     None
 }
 
+#[cfg(unix)]
 /// Kernel release (`uname -r`).
 fn release() -> String {
     unsafe {
@@ -791,6 +816,7 @@ fn release() -> String {
     }
 }
 
+#[cfg(unix)]
 /// Drivers that likely show a board's fans: "vendor (and product) prefix|*|modules"
 /// (`lookup` on the lower-case DMI vendor and product version).
 const MODS: &str = "\
@@ -804,11 +830,13 @@ apple|*|applesmc
 hp,hewlett|*|hp_wmi_sensors
 supermicro|*|nct6775";
 
+#[cfg(unix)]
 /// `s` with byte `a` replaced by `b` (both ASCII).
 fn us_dash(s: &str, a: u8, b: u8) -> String {
     s.bytes().map(|c| (if c == a { b } else { c }) as char).collect()
 }
 
+#[cfg(unix)]
 /// Is kernel module `m` installed (no modinfo: the usual places)?
 fn module_file(root: &str, m: &str) -> bool {
     let base = [root, "/lib/modules/", &release(), "/kernel/drivers/"].concat();
@@ -823,6 +851,21 @@ fn module_file(root: &str, m: &str) -> bool {
         }
     }
     false
+}
+
+/// Short names of the common board makers.
+fn short_vendor(v: String) -> String {
+    for (a, b) in "ASUSTeK COMPUTER INC.=ASUS|Micro-Star International Co., Ltd.=MSI|Gigabyte Technology Co., Ltd.=Gigabyte|Dell Inc.=Dell".split('|').filter_map(|p| p.split_once('=')) {
+        if v == a {
+            return b.to_string();
+        }
+    }
+    v
+}
+
+/// The system's maker and product (lower case) say it's a virtual machine.
+fn is_vm(vs: &str) -> bool {
+    "qemu|kvm|vmware|virtualbox|innotek|xen|bochs|parallels|virtual machine".split('|').any(|w| vs.contains(w))
 }
 
 impl Sens {
@@ -852,8 +895,12 @@ impl Sens {
             spent: 0,
             perf_paranoid: -9,
             ov_dear: i64::MIN / 2,
+            #[cfg(unix)]
             bmc: None,
+            #[cfg(unix)]
             sdr: Vec::new(),
+            #[cfg(windows)]
+            w: win::State::new(),
             bmc_locked: false,
         }
     }
@@ -886,18 +933,14 @@ impl Sens {
 
     /// Find everything, once (a driver loaded later shows after a restart), and
     /// read it.
+    #[cfg(unix)]
     pub fn detect(&mut self, now: i64) {
         self.detected = true;
         let root = self.root.clone();
         let root = root.as_str();
         let dmi = |f: &str| rstr(&[root, "/sys/class/dmi/id/", f]);
         let (bv, bn, sv, pn) = (dmi("board_vendor"), dmi("board_name"), dmi("sys_vendor"), dmi("product_name"));
-        let mut vendor = if bv.is_empty() { sv.clone() } else { bv };
-        for (a, b) in "ASUSTeK COMPUTER INC.=ASUS|Micro-Star International Co., Ltd.=MSI|Gigabyte Technology Co., Ltd.=Gigabyte|Dell Inc.=Dell".split('|').filter_map(|p| p.split_once('=')) {
-            if vendor == a {
-                vendor = b.to_string();
-            }
-        }
+        let vendor = short_vendor(if bv.is_empty() { sv.clone() } else { bv });
         let model = if !bn.is_empty() && !bn.starts_with("To be filled") { &bn } else { &pn };
         self.board = if model.is_empty() {
             rstr(&[root, "/proc/device-tree/model"]).trim_end_matches('\0').to_string()
@@ -905,8 +948,7 @@ impl Sens {
             [&vendor, " ", model].concat()
         };
         let vs = [&sv, " ", &pn].concat().to_ascii_lowercase();
-        self.vm = "qemu|kvm|vmware|virtualbox|innotek|xen|bochs|parallels|virtual machine".split('|').any(|w| vs.contains(w))
-            || exists(&[root, "/sys/hypervisor/type"]);
+        self.vm = is_vm(&vs) || exists(&[root, "/sys/hypervisor/type"]);
         let cpu = std::fs::read(pb(&[root, "/proc/cpuinfo"]).s()).unwrap_or_default();
         self.amd = cpu.windows(12).any(|w| w == b"AuthenticAMD" || w == b"HygonGenuine");
         // hwmon chips
@@ -994,6 +1036,7 @@ impl Sens {
         }
     }
 
+#[cfg(unix)]
     /// One hwmon chip's fans, temperatures, voltages and power readings.
     fn hwmon(&mut self, d: &str, name: &str, asus: bool) {
         let dev = std::fs::canonicalize(pb(&[d, "/device"]).s()).map_or(String::new(), |p| p.to_string_lossy().into_owned());
@@ -1090,6 +1133,7 @@ impl Sens {
         }
     }
 
+#[cfg(unix)]
     /// RAPL energy counters: powercap if readable, else perf (package; per core on
     /// AMD), else note that they exist but are locked.
     fn rapl(&mut self) {
@@ -1174,6 +1218,7 @@ impl Sens {
         };
     }
 
+#[cfg(unix)]
     fn batteries(&mut self) {
         let ps = [&self.root, "/sys/class/power_supply/"].concat();
         for b in list(&ps) {
@@ -1477,8 +1522,12 @@ impl Sens {
         if kind == S_BMC {
             self.read_bmc(i, 0);
         }
+        #[cfg(windows)]
+        if kind > S_BMC {
+            self.read_win(i);
+        }
         for r in &mut self.rd {
-            if r.src as usize != i || r.fd < 0 || kind == S_BMC {
+            if r.src as usize != i || r.fd < 0 || kind >= S_BMC {
                 continue;
             }
             match r.kind {
@@ -1515,10 +1564,16 @@ impl Sens {
                 }
                 K_POWER => {
                     if let Some(c) = r.ctr.as_mut() {
-                        let v = if c.perf {
+                        #[cfg(unix)]
+                        let perf = c.perf.then(|| {
                             let mut b = 0u64;
                             let n = unsafe { libc::read(r.fd, &mut b as *mut u64 as *mut _, 8) };
                             (n == 8).then_some(b)
+                        });
+                        #[cfg(windows)]
+                        let perf: Option<Option<u64>> = None;
+                        let v = if let Some(v) = perf {
+                            v
                         } else {
                             read_fd(r.fd).map(|v| v as u64)
                         };
@@ -1552,6 +1607,7 @@ impl Sens {
         self.spent += c;
     }
 
+#[cfg(unix)]
     /// The BMC's answers to the last read's requests (waiting up to `wait_ms` for
     /// them), then the next requests.
     fn read_bmc(&mut self, i: usize, wait_ms: i32) {
@@ -1596,6 +1652,7 @@ impl Sens {
         }
     }
 
+#[cfg(unix)]
     /// The BMC's sensors: fans, temperatures (by what their names say they
     /// measure) and voltages, with the limits the BMC sets.
     fn add_bmc(&mut self, sdr: Vec<crate::ipmi::Sdr>) {
@@ -1644,6 +1701,7 @@ impl Sens {
         self.sdr = sdr;
     }
 
+#[cfg(unix)]
     fn read_bats(&mut self, _now: i64) {
         if self.ac >= 0 {
             self.ac_on = read_fd(self.ac).map_or(-1, |v| (v != 0) as i8);
@@ -1690,6 +1748,9 @@ impl Sens {
 
     /// The CPU counts energy per core (perf power_core), whether or not readable.
     pub fn has_core_pmu(&self) -> bool {
+        #[cfg(windows)]
+        return false;
+        #[cfg(unix)]
         exists(&[&self.root, "/sys/bus/event_source/devices/power_core/type"])
     }
 
@@ -1697,7 +1758,7 @@ impl Sens {
     pub fn ndrivers(&self) -> usize {
         let mut v: Vec<&str> = Vec::new();
         for s in &self.srcs {
-            if s.kind == S_HWMON || s.kind == S_ZONES {
+            if s.kind == S_HWMON || s.kind == S_ZONES || s.kind > S_BMC {
                 let c = s.chip.split("_0").next().unwrap_or("");
                 if !v.contains(&c) {
                     v.push(c);
@@ -1744,9 +1805,12 @@ impl Sens {
 
 // ── cpuview --setup-sensors ─────────────────────────────────────────────────
 
+#[cfg(unix)]
 const UDEV_RULE: &str = "/etc/udev/rules.d/70-cpuview-rapl.rules";
+#[cfg(unix)]
 const BMC_RULE: &str = "/etc/udev/rules.d/70-cpuview-ipmi.rules";
 
+#[cfg(unix)]
 /// The `--bmc` step for user `u`: what it does and why, then the commands.
 fn bmc_step(u: &str) -> String {
     [
@@ -1765,6 +1829,7 @@ fn bmc_step(u: &str) -> String {
 
 /// This user's login name, if it is a plain one (it goes into a shell command and a
 /// udev rule).
+#[cfg(unix)]
 fn user_name() -> Option<String> {
     let pw = unsafe { libc::getpwuid(libc::getuid()) };
     if pw.is_null() {
@@ -1775,6 +1840,7 @@ fn user_name() -> Option<String> {
 }
 
 /// The RAPL zones' energy_uj files whose readability (by others) is `readable`.
+#[cfg(unix)]
 fn rapl_files(readable: bool) -> String {
     let mut v = String::new();
     for z in list("/sys/class/powercap") {
@@ -1788,6 +1854,7 @@ fn rapl_files(readable: bool) -> String {
     v
 }
 
+#[cfg(unix)]
 fn has_cap(exe: &str) -> bool {
     unsafe { libc::getxattr(pb(&[exe]).b.as_ptr() as *const _, c"security.capability".as_ptr(), std::ptr::null_mut(), 0) > 0 }
 }
@@ -1795,6 +1862,7 @@ fn has_cap(exe: &str) -> bool {
 /// `cpuview --setup-sensors [--undo] [--per-core] [--bmc] [--dry-run]`: show the
 /// shell commands it would run as root (each step with what it changes and why),
 /// ask, then run exactly those with sudo. Returns the exit code.
+#[cfg(unix)]
 pub fn setup(undo: bool, per_core: bool, bmc: bool, dry: bool) -> i32 {
     let exe = std::fs::read_link("/proc/self/exe").map_or("cpuview".into(), |p| p.to_string_lossy().into_owned());
     let mut sh = String::new();
@@ -1912,6 +1980,6 @@ pub fn setup(undo: bool, per_core: bool, bmc: bool, dry: bool) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "sensors_test.rs"]
 mod tests;

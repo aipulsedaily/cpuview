@@ -36,9 +36,9 @@ pub fn prof<T>(k: usize, f: impl FnOnce() -> T) -> T {
     if !cfg!(feature = "prof") || unsafe { !ON } {
         return f();
     }
-    let t0 = term::now_ns(libc::CLOCK_THREAD_CPUTIME_ID);
+    let t0 = term::now_ns(term::CLOCK_THREAD_CPUTIME_ID);
     let r = f();
-    unsafe { PROF[k] += term::now_ns(libc::CLOCK_THREAD_CPUTIME_ID) - t0 };
+    unsafe { PROF[k] += term::now_ns(term::CLOCK_THREAD_CPUTIME_ID) - t0 };
     r
 }
 

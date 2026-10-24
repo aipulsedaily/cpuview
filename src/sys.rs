@@ -1,8 +1,16 @@
 //! CPU topology and sampling: /proc/stat, cpufreq, hwmon, all through persistent file
 //! descriptors read with pread() into preallocated buffers (no allocation per sample).
 
+// (the Linux parsers stay compiled, and tested, on Windows too)
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+#[cfg(unix)]
 use std::ffi::CString;
 use std::os::raw::c_int;
+
+/// The Windows sources (counters and system calls instead of /proc and sysfs).
+#[cfg(windows)]
+#[path = "win/cpu.rs"]
+pub(crate) mod win;
 
 pub const SYS: &str = "/sys/devices/system/cpu";
 pub const HIST: usize = 1024;
@@ -196,11 +204,24 @@ pub fn parse_list(s: &str) -> Vec<usize> {
     out
 }
 
+#[cfg(unix)]
 pub fn open_ro(path: &str) -> c_int {
     let Ok(c) = CString::new(path) else { return -1 };
     unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) }
 }
 
+/// (no procfs or sysfs: the Windows sources use handles, see `win`)
+#[cfg(windows)]
+pub fn open_ro(_path: &str) -> c_int {
+    -1
+}
+
+#[cfg(windows)]
+pub fn pread(_fd: c_int, _buf: &mut [u8]) -> usize {
+    0
+}
+
+#[cfg(unix)]
 #[inline]
 pub fn pread(fd: c_int, buf: &mut [u8]) -> usize {
     if fd < 0 {
@@ -298,6 +319,7 @@ pub struct Topo {
     pub has_freq: bool,
 }
 
+#[cfg(unix)]
 fn cpu_model() -> String {
     let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     for key in ["model name", "Model", "Hardware", "cpu model", "Processor"] {
@@ -315,6 +337,12 @@ fn cpu_model() -> String {
 }
 
 impl Topo {
+    #[cfg(windows)]
+    pub fn detect() -> Topo {
+        win::topo()
+    }
+
+    #[cfg(unix)]
     pub fn detect() -> Topo {
         let mut cpus = read_str(&format!("{SYS}/online"))
             .map(|s| parse_list(&s))
@@ -486,8 +514,18 @@ pub struct Sampler {
     /// SMT sibling of each CPU index (first other thread of the same core)
     sibling: Vec<usize>,
     f_copy: Option<(usize, usize)>,
+    /// Windows: the system calls and counters that stand in for /proc and sysfs
+    #[cfg(windows)]
+    w: win::Cpu,
 }
 
+/// (Windows has no CPU temperature interface: see sensors.rs)
+#[cfg(windows)]
+fn find_sensors() -> Vec<Sensor> {
+    Vec::new()
+}
+
+#[cfg(unix)]
 fn find_sensors() -> Vec<Sensor> {
     let mut out = Vec::new();
     let wanted = [
@@ -649,6 +687,8 @@ impl Sampler {
             freq_rr: 0,
             sibling: Vec::new(),
             f_copy: None,
+            #[cfg(windows)]
+            w: win::Cpu::new(&t),
             t,
         };
         // size the /proc/stat buffer once (it can be large on many-CPU machines)
@@ -683,6 +723,12 @@ impl Sampler {
         s
     }
 
+    #[cfg(windows)]
+    fn read_stat(&mut self) {
+        self.w.times(&mut self.cur);
+    }
+
+    #[cfg(unix)]
     fn read_stat(&mut self) {
         let mut n = pread(self.stat_fd, &mut self.stat_buf);
         if n == self.stat_buf.len() {
@@ -698,6 +744,13 @@ impl Sampler {
     /// for at least 3% of the load window are read every sample; barely-busy ones are
     /// read round-robin (a quarter per sample) and fully idle ones show their
     /// minimum clock, which is what scaling_cur_freq reports for them anyway.
+    /// (Windows: one counter collection for all of them, see win::Cpu::clocks)
+    #[cfg(windows)]
+    fn read_freq(&mut self) {
+        self.w.clocks(&self.ur, &mut self.fr, &mut self.t);
+    }
+
+    #[cfg(unix)]
     fn read_freq(&mut self) {
         let mut buf = [0u8; 24];
         let n = self.freq_fds.len();
@@ -909,7 +962,15 @@ impl Sampler {
         }
     }
 
+    /// Load average (Windows: estimated, see win::Cpu::loadavg).
+    #[cfg(windows)]
+    pub fn read_slow(&mut self) {
+        let busy = self.tot_r * self.cur.len() as f32;
+        self.w.loadavg(busy, crate::term::mono(), &mut self.loadavg);
+    }
+
     /// Load average (the kernel updates it every 5 s).
+    #[cfg(unix)]
     pub fn read_slow(&mut self) {
         let mut buf = [0u8; 64];
         let n = pread(self.loadavg_fd, &mut buf);
@@ -919,7 +980,14 @@ impl Sampler {
         }
     }
 
+    /// The power plan (Windows has no governor or EPP).
+    #[cfg(windows)]
+    pub fn read_policy(&mut self) {
+        self.w.policy(&mut self.gov);
+    }
+
     /// Governor and EPP (rarely change; persistent fds, compared before allocating).
+    #[cfg(unix)]
     pub fn read_policy(&mut self) {
         let mut buf = [0u8; 64];
         for (fd, dst, dflt) in [
@@ -1216,6 +1284,8 @@ impl Sampler {
             freq_rr: 0,
             sibling: vec![usize::MAX; n],
             f_copy: None,
+            #[cfg(windows)]
+            w: win::Cpu::none(),
         }
     }
     fn parse_stat_buf(&mut self, n: usize) {

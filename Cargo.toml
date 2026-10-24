@@ -16,10 +16,42 @@ images = ["dep:zune-jpeg", "dep:zune-png", "dep:zune-core"]
 prof = []
 
 [dependencies]
-libc = "0.2"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"], optional = true }
 zune-png = { version = "0.5", default-features = false, features = ["std"], optional = true }
 zune-core = { version = "0.5", default-features = false, features = ["std"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# raw Win32 bindings (no wrappers): the console, the samplers' system calls
+[target.'cfg(windows)'.dependencies]
+windows-link = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Wdk_System_SystemInformation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+]
 
 [profile.release]
 opt-level = "z"

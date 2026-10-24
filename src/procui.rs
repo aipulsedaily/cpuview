@@ -1380,7 +1380,7 @@ impl App {
         m += &g.label;
         if bad > 0 {
             m += nf(": ", bad, " failed: ").s();
-            m += if g.kind == 1 && err == libc::EACCES {
+            m += if g.kind == 1 && err == procs::EACCES {
                 "only root can raise a priority (lower nice)"
             } else {
                 procs::why(err)
@@ -1883,7 +1883,7 @@ impl App {
             Self::line(scr, ir.x, y, ir.x + ir.w, surf(S_PANEL), &[]);
             return;
         };
-        let now_s = (crate::term::now_ns(libc::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
+        let now_s = (crate::term::now_ns(crate::term::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
         let ag = age(now_s.saturating_sub((p.start as f32 / d.hz) as u64));
         let group = agg.is_some();
         let (rd, wr, noio, iok, thr, n) = match agg {
@@ -2059,7 +2059,7 @@ impl App {
         };
         let agg = self.pv.aggs.get((row.g as usize).wrapping_sub(1));
         let det = &self.pv.det;
-        let now_s = (crate::term::now_ns(libc::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
+        let now_s = (crate::term::now_ns(crate::term::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
         let age_s = now_s.saturating_sub((p.start as f32 / d.hz) as u64);
         let charts = ir.h >= 6 && ir.w >= 40;
         let tr = d.tracked(p.pid, p.start);
@@ -2514,6 +2514,7 @@ mod tests {
     /// A fake /proc: what a hidepid=2 mount shows a user (only their processes), an
     /// unreadable process, a zombie, a kernel thread, odd names, a very long command
     /// line. The real scanner reads it; the page draws it.
+    #[cfg(unix)]
     #[test]
     fn restricted_proc_fixture() {
         let dir = std::env::temp_dir().join(format!("cpuview-proc-{}", std::process::id()));

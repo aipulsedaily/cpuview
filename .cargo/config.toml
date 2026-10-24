@@ -1,0 +1,4 @@
+# Windows: the C runtime linked into cpuview.exe, so it runs without the Visual C++
+# redistributable
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
