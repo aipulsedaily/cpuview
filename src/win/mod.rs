@@ -220,6 +220,12 @@ unsafe fn wstr<'a>(p: *const u16, len: u16) -> &'a [u16] {
     }
 }
 
+/// The image name ends in ".exe" (the kernel's own processes have none).
+pub fn is_exe(w: &[u16]) -> bool {
+    let n = w.len();
+    n > 4 && w[n - 4] == b'.' as u16 && w[n - 3..].iter().zip(b"exe").all(|(&c, &e)| c | 0x20 == e as u16)
+}
+
 /// A program's name for display: the image name without ".exe" (pid 0 is "Idle").
 pub fn prog_name(w: &[u16], pid: u32) -> String {
     if w.is_empty() {
