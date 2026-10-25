@@ -7,8 +7,11 @@
 //! prompt), and that does everything in places only administrators may write: a SYSTEM
 //! service must never run a program from a folder the user can change. The modules
 //! come from PawnIO.Modules' release, pinned by SHA-256 (the driver checks their
-//! signatures too); its log is in %ProgramData%\cpuview (never a path the user
-//! passes: an elevated program writing there could be made to overwrite any file).
+//! signatures too). Where things go never comes from the user's environment, which
+//! the elevated run inherits (Program Files from the registry, System32 from Windows),
+//! and its log is in the program's folder there: never anywhere a user may create
+//! files or links (%ProgramData%'s default lets them), which an elevated program
+//! could be made to overwrite any file through.
 
 use super::svc::{self, SERVICE};
 use super::*;
@@ -16,7 +19,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{GetLastError, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
+use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 use windows_sys::Win32::System::Services::*;
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
@@ -28,18 +33,26 @@ const MODULES: [(&str, &str); 2] = [
     ("AMDFamily17.bin", "dae74615761b78bdf064dfb3e136252ddcc6fc727d88f14738d0e5800d427a91"),
 ];
 
+/// %ProgramFiles%\cpuview, Program Files as the registry has it (only administrators
+/// may change that; the environment variable is the user's).
 fn program_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into())).join("cpuview")
+    let pf = reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "ProgramFilesDir").unwrap_or_else(|| "C:\\Program Files".into());
+    PathBuf::from(pf).join("cpuview")
 }
 
-/// A program of Windows' own (System32): never one found on the PATH, which runs
-/// elevated through folders the user may write.
+/// A program of Windows' own (System32, as Windows says): never one found on the
+/// PATH, which runs elevated through folders the user may write.
 fn system32(exe: &str) -> PathBuf {
-    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("System32").join(exe)
+    let mut b = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(b.as_mut_ptr(), b.len() as u32) } as usize;
+    let dir = if n > 0 && n < b.len() { String::from_utf16_lossy(&b[..n]) } else { "C:\\Windows\\System32".into() };
+    PathBuf::from(dir).join(exe)
 }
 
+/// The elevated install's log, in the program's folder (only administrators may
+/// write there).
 fn log_path() -> PathBuf {
-    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into())).join("cpuview").join("setup.log")
+    program_dir().join("setup.log")
 }
 
 /// `cpuview --setup-sensors [--undo] [--dry-run]`.
@@ -105,13 +118,23 @@ Web Server on (port 8085); cpuview reads it, also when it starts later."
         return 1;
     }
     let code = run_elevated(if undo { "--setup-sensors --undo --elevated" } else { "--setup-sensors --elevated" });
-    if let Ok(log) = std::fs::read_to_string(log_path()) {
-        print!("{log}");
+    if !undo {
+        if let Ok(log) = std::fs::read_to_string(log_path()) {
+            print!("{log}");
+        }
     }
     match code {
         Some(0) => {
             println!("{}", if undo { "Removed." } else { "Done: cpuview shows CPU temperatures now (on the CPU and Sensors & Power pages)." });
             0
+        }
+        Some(U_SERVICE) => {
+            println!("The {SERVICE} service couldn't be removed.");
+            U_SERVICE as i32
+        }
+        Some(U_FILES) => {
+            println!("The service is gone, but {} couldn't be removed (in use?).", program_dir().display());
+            U_FILES as i32
         }
         Some(c) => {
             println!("It didn't finish (code {c}).");
@@ -148,18 +171,20 @@ fn run_elevated(args: &str) -> Option<u32> {
     Some(code)
 }
 
-/// The elevated part: install or remove, its steps logged.
+/// The elevated part: install (its steps logged) or remove (what failed in its exit
+/// code: the folder the log would be in goes).
 fn elevated(undo: bool) -> i32 {
-    let lp = log_path();
-    let _ = std::fs::create_dir_all(lp.parent().unwrap_or(Path::new(".")));
-    let mut log = std::fs::File::create(&lp).ok();
+    if undo {
+        return remove() as i32;
+    }
+    let _ = std::fs::create_dir_all(program_dir());
+    let mut log = std::fs::File::create(log_path()).ok();
     let mut say = |s: &str| {
         if let Some(f) = log.as_mut() {
             let _ = writeln!(f, "{s}");
         }
     };
-    let r = if undo { remove(&mut say) } else { install(&mut say) };
-    match r {
+    match install(&mut say) {
         Ok(()) => 0,
         Err(e) => {
             say(&["failed: ", &e].concat());
@@ -265,7 +290,12 @@ fn install(say: &mut dyn FnMut(&str)) -> Result<(), String> {
     Ok(())
 }
 
-fn remove(say: &mut dyn FnMut(&str)) -> Result<(), String> {
+/// `--undo`'s exit codes: the service, or the folder, couldn't be removed
+const U_SERVICE: u32 = 4;
+const U_FILES: u32 = 5;
+
+/// Stop and delete the service, then its folder: 0, or what failed.
+fn remove() -> u32 {
     let mut gone = true;
     service(|s| {
         let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
@@ -274,15 +304,13 @@ fn remove(say: &mut dyn FnMut(&str)) -> Result<(), String> {
         gone = unsafe { DeleteService(s) } != 0;
     });
     if !gone {
-        return Err(["removing the ", SERVICE, " service failed"].concat());
+        return U_SERVICE;
     }
-    say(&["service ", SERVICE, ": removed"].concat());
     let dir = program_dir();
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        say(&["removed ", &dir.to_string_lossy()].concat());
+    if dir.exists() && std::fs::remove_dir_all(&dir).is_err() {
+        return U_FILES;
     }
-    Ok(())
+    0
 }
 
 /// Run `f` on the service, if it is installed.
@@ -323,6 +351,15 @@ fn sha256_file(p: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where things go: from the registry and Windows, whatever the environment says.
+    #[test]
+    fn places() {
+        let (pd, tar) = (program_dir(), system32("tar.exe"));
+        assert!(pd.is_absolute() && pd.ends_with("cpuview"), "{}", pd.display());
+        assert_eq!(log_path().parent(), Some(pd.as_path()));
+        assert!(tar.is_absolute() && tar.exists(), "{}", tar.display());
+    }
 
     #[test]
     fn hashes() {
