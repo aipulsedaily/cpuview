@@ -884,6 +884,38 @@ What makes that possible:
   animation frames redraw only what moved (memo keys per panel and per card row) and never
   send picture data.
 
+**On Windows** (i9-13900K, Windows 11 on the Balanced plan, a busy desktop: ~620
+processes and 15 000 threads; 128×45 in a pseudo console that is read continuously; 60 s
+windows, eco after a minute's warm-up). CPU time is the process's exact cycle count
+(QueryProcessCycleTime); GetProcessTimes is in brackets: it moves in 15.6 ms ticks, so
+eco's ~3–5 ms a minute reads 0 (one tick in a minute would be 260 µs/s), and a smooth
+minute reads anywhere from 0.7× to 2× the cycle count:
+
+| page | eco (3 windows) | smooth (2 windows) | smooth output |
+|---|---|---|---|
+| overview | 39–76 µs/s (0) | 3.3–4.3 ms/s (3.1–6.8) | 9–10 KB/s |
+| CPU | 60–66 µs/s (0) | 3.3–3.5 ms/s (5.2–5.5) | 51–52 KB/s |
+| memory & storage | 53–68 µs/s (0) | 2.9–3.6 ms/s (2.6–7.6) | 1.6 KB/s |
+| network | 55–79 µs/s (0) | 3.7–3.8 ms/s (4.2–6.3) | 8 KB/s |
+| processes | 5–79 µs/s (0) | 3.3–4.5 ms/s (4.9–5.2) | 23–41 KB/s |
+| sensors | 43–58 µs/s (0) | 2.5–2.6 ms/s (4.7–5.7) | 0.2 KB/s |
+
+The same work costs more CPU time when Windows has the core clocked down: in one hour
+with the clocks low, smooth measured up to 7–8 ms/s on the overview and processes pages
+(the frame-rate governor had halved the frame rate twice).
+
+The budget is the same as on Linux, but a sample costs more there (the console, the
+clocks' performance counters, process and socket tables that walk the whole system), so
+eco updates every ~5 s on the CPU page and every ~15–60 s on the others; the processes
+page, whose sample is the dearest, now and then waits a minute or two. The eco budget
+counts the main thread's exact cycles (QueryThreadCycleTime: 0.1 µs to read) and adds the
+other threads' once a minute where the budget is charged (QueryProcessCycleTime costs
+50–150 µs). The full process list walks every thread of every process — 16 ms with
+15 000 threads — so it is read when a page that needs it is entered (and outside eco now
+and then); in between the basic list (pids and names, ~0.1–0.4 ms) and process handles
+kept open keep it current. The working set is 8–11 MB (the performance counter library
+is ~5 MB of it).
+
 ## Notes
 
 - Clock speeds come from cpufreq (`scaling_cur_freq`), like the Python version.

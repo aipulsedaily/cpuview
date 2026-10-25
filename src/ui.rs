@@ -1661,7 +1661,7 @@ impl App {
         let spd_long = match SPEEDS[self.speed] {
             // (Windows: its system calls and console cost more a sample, the budget is
             // the same)
-            (_, 0) if cfg!(windows) => f!(" · eco: every few s"),
+            (_, 0) if cfg!(windows) => f!(" · eco: every 5–60 s"),
             (_, 0) => f!(" · eco: every 1–2 s"),
             _ if self.speed == SMOOTH => f!(" · smooth: 60 fps"),
             (_, n) => f!(" · {n} updates/s"),
