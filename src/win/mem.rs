@@ -365,8 +365,10 @@ impl Mem {
     /// Drop the scans' scratch memory (the overview scans rarely); the handles and
     /// names stay (they are what the next scan starts from).
     pub fn shrink(&mut self) {
-        self.w.list.release();
-        self.w.pending = false;
+        // (a list read for the next scan stays)
+        if !self.w.pending {
+            self.w.list.release();
+        }
         self.all = Vec::new();
         for g in &mut self.groups {
             g.name.shrink_to_fit();
