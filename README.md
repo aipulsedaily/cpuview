@@ -76,16 +76,19 @@ with Visual Studio's C++ build tools).
 
 **What Windows can and can't show.** CPU load per thread, the clocks the cores really run at,
 cores and their threads (P- and E-cores), the power plan, RAM and the page file, disks,
-volumes, the network, processes (end, suspend, resume, priority), the battery, NVMe drives'
-temperatures and the firmware's ACPI thermal zones all come from Windows itself. CPU
-temperatures, fans, voltages and CPU / GPU power don't: Windows has no interface for them
-without a kernel driver, and cpuview loads none. Run
+volumes, the network, processes (end, suspend, resume, priority), the CPU's power (package,
+cores and, where the CPU counts them, its built-in GPU and RAM: Windows' energy meter),
+graphics cards' temperature and fan (any vendor, as Task Manager shows them) and an NVIDIA
+card's watts (NVML, which comes with its driver; ~14 MB of memory), the battery, NVMe
+drives' temperatures and the firmware's ACPI thermal zones all come from Windows itself. CPU
+temperatures, the board's fans (CPU fan, case fans, pump) and voltages don't: Windows has no
+interface for them without a kernel driver, and cpuview loads none. Run
 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) with its
 web server on (Options → Remote Web Server) and cpuview shows them on the Sensors & Power
-page and the CPU page (`cpuview --setup-sensors` explains). Linux-only: containers, systemd
-services, a server board's BMC, per-core RAPL, Ctrl-Z. The load average is an estimate (the
-busy CPUs, decayed like Linux's); processes' read / write counts are all their I/O (disk,
-network and pipes together).
+page and the CPU page, also when it starts after cpuview (`cpuview --setup-sensors`
+explains). Linux-only: containers, systemd services, a server board's BMC, per-core RAPL,
+Ctrl-Z. The load average is an estimate (the busy CPUs, decayed like Linux's); processes'
+read / write counts are all their I/O (disk, network and pipes together).
 
 ### From source
 

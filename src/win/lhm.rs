@@ -24,10 +24,12 @@ pub struct Reading {
 }
 
 static SNAP: Mutex<Vec<Reading>> = Mutex::new(Vec::new());
-/// fetches done (a new snapshot), asked for (futex-style word), thread started
+/// fetches done (a new snapshot), asked for (futex-style word), thread started, the
+/// last fetch answered (else the snapshot is empty: LHM was closed)
 static GEN: AtomicU32 = AtomicU32::new(0);
 static ASK: AtomicU32 = AtomicU32::new(0);
 static UP: AtomicBool = AtomicBool::new(false);
+static LIVE: AtomicBool = AtomicBool::new(false);
 /// CPU time (ns) of the helper's last fetch
 pub static COST: AtomicI64 = AtomicI64::new(0);
 
@@ -37,41 +39,37 @@ fn addr() -> String {
 }
 
 /// Something listens on the web server's port of this machine (the TCP listener
-/// table: no connection attempt, which Windows retries for ~2 s when refused).
+/// table of the address's family, ~0.15 ms: no connection attempt, which Windows
+/// retries for ~2 s when refused).
 pub fn listening() -> bool {
     let a = addr();
     let Some(port) = a.rsplit_once(':').and_then(|p| p.1.parse::<u16>().ok()) else {
         return false;
     };
-    if !a.starts_with("127.") && !a.starts_with("localhost") {
+    let v6 = a.starts_with("[::1]");
+    if !a.starts_with("127.") && !a.starts_with("localhost") && !v6 {
         return true;
     }
-    let mut buf = vec![0u8; 65536];
-    for v6 in [false, true] {
-        let af = if v6 { 23 } else { 2 };
-        for _ in 0..3 {
-            let mut size = buf.len() as u32;
-            // TCP_TABLE_BASIC_LISTENER (v4) / OWNER_PID_LISTENER (v6: basic tables are
-            // v4 only)
-            let r = unsafe {
-                windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable(
-                    buf.as_mut_ptr() as *mut _,
-                    &mut size,
-                    0,
-                    af,
-                    if v6 { 3 } else { 0 },
-                    0,
-                )
-            };
-            if r == 122 {
-                buf.resize(size as usize + 4096, 0);
-                continue;
-            }
-            if r == 0 && listening_in(&buf, v6, port) {
-                return true;
-            }
-            break;
+    let mut buf = vec![0u8; 16384];
+    let af = if v6 { 23 } else { 2 };
+    for _ in 0..3 {
+        let mut size = buf.len() as u32;
+        // TCP_TABLE_BASIC_LISTENER (v4) / OWNER_PID_LISTENER (v6: basic tables are v4
+        // only)
+        let r = unsafe {
+            windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+                0,
+                af,
+                if v6 { 3 } else { 0 },
+                0,
+            )
+        };
+        if r != 122 {
+            return r == 0 && listening_in(&buf, v6, port);
         }
+        buf.resize(size as usize + 4096, 0);
     }
     false
 }
@@ -299,9 +297,9 @@ fn main_loop() {
     loop {
         let a = ASK.load(Relaxed);
         let t0 = crate::term::now_ns(crate::term::CLOCK_THREAD_CPUTIME_ID);
-        if let Some(v) = fetch() {
-            *SNAP.lock().unwrap_or_else(|e| e.into_inner()) = v;
-        }
+        let v = fetch();
+        LIVE.store(v.is_some(), Relaxed);
+        *SNAP.lock().unwrap_or_else(|e| e.into_inner()) = v.unwrap_or_default();
         COST.store(crate::term::now_ns(crate::term::CLOCK_THREAD_CPUTIME_ID) - t0, Relaxed);
         GEN.fetch_add(1, Relaxed);
         // until the next request
@@ -323,7 +321,27 @@ pub fn request() {
 
 /// The last snapshot (set directly by a synchronous fetch at detection).
 pub fn set(v: Vec<Reading>) {
+    LIVE.store(true, Relaxed);
     *SNAP.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// The web server answered the last fetch.
+pub fn live() -> bool {
+    LIVE.load(Relaxed)
+}
+
+/// While it isn't there: has it started? At most once a minute for every caller
+/// together (the sensors and the CPU page's temperatures), whether its port is
+/// listened on; if so a fetch is asked for, and `live` says when it answered.
+pub fn look(now: i64) {
+    static LOOKED: AtomicI64 = AtomicI64::new(i64::MIN / 2);
+    if now - LOOKED.load(Relaxed) < 60_000_000_000 {
+        return;
+    }
+    LOOKED.store(now, Relaxed);
+    if listening() {
+        request();
+    }
 }
 
 /// Look at the last snapshot.

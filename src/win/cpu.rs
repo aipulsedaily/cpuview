@@ -144,14 +144,21 @@ fn rated_max() -> f32 {
 /// The CPU's temperatures where LibreHardwareMonitor's web server runs (Windows has
 /// none of its own): the package (Intel), Tctl and the CCDs' (AMD).
 pub fn find_sensors() -> Vec<Sensor> {
-    let mut out = Vec::new();
     if !lhm::listening() {
-        return out;
+        return Vec::new();
     }
     let Some(v) = lhm::fetch() else {
-        return out;
+        return Vec::new();
     };
-    for x in &v {
+    let out = cpu_sensors(&v);
+    lhm::set(v);
+    out
+}
+
+/// The CPU's temperatures among LibreHardwareMonitor's readings.
+fn cpu_sensors(v: &[lhm::Reading]) -> Vec<Sensor> {
+    let mut out = Vec::new();
+    for x in v {
         if let (true, Some(l)) = (x.typ == "Temperature" && x.hwid.contains("cpu"), cpu_temp_label(&x.text)) {
             if !out.iter().any(|s: &Sensor| s.label == l) {
                 out.push(Sensor {
@@ -164,7 +171,6 @@ pub fn find_sensors() -> Vec<Sensor> {
             }
         }
     }
-    lhm::set(v);
     out
 }
 
@@ -479,8 +485,25 @@ impl Cpu {
 
     /// The CPU temperatures from LibreHardwareMonitor's last snapshot; a fresh one is
     /// asked for every 2 s (`all`: smooth) or 30 s (its parse costs a few hundred µs).
-    pub fn lhm_temps(&mut self, temps: &mut [Sensor], all: bool) {
+    ///
+    /// LibreHardwareMonitor may start after cpuview, or close: while there are none,
+    /// whether it started is looked at now and then (lhm::look), and the
+    /// temperatures come from the helper's first snapshot; they go when it stops
+    /// answering.
+    pub fn lhm_temps(&mut self, temps: &mut Vec<Sensor>, all: bool) {
         let now = crate::term::mono();
+        if temps.is_empty() {
+            if lhm::live() {
+                *temps = lhm::with(cpu_sensors);
+            } else {
+                lhm::look(now);
+            }
+            return;
+        }
+        if !lhm::live() {
+            temps.clear();
+            return;
+        }
         if now - self.lhm_t >= if all { 2 } else { 30 } * 1_000_000_000 {
             self.lhm_t = now;
             lhm::request();

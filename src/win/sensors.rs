@@ -1,39 +1,60 @@
 //! Sensors on Windows (the Windows half of sensors.rs). Windows has no user-mode
-//! interface for CPU temperatures, fans, voltages or CPU power, and cpuview loads no
-//! kernel driver; what it reads:
+//! interface for CPU temperatures, fans on the board or voltages, and cpuview loads
+//! no kernel driver; what it reads:
+//! - the CPU's power (package, cores, built-in GPU, RAM where the CPU counts them)
+//!   from Windows' energy meter (PDH "Energy Meter": the RAPL counters, no driver),
+//! - graphics cards' temperature and fan (Windows' GPU statistics, as Task Manager
+//!   shows them, any vendor) and NVIDIA cards' watts (NVML, which comes with the
+//!   driver),
 //! - the battery and mains (GetSystemPowerStatus; watts from the battery's IOCTLs),
 //! - the firmware's ACPI thermal zones (PDH "Thermal Zone Information": often a fixed
 //!   or board value, so never called the CPU's),
 //! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence),
-//! - LibreHardwareMonitor's readings when it runs with its web server (see win/lhm.rs):
-//!   CPU, GPU and board temperatures, fans, voltages, CPU package power.
+//! - LibreHardwareMonitor's readings while it runs with its web server (see
+//!   win/lhm.rs): CPU and board temperatures, fans, pump, voltages; looked for while
+//!   cpuview runs, as it may start later or close.
 
 use super::*;
-use crate::win::{close, fd2h, from_pwstr, h2fd, lhm, reg_str, wide};
+use crate::win::{close, fd2h, from_pwstr, from_wide, h2fd, lhm, reg_str, wide};
+use windows_sys::Wdk::Graphics::Direct3D::*;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Ioctl::*;
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::*;
 use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
-/// Windows sources (beyond S_BAT): ACPI zones, a drive, LibreHardwareMonitor
+/// Windows sources (beyond S_BAT): ACPI zones, a drive, LibreHardwareMonitor, the
+/// energy meter, a graphics card
 pub(super) const S_ACPI: u8 = 6;
 pub(super) const S_DRIVE: u8 = 7;
 pub(super) const S_LHM: u8 = 8;
+pub(super) const S_EMI: u8 = 9;
+pub(super) const S_GPU: u8 = 10;
 
-/// What the Windows sources keep: the thermal zones' query, LHM sensor ids by
-/// reading, the snapshot last copied.
+/// NVML's power reading: device, milliwatts
+type NvPower = unsafe extern "C" fn(usize, *mut u32) -> i32;
+
+/// What the Windows sources keep: the thermal zones' query, the energy meter's
+/// query (energy, time), the graphics cards (D3DKMT handle, NVML device or 0), LHM
+/// sensor ids by reading, the snapshot last copied, since when LHM hasn't answered.
 pub struct State {
     zq: PDH_HQUERY,
     zc: PDH_HCOUNTER,
     zarr: Vec<u64>,
     /// tenths of a kelvin ("High Precision Temperature") or kelvin
     ztenths: bool,
+    eq: PDH_HQUERY,
+    ec: [PDH_HCOUNTER; 2],
+    earr: Vec<u64>,
+    gpus: Vec<(u32, usize)>,
+    nv_power: Option<NvPower>,
     lhm_id: Vec<(usize, String)>,
     lhm_gen: u32,
+    lhm_gone: Option<i64>,
 }
 
 impl State {
@@ -43,10 +64,21 @@ impl State {
             zc: std::ptr::null_mut(),
             zarr: Vec::new(),
             ztenths: false,
+            eq: std::ptr::null_mut(),
+            ec: [std::ptr::null_mut(); 2],
+            earr: Vec::new(),
+            gpus: Vec::new(),
+            nv_power: None,
             lhm_id: Vec::new(),
             lhm_gen: 0,
+            lhm_gone: None,
         }
     }
+}
+
+/// The hint while LibreHardwareMonitor isn't running (sensui.rs: kind 4).
+fn lhm_hint() -> Option<(String, u8)> {
+    Some(("LibreHardwareMonitor".into(), 4))
 }
 
 fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
@@ -123,17 +155,76 @@ impl Sens {
         self.board = if model.is_empty() { String::new() } else { [&vendor, " ", model].concat() };
         self.vm = is_vm(&[&sv, " ", &pn].concat().to_ascii_lowercase());
         self.zones();
+        self.emi();
+        self.gpus();
         self.drives();
-        self.lhm();
+        self.lhm(true);
         self.batteries();
         self.finish_names();
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
-        if !self.rd.iter().any(|r| r.kind == K_FAN) && !self.vm {
-            self.fan_hint = Some(("LibreHardwareMonitor".into(), 4));
+        if !self.vm && !self.srcs.iter().any(|s| s.kind == S_LHM) {
+            self.fan_hint = lhm_hint();
         }
         for i in 0..self.srcs.len() {
             self.read_src(i, now);
         }
+    }
+
+    /// LibreHardwareMonitor started or closed since detection: its readings added
+    /// when it first answers (from the helper's snapshot, asked for after its server
+    /// was seen listening: lhm::look), and dropped, the hint back, when it hasn't
+    /// answered for 20 s (they keep their last values until then).
+    pub(super) fn win_tick(&mut self, now: i64) {
+        if self.vm {
+            return;
+        }
+        if let Some(s) = self.srcs.iter().position(|s| s.kind == S_LHM) {
+            if lhm::live() {
+                self.w.lhm_gone = None;
+            } else if now - *self.w.lhm_gone.get_or_insert(now) >= 20 * SEC {
+                self.w.lhm_gone = None;
+                self.drop_src(s);
+                self.fan_hint = lhm_hint();
+            }
+            return;
+        }
+        if !lhm::live() {
+            // (the main loop's time, charged as such: not part of the sensors' plan)
+            lhm::look(now);
+            return;
+        }
+        let (t0, n, hists) = (thread_ns(), self.srcs.len(), self.rd.iter().any(|r| r.hist.is_some()));
+        self.lhm(false);
+        if self.srcs.len() > n {
+            self.finish_names();
+            self.hists(hists);
+            self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
+            self.fan_hint = None;
+            self.spent += (thread_ns() - t0).max(0);
+            self.read_src(n, now);
+        }
+    }
+
+    /// Source `s` and its readings gone (LibreHardwareMonitor closed): the indices
+    /// after them move down.
+    fn drop_src(&mut self, s: usize) {
+        let gone: Vec<bool> = self.rd.iter().map(|r| r.src as usize == s).collect();
+        for b in &mut self.bats {
+            b.rd -= gone[..b.rd].iter().filter(|&&g| g).count();
+        }
+        let mut k = 0;
+        self.rd.retain(|_| {
+            k += 1;
+            !gone[k - 1]
+        });
+        for r in &mut self.rd {
+            if r.src as usize > s {
+                r.src -= 1;
+            }
+        }
+        self.srcs.remove(s);
+        self.w.lhm_id.clear();
+        self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
     }
 
     /// The firmware's thermal zones (one PDH query for all of them).
@@ -198,6 +289,142 @@ impl Sens {
         }
     }
 
+    /// Windows' energy meter: the CPU's RAPL counters as Windows reads them (Intel,
+    /// and AMD where it has them), no driver needed. Watts are the energy (EMI's
+    /// unit: picowatt-hours) over the counter's own clock (ms), as its "Power"
+    /// counter (mW) has them; domains the CPU lacks read 0 since boot and are left
+    /// out.
+    fn emi(&mut self) {
+        let w = &mut self.w;
+        unsafe {
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut w.eq) != 0 {
+                return;
+            }
+            let ok = PdhAddEnglishCounterW(w.eq, wide("\\Energy Meter(*)\\Energy").as_ptr(), 0, &mut w.ec[0]) == 0
+                && PdhAddEnglishCounterW(w.eq, wide("\\Energy Meter(*)\\Time").as_ptr(), 0, &mut w.ec[1]) == 0;
+            if !ok || PdhCollectQueryData(w.eq) != 0 {
+                PdhCloseQuery(w.eq);
+                w.eq = std::ptr::null_mut();
+                return;
+            }
+        }
+        let mut found = Vec::new();
+        self.emi_values(&mut |n, e, _| {
+            if e > 0 && !n.eq_ignore_ascii_case("_Total") {
+                found.push(n.to_string());
+            }
+        });
+        if found.is_empty() {
+            return;
+        }
+        let s = self.src("Energy Meter", "EMI", "Windows' energy meter (RAPL)", "", S_EMI, C_POWER, G_CPU);
+        for (k, n) in found.iter().enumerate() {
+            let l = n.to_ascii_lowercase();
+            let (role, g, pn) = if l.ends_with("_pkg") {
+                (R_PKG, G_CPU, "CPU package")
+            } else if l.ends_with("_pp0") {
+                (R_CORES, G_CPU, "cores")
+            } else if l.ends_with("_pp1") {
+                (R_UNCORE, G_GPU, "GPU (built-in)")
+            } else if l.ends_with("_dram") {
+                (R_DRAM, G_MEM, "memory (RAM)")
+            } else if l.contains("psys") || l.contains("platform") {
+                (R_PSYS, G_OTHER, "whole computer")
+            } else {
+                (R_OTHER, G_OTHER, n.as_str())
+            };
+            let mut r = rd(K_POWER, s, g, k as c_int, n, pn);
+            r.role = role;
+            // (1 pWh = 3.6 nJ)
+            r.ctr = Some(Ctr { scale: 3.6e-9, ..Default::default() });
+            self.add(s, r);
+        }
+    }
+
+    /// Each energy meter's name, energy (pJ) and time (ms): one collection.
+    fn emi_values(&mut self, f: &mut dyn FnMut(&str, u64, i64)) {
+        let w = &mut self.w;
+        if w.eq.is_null() || unsafe { PdhCollectQueryData(w.eq) } != 0 {
+            return;
+        }
+        let mut v: [Vec<(String, i64)>; 2] = Default::default();
+        // (a real buffer from the start: the raw array call writes to it even when
+        // only asked for its size)
+        if w.earr.is_empty() {
+            w.earr = vec![0u64; 256];
+        }
+        for (k, out) in v.iter_mut().enumerate() {
+            let (mut size, mut n) = ((w.earr.len() * 8) as u32, 0u32);
+            let mut r = unsafe { PdhGetRawCounterArrayW(w.ec[k], &mut size, &mut n, w.earr.as_mut_ptr() as *mut _) };
+            if r == PDH_MORE_DATA {
+                w.earr = vec![0u64; (size as usize).div_ceil(8) + 16];
+                size = (w.earr.len() * 8) as u32;
+                r = unsafe { PdhGetRawCounterArrayW(w.ec[k], &mut size, &mut n, w.earr.as_mut_ptr() as *mut _) };
+            }
+            if r != 0 {
+                return;
+            }
+            let it = unsafe { std::slice::from_raw_parts(w.earr.as_ptr() as *const PDH_RAW_COUNTER_ITEM_W, n as usize) };
+            *out = it.iter().map(|x| (unsafe { from_pwstr(x.szName) }, x.RawValue.FirstValue)).collect();
+        }
+        for (n, e) in &v[0] {
+            if let Some(t) = v[1].iter().find(|x| x.0 == *n) {
+                f(n, *e as u64, t.1);
+            }
+        }
+    }
+
+    /// Graphics cards: temperature and fan from Windows' own GPU statistics (what
+    /// Task Manager shows; any vendor's driver, WDDM 2.4 and later), with the card's
+    /// own limits; watts from NVML on NVIDIA's (the card on the same PCI bus).
+    fn gpus(&mut self) {
+        let mut e = D3DKMT_ENUMADAPTERS2::default();
+        if unsafe { D3DKMTEnumAdapters2(&mut e) } < 0 || e.NumAdapters == 0 {
+            return;
+        }
+        let mut v = vec![unsafe { std::mem::zeroed::<D3DKMT_ADAPTERINFO>() }; e.NumAdapters as usize];
+        e.pAdapters = v.as_mut_ptr();
+        if unsafe { D3DKMTEnumAdapters2(&mut e) } < 0 {
+            return;
+        }
+        let mut cards = Vec::new();
+        for a in &v[..e.NumAdapters as usize] {
+            let mut pd: D3DKMT_ADAPTER_PERFDATA = unsafe { std::mem::zeroed() };
+            let mut caps = D3DKMT_ADAPTER_PERFDATACAPS::default();
+            if kmt(a.hAdapter, KMTQAITYPE_ADAPTERPERFDATA, &mut pd) && kmt(a.hAdapter, KMTQAITYPE_ADAPTERPERFDATA_CAPS, &mut caps) && (pd.Temperature > 0 || caps.MaxFanRPM > 0) {
+                let mut reg: D3DKMT_ADAPTERREGISTRYINFO = unsafe { std::mem::zeroed() };
+                kmt(a.hAdapter, KMTQAITYPE_ADAPTERREGISTRYINFO, &mut reg);
+                let mut at = D3DKMT_ADAPTERADDRESS { BusNumber: u32::MAX, DeviceNumber: 0, FunctionNumber: 0 };
+                kmt(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut at);
+                cards.push((a.hAdapter, from_wide(&reg.AdapterString), at.BusNumber, caps));
+            } else {
+                unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter }) };
+            }
+        }
+        let nv = if cards.iter().any(|c| c.1.starts_with("NVIDIA")) { nvml() } else { None };
+        self.w.nv_power = nv.as_ref().map(|n| n.0);
+        let one = cards.len() == 1;
+        for (k, (h, name, bus, caps)) in cards.into_iter().enumerate() {
+            let what = if name.is_empty() { "graphics card".to_string() } else { name.clone() };
+            let s = self.src("gpu", "WDDM", &what, &["PCI bus ", &n2s(bus)].concat(), S_GPU, 2, G_GPU);
+            let label = |w: &str| if one || name.is_empty() { w.to_string() } else { [w, " (", &name, ")"].concat() };
+            let mut t = rd(K_TEMP, s, G_GPU, k as c_int, "Temperature", &label("GPU"));
+            let lim = |d: u32| (d > 0).then_some(d as i64 * 100);
+            (t.warn, t.crit) = temp_limits(G_GPU, lim(caps.TemperatureWarning), lim(caps.TemperatureMax));
+            self.add(s, t);
+            if caps.MaxFanRPM > 0 {
+                self.add(s, rd(K_FAN, s, G_GPU, k as c_int, "fan", &label("GPU fan")));
+            }
+            let dev = nv.as_ref().and_then(|n| n.1.iter().find(|d| d.0 == bus)).map_or(0, |d| d.1);
+            if dev != 0 {
+                let mut p = rd(K_POWER, s, G_GPU, k as c_int, "NVML", &label("GPU"));
+                p.role = R_GPU;
+                self.add(s, p);
+            }
+            self.w.gpus.push((h, dev));
+        }
+    }
+
     /// NVMe drives that report a temperature: one source each (read slowly).
     fn drives(&mut self) {
         let (g, what, class) = chip_info("nvme");
@@ -226,15 +453,27 @@ impl Sens {
         }
     }
 
-    /// LibreHardwareMonitor's sensors, if its web server answers: its temperatures,
-    /// fans, voltages and power readings, grouped by the hardware they belong to.
-    fn lhm(&mut self) {
-        if !lhm::listening() {
+    /// LibreHardwareMonitor's sensors, if its web server answers (`fetch`: asked now,
+    /// else from the helper's snapshot): its temperatures, fans, voltages and power
+    /// readings, grouped by the hardware they belong to. Not what Windows already
+    /// gives here: the CPU's package / cores / RAM power (the energy meter reads the
+    /// same counters), a card's temperature, fans and power, the drives'.
+    fn lhm(&mut self, fetch: bool) {
+        let v = if !fetch {
+            lhm::with(|v| v.to_vec())
+        } else if lhm::listening() {
+            lhm::fetch().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if v.is_empty() {
             return;
         }
-        let Some(v) = lhm::fetch() else { return };
+        let emi = self.srcs.iter().any(|s| s.kind == S_EMI);
+        let gpus = self.srcs.iter().any(|s| s.kind == S_GPU);
+        let drives = self.srcs.iter().any(|s| s.kind == S_DRIVE);
         let mut s = usize::MAX;
-        let mut gpu = false;
+        let mut gpu = gpus;
         for (k, x) in v.iter().enumerate() {
             let kind = match x.typ.as_str() {
                 "Temperature" => K_TEMP,
@@ -247,10 +486,20 @@ impl Sens {
             if x.text.starts_with("Distance to TjMax") {
                 continue;
             }
+            let g = lhm_group(&x.hwid);
+            let dup = match (g, kind) {
+                (G_CPU, K_POWER) => emi && matches!(x.text.as_str(), "CPU Package" | "Package" | "CPU Cores" | "Cores" | "CPU Memory"),
+                (G_GPU, K_FAN | K_POWER) => gpus,
+                (G_GPU, K_TEMP) => gpus && x.text == "GPU Core",
+                (G_DISK, K_TEMP) => drives,
+                _ => false,
+            };
+            if dup {
+                continue;
+            }
             if s == usize::MAX {
                 s = self.src("LibreHardwareMonitor", "LHM", "LibreHardwareMonitor (web server)", "", S_LHM, 1, G_BOARD);
             }
-            let g = lhm_group(&x.hwid);
             let generic = matches!(x.text.as_str(), "Temperature" | "Composite Temperature" | "Power" | "Fan" | "Total");
             let name = if generic || g == G_GPU && !x.text.starts_with("GPU") { [&x.hw, " ", &x.text].concat() } else { x.text.clone() };
             // (beside the name: the hardware it belongs to; fans keep their own)
@@ -281,7 +530,9 @@ impl Sens {
             self.w.lhm_id.push((self.rd.len(), x.id.clone()));
             self.add(s, r);
         }
-        lhm::set(v);
+        if fetch {
+            lhm::set(v);
+        }
     }
 
     /// The battery (GetSystemPowerStatus) and, where its driver answers, its watts.
@@ -366,6 +617,40 @@ impl Sens {
                     r.val = c.unwrap_or(0.0);
                 }
             }
+            S_EMI => {
+                let mut v = Vec::new();
+                self.emi_values(&mut |n, e, t| v.push((n.to_string(), e, t)));
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
+                    let x = v.iter().find(|x| x.0 == r.raw);
+                    // (the counter's own clock: ms → ns)
+                    if let Some(w) = x.and_then(|x| r.ctr.as_mut()?.update(x.1, x.2 * 1_000_000)) {
+                        (r.val, r.ok, r.seen) = (w, true, true);
+                    } else if x.is_none() {
+                        r.ok = false;
+                    }
+                }
+            }
+            S_GPU => {
+                let Some(k) = self.rd.iter().find(|r| r.src as usize == i).map(|r| r.fd as usize) else { return };
+                let Some(&(h, dev)) = self.w.gpus.get(k) else { return };
+                let mut pd: D3DKMT_ADAPTER_PERFDATA = unsafe { std::mem::zeroed() };
+                let ok = kmt(h, KMTQAITYPE_ADAPTERPERFDATA, &mut pd);
+                let mut mw = 0u32;
+                let watts = (dev != 0 && self.w.nv_power.is_some_and(|f| unsafe { f(dev, &mut mw) } == 0)).then(|| mw as f32 / 1000.0);
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
+                    let v = match r.kind {
+                        K_TEMP => ok.then(|| pd.Temperature as f32 / 10.0).filter(|&c| temp_ok(c, false, None)),
+                        K_FAN => ok.then_some(pd.FanRPM as f32).filter(|v| (0.0..30000.0).contains(v)),
+                        _ => watts,
+                    };
+                    r.ok = v.is_some();
+                    r.val = v.unwrap_or(0.0);
+                    if r.ok && (r.kind != K_FAN || r.val > 0.0) {
+                        r.seen = true;
+                        r.max = r.max.max(r.val);
+                    }
+                }
+            }
             S_LHM => {
                 // the helper's last snapshot, and a fresh one asked for (its cost: the
                 // helper's last fetch)
@@ -375,6 +660,10 @@ impl Sens {
                     self.srcs[i].cost = self.srcs[i].cost.max(lhm::COST.load(std::sync::atomic::Ordering::Relaxed));
                 }
                 lhm::request();
+                // (no answer: the last values stay, see win_tick)
+                if !lhm::live() {
+                    return;
+                }
                 let (ids, rd) = (&self.w.lhm_id, &mut self.rd);
                 lhm::with(|v| {
                     for (k, id) in ids {
@@ -400,6 +689,48 @@ impl Sens {
 
     /// (no BMC on Windows here)
     pub(super) fn read_bmc(&mut self, _i: usize, _wait_ms: i32) {}
+}
+
+/// One D3DKMT query of a graphics adapter into `out`.
+fn kmt<T>(h: u32, ty: KMTQUERYADAPTERINFOTYPE, out: &mut T) -> bool {
+    let mut q = D3DKMT_QUERYADAPTERINFO {
+        hAdapter: h,
+        Type: ty,
+        pPrivateDriverData: out as *mut T as *mut _,
+        PrivateDriverDataSize: std::mem::size_of::<T>() as u32,
+    };
+    unsafe { D3DKMTQueryAdapterInfo(&mut q) >= 0 }
+}
+
+/// NVIDIA's management library (installed with its driver, loaded from System32
+/// only): its power reading, and each card's PCI bus and device. Started once
+/// (~20 ms), never shut down.
+fn nvml() -> Option<(NvPower, Vec<(u32, usize)>)> {
+    unsafe {
+        let lib = LoadLibraryExW(wide("nvml.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if lib.is_null() {
+            return None;
+        }
+        let f = |n: &str| GetProcAddress(lib, [n, "\0"].concat().as_ptr());
+        let init: unsafe extern "C" fn() -> i32 = std::mem::transmute(f("nvmlInit_v2")?);
+        let count: unsafe extern "C" fn(*mut u32) -> i32 = std::mem::transmute(f("nvmlDeviceGetCount_v2")?);
+        let by_index: unsafe extern "C" fn(u32, *mut usize) -> i32 = std::mem::transmute(f("nvmlDeviceGetHandleByIndex_v2")?);
+        // (nvmlPciInfo_t: legacy bus id[16], domain, bus, device, ids, bus id[32])
+        let pci: unsafe extern "C" fn(usize, *mut [u32; 17]) -> i32 = std::mem::transmute(f("nvmlDeviceGetPciInfo_v3")?);
+        let power: NvPower = std::mem::transmute(f("nvmlDeviceGetPowerUsage")?);
+        let mut n = 0u32;
+        if init() != 0 || count(&mut n) != 0 {
+            return None;
+        }
+        let mut devs = Vec::new();
+        for i in 0..n {
+            let (mut d, mut p) = (0usize, [0u32; 17]);
+            if by_index(i, &mut d) == 0 && pci(d, &mut p) == 0 {
+                devs.push((p[5], d));
+            }
+        }
+        Some((power, devs))
+    }
 }
 
 /// The first battery's device and tag (for its rate in watts).
@@ -439,16 +770,19 @@ fn battery_device() -> Option<(HANDLE, u32)> {
 pub fn setup(_undo: bool, _per_core: bool, _bmc: bool, _dry: bool) -> i32 {
     println!(
         "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
-disks, network, processes, the battery, NVMe drive temperatures and the firmware's
-ACPI thermal zones. Windows has no interface for CPU temperatures, fans, voltages
-or CPU power without a kernel driver, and cpuview installs none.
+disks, network, processes, the CPU's power (Windows' energy meter), graphics cards'
+temperature, fan and (NVIDIA) watts, the battery, NVMe drive temperatures and the
+firmware's ACPI thermal zones. Windows has no interface for CPU temperatures, the
+board's fans (CPU fan, case fans, pump) or voltages without a kernel driver, and
+cpuview installs none.
 
 To see them, run LibreHardwareMonitor (https://github.com/LibreHardwareMonitor/
 LibreHardwareMonitor, free) and turn on Options → Remote Web Server (port 8085;
 it listens on your network too: allow it in the firewall only for this computer).
 cpuview then reads its sensors from http://localhost:8085/data.json, on the
-Sensors & Power page and the CPU page (set CPUVIEW_LHM=host:port for another port).
-Nothing needs administrator rights."
+Sensors & Power page and the CPU page, also when it starts after cpuview (set
+CPUVIEW_LHM=host:port for another port). cpuview itself needs no administrator
+rights."
     );
     if lhm::listening() {
         match lhm::fetch() {

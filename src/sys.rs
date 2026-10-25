@@ -956,9 +956,7 @@ impl Sampler {
     /// Temperatures (Windows: LibreHardwareMonitor's snapshot, see win::Cpu::lhm_temps).
     #[cfg(windows)]
     pub fn read_temps(&mut self, all: bool) {
-        if !self.temps.is_empty() {
-            self.w.lhm_temps(&mut self.temps, all);
-        }
+        self.w.lhm_temps(&mut self.temps, all);
     }
 
     /// Temperatures: k10temp reads go over SMN and cost ~10 µs each on a cold core,

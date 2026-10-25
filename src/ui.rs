@@ -2286,7 +2286,7 @@ impl App {
                 bg,
                 &[(
                     if cfg!(windows) {
-                        "CPU temperature: Windows has none (LibreHardwareMonitor can)"
+                        "CPU temperature: run LibreHardwareMonitor with its web server on"
                     } else {
                         "no CPU temperature sensor found"
                     },
