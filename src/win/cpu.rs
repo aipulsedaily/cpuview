@@ -42,6 +42,11 @@ pub struct Cpu {
     map: Vec<usize>,
     /// nominal clock (MHz): "% Processor Performance" is relative to it
     nominal: f32,
+    /// highest clock believed (MHz): a fifth above the rated maximum where the CPU
+    /// states one (not under Windows' hypervisor, which hides it)
+    ceil: f32,
+    /// CPUs whose clock was read this time
+    read: Vec<bool>,
     /// load average: the time of its last update
     la_t: i64,
     /// LibreHardwareMonitor's CPU temperatures: when a fresh snapshot was last asked for
@@ -303,6 +308,8 @@ impl Cpu {
             nominal: 0.0,
             la_t: 0,
             lhm_t: 0,
+            ceil: f32::MAX,
+            read: Vec::new(),
             plan: unsafe { std::mem::zeroed() },
         }
     }
@@ -324,6 +331,8 @@ impl Cpu {
             nominal: nominal_mhz(n),
             la_t: 0,
             lhm_t: 0,
+            ceil: if rated_max() > 0.0 { 1.2 * rated_max() } else { f32::MAX },
+            read: Vec::new(),
             plan: unsafe { std::mem::zeroed() },
         };
         if t.has_freq {
@@ -367,8 +376,12 @@ impl Cpu {
 
     /// Effective clocks (MHz) of every CPU over the interval since the last call: one
     /// PDH collection for all of them. Idle CPUs show the slowest clock seen (as Linux
-    /// reports their minimum). The highest clock seen raises `maxf` (Windows doesn't
-    /// say how far a CPU boosts).
+    /// reports their minimum). The highest clock of a CPU busy for a quarter of the
+    /// interval raises `maxf` (Windows doesn't say how far a CPU boosts).
+    ///
+    /// A CPU busy for less than a tenth of the interval (the idle thread of a core)
+    /// gets a ratio that is noise, 6–9 GHz on a 5.5 GHz CPU: it shows the clock of
+    /// its core's other thread (they share it), else its last one (idle: the slowest).
     pub fn clocks(&mut self, ur: &[f32], fr: &mut [f32], t: &mut Topo) {
         if self.q.is_null() || unsafe { PdhCollectQueryData(self.q) } != ERROR_SUCCESS {
             return;
@@ -406,19 +419,36 @@ impl Cpu {
                 .collect();
         }
         let mut top = 0f32;
+        self.read.clear();
+        self.read.resize(fr.len(), false);
         for (x, &c) in it.iter().zip(&self.map) {
             if c >= fr.len() || x.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA {
                 continue;
             }
             let f = (unsafe { x.FmtValue.Anonymous.doubleValue } as f32 * self.nominal / 100.0).round();
-            if f <= 0.0 {
+            let u = ur.get(c).copied().unwrap_or(0.0);
+            if u <= 0.0 && t.minf > 0.0 {
+                fr[c] = t.minf;
+                continue;
+            }
+            if f <= 0.0 || f > self.ceil || u < 0.1 {
                 continue;
             }
             if t.minf == 0.0 || f < t.minf {
                 t.minf = f;
             }
-            top = top.max(f);
-            fr[c] = if ur.get(c).is_some_and(|&u| u <= 0.0) { t.minf } else { f };
+            if u >= 0.25 {
+                top = top.max(f);
+            }
+            fr[c] = f;
+            self.read[c] = true;
+        }
+        for g in &t.groups {
+            if let Some(f) = g.iter().filter(|&&c| self.read[c]).map(|&c| fr[c]).reduce(f32::max) {
+                for &c in g.iter().filter(|&&c| !self.read[c]) {
+                    fr[c] = f;
+                }
+            }
         }
         if top > t.maxf {
             t.maxf = (top / 100.0).ceil() * 100.0;
