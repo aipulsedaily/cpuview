@@ -1691,6 +1691,10 @@ fn main() {
         }
         // account the CPU time of the wakeup that just finished (eco only: reading
         // the process clock is a syscall, which faster speeds needn't pay per frame)
+        // (Windows: the other threads' CPU time joins the process's here, once a
+        // minute: charged to the budget, never to a sample's cost)
+        #[cfg(windows)]
+        term::reconcile();
         let c = if eco { term::cpu_ns() } else { cpu_mark };
         let now = term::mono();
         // sensors page: the sensor reads have their own share of the budget (`zp`,

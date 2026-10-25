@@ -230,26 +230,18 @@ fn process_ns() -> i64 {
 /// The main thread (a real handle: its time is read from wherever cpu_ns is called).
 #[cfg(target_arch = "x86_64")]
 static MAIN: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-/// Cycles spent outside the main thread (helper threads, threads of system DLLs):
-/// charged so far, found and not charged yet; the main thread's cycles at the last
-/// reconciliation and in the minute before it; its time (0: none yet).
+/// Cycles spent outside the main thread (helper threads, threads of system DLLs)
+/// since start-up, as of the last reconciliation; their count then (start-up's), and
+/// its time (0: none yet).
 #[cfg(target_arch = "x86_64")]
 static OTHER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "x86_64")]
-static SPREAD: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_arch = "x86_64")]
-static M_REC: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_arch = "x86_64")]
-static M_MIN: AtomicU64 = AtomicU64::new(1);
+static OTHER0: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "x86_64")]
 static REC_NS: AtomicI64 = AtomicI64::new(0);
 
 /// Process CPU cycles: the main thread's (0.1 µs to read) plus the rest of the
-/// process as of the last QueryProcessCycleTime, which costs 50–150 µs and so runs
-/// once a minute. What the other threads used is charged on the main thread's work
-/// in the next minute, in proportion to it (at the last minute's rate; what's left
-/// carries over): never lost, and neither in the one wakeup that finds it nor in
-/// the one after a long sleep (the eco planner would take that for a sample's cost).
+/// process as of the last `reconcile`.
 #[cfg(target_arch = "x86_64")]
 fn process_cycles() -> u64 {
     unsafe {
@@ -261,23 +253,33 @@ fn process_cycles() -> u64 {
         }
         let mut m = 0u64;
         QueryThreadCycleTime(h, &mut m);
-        let spread = SPREAD.load(Ordering::Relaxed);
-        let ran = m.saturating_sub(M_REC.load(Ordering::Relaxed));
-        let mut part = (spread as u128 * ran as u128 / M_MIN.load(Ordering::Relaxed) as u128).min(spread as u128) as u64;
+        m + OTHER.load(Ordering::Relaxed)
+    }
+}
+
+/// Add what the other threads used to the process time (main thread only), once a
+/// minute: QueryProcessCycleTime costs 50–150 µs. The main loop calls it where the
+/// eco budget is charged, never inside a sample's cost (the planner would take a
+/// minute of the helpers' work for a dear sample). What they used before the first
+/// call is start-up, as on Linux (the main loop's accounting starts after it).
+pub fn reconcile() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
         let now = qpc_ns();
         let rec = REC_NS.load(Ordering::Relaxed);
-        if rec == 0 || now - rec >= 60_000_000_000 {
-            let done = OTHER.load(Ordering::Relaxed) + part;
-            let mut p = 0u64;
-            QueryProcessCycleTime(GetCurrentProcess(), &mut p);
-            OTHER.store(done, Ordering::Relaxed);
-            SPREAD.store(p.saturating_sub(m).saturating_sub(done), Ordering::Relaxed);
-            M_MIN.store(ran.max(1), Ordering::Relaxed);
-            M_REC.store(m, Ordering::Relaxed);
-            REC_NS.store(now, Ordering::Relaxed);
-            part = 0;
+        if rec != 0 && now - rec < 60_000_000_000 {
+            return;
         }
-        m + OTHER.load(Ordering::Relaxed) + part
+        REC_NS.store(now, Ordering::Relaxed);
+        let (mut p, mut m) = (0u64, 0u64);
+        process_cycles(); // (the main thread's handle)
+        QueryThreadCycleTime(MAIN.load(Ordering::Relaxed), &mut m);
+        QueryProcessCycleTime(GetCurrentProcess(), &mut p);
+        let other = p.saturating_sub(m);
+        if rec == 0 {
+            OTHER0.store(other, Ordering::Relaxed);
+        }
+        OTHER.fetch_max(other.saturating_sub(OTHER0.load(Ordering::Relaxed)), Ordering::Relaxed);
     }
 }
 
