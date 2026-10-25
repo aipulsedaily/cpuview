@@ -1240,6 +1240,8 @@ pub struct Net {
     /// the overview's look-ups: containers only (no services, no cgroup names)
     pub lite: bool,
     cread: u32,
+    #[cfg(windows)]
+    w: win::State,
 }
 
 impl Net {
@@ -1284,6 +1286,8 @@ impl Net {
             entered: false,
             lite: false,
             cread: 0,
+            #[cfg(windows)]
+            w: win::State::default(),
         }
     }
 

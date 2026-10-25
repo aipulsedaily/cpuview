@@ -7,8 +7,29 @@
 
 use super::*;
 use crate::win::{from_wide, prog_name, ProcList};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+
+/// What the Windows sources keep between reads.
+#[derive(Default)]
+pub struct State {
+    /// the addresses' last read: change count, links (index and state), time
+    addr_gen: u32,
+    addr_links: u64,
+    addr_t: i64,
+    /// listening sockets' owners read so far
+    owner_reads: u32,
+}
+
+/// Address changes so far (IP Helper calls `addr_changed` on a thread of its own),
+/// and whether that is watched (0: not yet asked, 1: yes, 2: no).
+static ADDR_GEN: AtomicU32 = AtomicU32::new(0);
+static ADDR_WATCH: AtomicU8 = AtomicU8::new(0);
+
+unsafe extern "system" fn addr_changed(_: *const core::ffi::c_void, _: *const MIB_UNICASTIPADDRESS_ROW, _: MIB_NOTIFICATION_TYPE) {
+    ADDR_GEN.fetch_add(1, Relaxed);
+}
 
 /// MIB_IF_ROW2 flags
 const F_HARDWARE: u8 = 1;
@@ -224,8 +245,22 @@ impl Net {
     }
 
     /// Addresses of the links (GetAdaptersAddresses): a global one first (IPv4, then
-    /// IPv6), a link-local one only when there is nothing else.
+    /// IPv6), a link-local one only when there is nothing else. It costs 1–2 ms on a
+    /// desktop with Windows' dozens of interfaces, so it runs when an address
+    /// changed (IP Helper says so), the links changed, or 10 minutes passed.
     pub(super) fn addrs(&mut self) {
+        if ADDR_WATCH.load(Relaxed) == 0 {
+            let mut h = std::ptr::null_mut();
+            let r = unsafe { NotifyUnicastIpAddressChange(AF_UNSPEC, Some(addr_changed), std::ptr::null(), false, &mut h) };
+            ADDR_WATCH.store(if r == 0 { 1 } else { 2 }, Relaxed);
+        }
+        let links = self.ifs.iter().fold(0u64, |k, i| k.wrapping_mul(31).wrapping_add((i.idx as u64) << 2 | (i.up as u64) << 1 | i.prim as u64));
+        let (gen, now) = (ADDR_GEN.load(Relaxed), crate::term::mono());
+        let w = &mut self.w;
+        if ADDR_WATCH.load(Relaxed) == 1 && gen == w.addr_gen && links == w.addr_links && now - w.addr_t < 600 * SEC {
+            return;
+        }
+        (w.addr_gen, w.addr_links, w.addr_t) = (gen, links, now);
         for i in &mut self.ifs {
             i.addr_rank = 9;
             i.addr.clear();
@@ -338,17 +373,24 @@ impl Net {
         self.buf = buf;
         self.sock_ok = true;
         self.listen = group_listen(&self.socks);
-        // owners: the programs of the pids, from the basic process list
-        self.owners.clear();
-        let mut pl = ProcList::new();
-        if pl.read(false) {
-            let socks = &self.socks;
-            let owners = &mut self.owners;
-            pl.each(&mut |e| {
-                if socks.iter().any(|s| s.ino == e.pid) {
-                    owners.push((e.pid, prog_name(e.name, e.pid)));
-                }
-            });
+        // owners: the programs of the pids, from the basic process list (~0.7 ms on a
+        // busy desktop): when a pid is new, and every tenth time (a pid reused)
+        let mut pids: Vec<u32> = self.socks.iter().map(|s| s.ino).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        self.owners.retain(|o| pids.binary_search(&o.0).is_ok());
+        self.w.owner_reads += 1;
+        if self.w.owner_reads % 10 == 1 || pids.iter().any(|p| !self.owners.iter().any(|o| o.0 == *p)) {
+            self.owners.clear();
+            let mut pl = ProcList::new();
+            if pl.read(false) {
+                let owners = &mut self.owners;
+                pl.each(&mut |e| {
+                    if pids.binary_search(&e.pid).is_ok() {
+                        owners.push((e.pid, prog_name(e.name, e.pid)));
+                    }
+                });
+            }
         }
         self.socks = Vec::new();
         self.resolve_owners();
