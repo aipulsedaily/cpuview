@@ -842,9 +842,10 @@ impl App {
         let th = &self.t;
         let m = z.fan_hint.as_ref().map_or("", |h| h.0.as_str());
         l.row(2, th.warn, th.dim, -1.0, 0);
-        // (Windows: one line, whatever else Windows itself gives)
-        if !z.vm && z.fan_hint.as_ref().is_some_and(|h| h.1 == 4) {
-            l.s("CPU temperature and fans: ");
+        // (Windows: one line, whatever else Windows itself gives; 5: cpuview's sensor
+        // service has the CPU's temperatures)
+        if let Some(k) = z.fan_hint.as_ref().map(|h| h.1).filter(|&k| !z.vm && (k == 4 || k == 5)) {
+            l.s(if k == 4 { "CPU temperature and fans: " } else { "fans: " });
             if two {
                 l.row(2, th.dim, 0, -1.0, 0);
             } else {

@@ -1323,6 +1323,12 @@ fn main() {
         libc::mallopt(libc::M_TOP_PAD, 0);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // (Windows: the sensor service, started by the service manager: no settings, no
+    // console)
+    #[cfg(windows)]
+    if args.first().is_some_and(|a| a == "--sensor-service") {
+        std::process::exit(win::svc::main());
+    }
     let mut cfg = Config::load();
     let (mut want_doctor, mut no_probe) = (false, false);
     let mut theme_arg = None;
@@ -1363,6 +1369,9 @@ fn main() {
             "--per-core" => per_core = true,
             "--bmc" => bmc = true,
             "--dry-run" => dry = true,
+            // (Windows: --setup-sensors run elevated by itself, see win/setup.rs)
+            #[cfg(windows)]
+            "--elevated" => setup = true,
             "--no-probe" => no_probe = true,
             "--theme" => theme_arg = Some(val()),
             "--image" => image_arg = Some(val()),

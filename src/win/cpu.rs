@@ -8,7 +8,7 @@
 use crate::win::{from_wide, wide, NtQuerySystemInformationEx};
 use crate::sensors::cpu_temp_label;
 use crate::sys::{isort, Ring, Sensor, Topo};
-use crate::win::lhm;
+use crate::win::{lhm, svc};
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
 use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::{CallNtPowerInformation, PowerGetActiveScheme, PowerReadFriendlyName, ProcessorInformation};
@@ -51,6 +51,8 @@ pub struct Cpu {
     la_t: i64,
     /// LibreHardwareMonitor's CPU temperatures: when a fresh snapshot was last asked for
     lhm_t: i64,
+    /// the temperatures came from cpuview's sensor service (win/svc.rs)
+    from_svc: bool,
     /// active power plan
     plan: windows_sys::core::GUID,
 }
@@ -114,6 +116,18 @@ fn group_bases() -> (Vec<(u16, usize)>, usize) {
         n = std::thread::available_parallelism().map_or(1, |n| n.get());
     }
     (v, n)
+}
+
+/// Processor group and number in it of each CPU (cpuview's CPU index: the groups'
+/// CPUs one after the other).
+pub fn group_numbers() -> Vec<(u16, u8)> {
+    let (bases, n) = group_bases();
+    (0..n)
+        .map(|c| {
+            let k = bases.iter().rposition(|b| b.1 <= c).unwrap_or(0);
+            (bases[k].0, (c - bases[k].1) as u8)
+        })
+        .collect()
 }
 
 /// Nominal clock (MHz) of the first processor.
@@ -314,6 +328,7 @@ impl Cpu {
             nominal: 0.0,
             la_t: 0,
             lhm_t: 0,
+            from_svc: false,
             ceil: f32::MAX,
             read: Vec::new(),
             plan: unsafe { std::mem::zeroed() },
@@ -337,6 +352,7 @@ impl Cpu {
             nominal: nominal_mhz(n),
             la_t: 0,
             lhm_t: 0,
+            from_svc: false,
             ceil: if rated_max() > 0.0 { 1.2 * rated_max() } else { f32::MAX },
             read: Vec::new(),
             plan: unsafe { std::mem::zeroed() },
@@ -483,7 +499,8 @@ impl Cpu {
         self.la_t = now;
     }
 
-    /// The CPU temperatures from LibreHardwareMonitor's last snapshot; a fresh one is
+    /// The CPU temperatures: from cpuview's sensor service where it is installed (see
+    /// win/svc.rs), else from LibreHardwareMonitor's last snapshot; a fresh one is
     /// asked for every 2 s (`all`: smooth) or 30 s (its parse costs a few hundred µs).
     ///
     /// LibreHardwareMonitor may start after cpuview, or close: while there are none,
@@ -491,6 +508,23 @@ impl Cpu {
     /// temperatures come from the helper's first snapshot; they go when it stops
     /// answering.
     pub fn lhm_temps(&mut self, temps: &mut Vec<Sensor>, all: bool) {
+        // cpuview's sensor service first (its snapshot, a fresh one asked for: a few
+        // µs), the package / Tctl / CCDs as the CPU page shows them
+        if let Some(v) = svc::readings() {
+            let v: Vec<_> = v.into_iter().filter(|r| !r.minor).collect();
+            if !self.from_svc || temps.len() != v.len() || temps.iter().zip(&v).any(|(s, r)| s.label != r.label) {
+                *temps = v.iter().map(|r| Sensor { label: r.label.clone(), fd: -1, val: r.val, hist: Ring::new(), max: 0.0 }).collect();
+                self.from_svc = true;
+            } else {
+                for (s, r) in temps.iter_mut().zip(&v) {
+                    s.val = r.val;
+                }
+            }
+            return;
+        }
+        if std::mem::take(&mut self.from_svc) {
+            temps.clear();
+        }
         let now = crate::term::mono();
         if temps.is_empty() {
             if lhm::live() {

@@ -15,7 +15,7 @@
 //!   cpuview runs, as it may start later or close.
 
 use super::*;
-use crate::win::{close, fd2h, from_pwstr, from_wide, h2fd, lhm, reg_str, wide};
+use crate::win::{close, cputemp, fd2h, from_pwstr, from_wide, h2fd, lhm, reg_str, svc, wide};
 use windows_sys::Wdk::Graphics::Direct3D::*;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
@@ -28,12 +28,13 @@ use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Windows sources (beyond S_BAT): ACPI zones, a drive, LibreHardwareMonitor, the
-/// energy meter, a graphics card
+/// energy meter, a graphics card, cpuview's sensor service
 pub(super) const S_ACPI: u8 = 6;
 pub(super) const S_DRIVE: u8 = 7;
 pub(super) const S_LHM: u8 = 8;
 pub(super) const S_EMI: u8 = 9;
 pub(super) const S_GPU: u8 = 10;
+pub(super) const S_SVC: u8 = 11;
 
 /// NVML's power reading: device, milliwatts
 type NvPower = unsafe extern "C" fn(usize, *mut u32) -> i32;
@@ -55,6 +56,7 @@ pub struct State {
     lhm_id: Vec<(usize, String)>,
     lhm_gen: u32,
     lhm_gone: Option<i64>,
+    svc_gone: Option<i64>,
 }
 
 impl State {
@@ -72,13 +74,15 @@ impl State {
             lhm_id: Vec::new(),
             lhm_gen: 0,
             lhm_gone: None,
+            svc_gone: None,
         }
     }
 }
 
-/// The hint while LibreHardwareMonitor isn't running (sensui.rs: kind 4).
-fn lhm_hint() -> Option<(String, u8)> {
-    Some(("LibreHardwareMonitor".into(), 4))
+/// The hint while LibreHardwareMonitor isn't running (sensui.rs: kind 4; with
+/// cpuview's sensor service for the CPU's temperatures, the fans only: kind 5).
+fn lhm_hint(svc: bool) -> Option<(String, u8)> {
+    Some(("LibreHardwareMonitor".into(), if svc { 5 } else { 4 }))
 }
 
 fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
@@ -158,33 +162,63 @@ impl Sens {
         self.emi();
         self.gpus();
         self.drives();
+        if let Some(v) = svc::readings() {
+            self.svc(&v);
+        }
         self.lhm(true);
         self.batteries();
         self.finish_names();
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
         if !self.vm && !self.srcs.iter().any(|s| s.kind == S_LHM) {
-            self.fan_hint = lhm_hint();
+            self.fan_hint = lhm_hint(self.srcs.iter().any(|s| s.kind == S_SVC));
         }
         for i in 0..self.srcs.len() {
             self.read_src(i, now);
         }
     }
 
-    /// LibreHardwareMonitor started or closed since detection: its readings added
-    /// when it first answers (from the helper's snapshot, asked for after its server
-    /// was seen listening: lhm::look), and dropped, the hint back, when it hasn't
-    /// answered for 20 s (they keep their last values until then).
+    /// cpuview's sensor service or LibreHardwareMonitor started or closed since
+    /// detection. The service's readings are added when it first answers (its
+    /// snapshot, looked for every 10 s: svc::readings) and dropped when it hasn't for
+    /// 20 s; then LibreHardwareMonitor's, without the CPU's temperatures, again.
+    /// LibreHardwareMonitor's are added when it first answers (from the helper's
+    /// snapshot, asked for after its server was seen listening: lhm::look), and
+    /// dropped, the hint back, when it hasn't answered for 20 s (they keep their last
+    /// values until then).
     pub(super) fn win_tick(&mut self, now: i64) {
         if self.vm {
             return;
         }
-        if let Some(s) = self.srcs.iter().position(|s| s.kind == S_LHM) {
+        let lhm_src = |z: &Sens| z.srcs.iter().position(|s| s.kind == S_LHM);
+        if let Some(s) = self.srcs.iter().position(|s| s.kind == S_SVC) {
+            if self.w.svc_gone.is_some_and(|t| now - t >= 20 * SEC) {
+                self.w.svc_gone = None;
+                self.drop_src(s);
+                if let Some(l) = lhm_src(self) {
+                    self.drop_src(l);
+                }
+                self.fan_hint = lhm_hint(false);
+            }
+        } else if let Some(v) = svc::readings() {
+            let (t0, hists) = (thread_ns(), self.rd.iter().any(|r| r.hist.is_some()));
+            if let Some(l) = lhm_src(self) {
+                self.drop_src(l);
+            }
+            self.svc(&v);
+            self.finish_names();
+            self.hists(hists);
+            self.fan_hint = lhm_hint(true);
+            self.spent += (thread_ns() - t0).max(0);
+            self.read_src(self.srcs.len() - 1, now);
+        }
+        let svc = self.srcs.iter().any(|s| s.kind == S_SVC);
+        if let Some(s) = lhm_src(self) {
             if lhm::live() {
                 self.w.lhm_gone = None;
             } else if now - *self.w.lhm_gone.get_or_insert(now) >= 20 * SEC {
                 self.w.lhm_gone = None;
                 self.drop_src(s);
-                self.fan_hint = lhm_hint();
+                self.fan_hint = lhm_hint(svc);
             }
             return;
         }
@@ -205,12 +239,17 @@ impl Sens {
         }
     }
 
-    /// Source `s` and its readings gone (LibreHardwareMonitor closed): the indices
-    /// after them move down.
+    /// Source `s` and its readings gone (LibreHardwareMonitor or the sensor service
+    /// closed): the indices after them move down.
     fn drop_src(&mut self, s: usize) {
         let gone: Vec<bool> = self.rd.iter().map(|r| r.src as usize == s).collect();
+        let before = |i: usize| gone[..i].iter().filter(|&&g| g).count();
         for b in &mut self.bats {
-            b.rd -= gone[..b.rd].iter().filter(|&&g| g).count();
+            b.rd -= before(b.rd);
+        }
+        self.w.lhm_id.retain(|x| !gone[x.0]);
+        for x in &mut self.w.lhm_id {
+            x.0 -= before(x.0);
         }
         let mut k = 0;
         self.rd.retain(|_| {
@@ -223,8 +262,25 @@ impl Sens {
             }
         }
         self.srcs.remove(s);
-        self.w.lhm_id.clear();
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
+    }
+
+    /// cpuview's sensor service (win/svc.rs): the CPU's temperatures through PawnIO
+    /// (the package, Tctl and the CCDs; each core's as minor ones).
+    fn svc(&mut self, v: &[cputemp::Reading]) {
+        let s = self.src("cpuview-sensors", "PawnIO", "cpuview's sensor service (PawnIO)", "", S_SVC, C_CPU, G_CPU);
+        for (k, x) in v.iter().enumerate() {
+            let name = match x.label.as_str() {
+                "Pkg" => "CPU package".to_string(),
+                "Tctl" => "CPU (Tctl)".to_string(),
+                l if l.starts_with("Tccd") => ["CCD ", &l[4..]].concat(),
+                l => l.replacen("Core", "core", 1),
+            };
+            let mut r = rd(K_TEMP, s, G_CPU, k as c_int, &x.label, &name);
+            (r.warn, r.crit) = temp_limits(G_CPU, None, None);
+            r.minor = x.minor;
+            self.add(s, r);
+        }
     }
 
     /// The firmware's thermal zones (one PDH query for all of them).
@@ -472,6 +528,7 @@ impl Sens {
         let emi = self.srcs.iter().any(|s| s.kind == S_EMI);
         let gpus = self.srcs.iter().any(|s| s.kind == S_GPU);
         let drives = self.srcs.iter().any(|s| s.kind == S_DRIVE);
+        let cpu_t = self.srcs.iter().any(|s| s.kind == S_SVC);
         let mut s = usize::MAX;
         let mut gpu = gpus;
         for (k, x) in v.iter().enumerate() {
@@ -492,6 +549,7 @@ impl Sens {
                 (G_GPU, K_FAN | K_POWER) => gpus,
                 (G_GPU, K_TEMP) => gpus && x.text == "GPU Core",
                 (G_DISK, K_TEMP) => drives,
+                (G_CPU, K_TEMP) => cpu_t,
                 _ => false,
             };
             if dup {
@@ -651,6 +709,22 @@ impl Sens {
                     }
                 }
             }
+            S_SVC => {
+                // the service's last snapshot, a fresh one asked for (none: the last
+                // values stay, and win_tick lets the service go after 20 s)
+                let Some(v) = svc::readings() else {
+                    self.w.svc_gone.get_or_insert(crate::term::mono());
+                    return;
+                };
+                self.w.svc_gone = None;
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
+                    let val = v.iter().find(|x| x.label == r.raw).map_or(f32::NAN, |x| x.val);
+                    r.ok = temp_ok(val, false, None);
+                    if r.ok {
+                        (r.val, r.seen) = (val, true);
+                    }
+                }
+            }
             S_LHM => {
                 // the helper's last snapshot, and a fresh one asked for (its cost: the
                 // helper's last fetch)
@@ -766,31 +840,7 @@ fn battery_device() -> Option<(HANDLE, u32)> {
     }
 }
 
-/// `cpuview --setup-sensors` on Windows: nothing to set up, only what to run.
-pub fn setup(_undo: bool, _per_core: bool, _bmc: bool, _dry: bool) -> i32 {
-    println!(
-        "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
-disks, network, processes, the CPU's power (Windows' energy meter), graphics cards'
-temperature, fan and (NVIDIA) watts, the battery, NVMe drive temperatures and the
-firmware's ACPI thermal zones. Windows has no interface for CPU temperatures, the
-board's fans (CPU fan, case fans, pump) or voltages without a kernel driver, and
-cpuview installs none.
-
-To see them, run LibreHardwareMonitor (https://github.com/LibreHardwareMonitor/
-LibreHardwareMonitor, free) and turn on Options → Remote Web Server (port 8085;
-it listens on your network too: allow it in the firewall only for this computer).
-cpuview then reads its sensors from http://localhost:8085/data.json, on the
-Sensors & Power page and the CPU page, also when it starts after cpuview (set
-CPUVIEW_LHM=host:port for another port). cpuview itself needs no administrator
-rights."
-    );
-    if lhm::listening() {
-        match lhm::fetch() {
-            Some(v) => println!("\nLibreHardwareMonitor answers: {} readings.", v.len()),
-            None => println!("\nSomething listens on its port, but data.json didn't come back."),
-        }
-    } else {
-        println!("\nLibreHardwareMonitor's web server isn't running now.");
-    }
-    0
+/// `cpuview --setup-sensors` on Windows: the sensor service (see win/setup.rs).
+pub fn setup(undo: bool, _per_core: bool, _bmc: bool, dry: bool) -> i32 {
+    crate::win::setup::setup(undo, dry)
 }
