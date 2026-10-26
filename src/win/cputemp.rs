@@ -78,8 +78,9 @@ impl Cpu {
         }
     }
 
-    /// Read every temperature now.
-    pub fn read(&self) -> Vec<Reading> {
+    /// Read the temperatures now; Intel's cores' only with `all_cores` (each is read on
+    /// its core: the thread visits all of them, waking the idle ones).
+    pub fn read(&self, all_cores: bool) -> Vec<Reading> {
         let mut out = Vec::new();
         match self {
             Cpu::Intel { m, tjmax, cores } => {
@@ -90,7 +91,7 @@ impl Cpu {
                 let me = unsafe { GetCurrentThread() };
                 let mut prev: GROUP_AFFINITY = unsafe { std::mem::zeroed() };
                 let mut moved = false;
-                for (label, group, n) in cores {
+                for (label, group, n) in cores.iter().take(if all_cores { usize::MAX } else { 0 }) {
                     let a = GROUP_AFFINITY { Mask: 1usize << n, Group: *group, Reserved: [0; 3] };
                     let ok = unsafe { SetThreadGroupAffinity(me, &a, if moved { std::ptr::null_mut() } else { &mut prev }) } != 0;
                     moved |= ok;

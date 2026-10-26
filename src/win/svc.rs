@@ -193,7 +193,7 @@ pub fn main() -> i32 {
 /// `--print` (as an administrator): what the service would read here, once.
 fn print() -> i32 {
     let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("pawnio"))).unwrap_or_default();
-    let mut v = Cpu::open(&dir).map(|c| c.read()).unwrap_or_default();
+    let mut v = Cpu::open(&dir).map(|c| c.read(true)).unwrap_or_default();
     match Board::open(&dir) {
         Ok(mut b) => v.extend(b.read()),
         Err(Missing::Later) => println!("board chip: not readable now (driver, module or the ISA bus)"),
@@ -266,6 +266,8 @@ fn serve(stop: HANDLE) -> i32 {
     let mut cpu = Cpu::open(&dir);
     let mut board = Board::open(&dir);
     let mut tried = unsafe { GetTickCount64() };
+    // (each core's temperatures, every 5 s: the package's on every read)
+    let (mut cores, mut cores_at) = (Vec::new(), 0u64);
     serve_with(stop, &mut || {
         let now = unsafe { GetTickCount64() };
         let later = matches!(board, Err(Missing::Later));
@@ -278,7 +280,14 @@ fn serve(stop: HANDLE) -> i32 {
                 board = Board::open(&dir);
             }
         }
-        let mut v = cpu.as_ref().map(|c| c.read()).unwrap_or_default();
+        let all = now >= cores_at + 5000;
+        let mut v = cpu.as_ref().map(|c| c.read(all)).unwrap_or_default();
+        if all {
+            cores_at = now;
+            cores = v.iter().filter(|r| r.minor).cloned().collect();
+        } else if v.iter().all(|r| !r.minor) {
+            v.extend(cores.iter().cloned());
+        }
         if let Ok(b) = board.as_mut() {
             v.extend(b.read());
         }

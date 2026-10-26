@@ -239,10 +239,10 @@ impl Sens {
                 _ => {
                     r.kind = K_VOLT;
                     let mul;
-                    (r.name, mul) = volt_name(&name, "", n, x.val);
+                    (r.name, mul) = volt_name(&name, &x.label, n, x.val);
                     r.mul = mul;
                     (r.warn, r.crit) = (x.lo * mul, x.hi * mul);
-                    r.guess = r.name.starts_with("in");
+                    r.guess = x.label.is_empty() && r.name.starts_with("in");
                 }
             }
             self.add(s, r);

@@ -169,8 +169,11 @@ then run cpuview --setup-sensors again."
         println!("Nothing changed.");
         return 1;
     }
+    let t0 = std::time::SystemTime::now();
     let code = run_elevated(if undo { "--setup-sensors --undo --elevated" } else { "--setup-sensors --elevated" });
-    if !undo {
+    // (this run's log only: one left from an earlier run isn't shown)
+    let fresh = std::fs::metadata(log_path()).and_then(|m| m.modified()).is_ok_and(|t| t >= t0);
+    if !undo && fresh {
         if let Ok(log) = std::fs::read_to_string(log_path()) {
             print!("{log}");
         }

@@ -1,18 +1,20 @@
 //! The motherboard's monitoring chip, for the sensor service (win/svc.rs): Nuvoton's
 //! NCT6779–NCT6799, the Super I/O on most ASUS boards (and many others) since 2013,
-//! through PawnIO's LpcIO module: its fans (RPM, duty, how they're controlled),
-//! voltages and temperatures, the inputs Linux's nct6775 driver lists (register
-//! facts from Nuvoton's datasheets and that driver; the code is cpuview's own).
+//! and ITE's and Fintek's (win/chips.rs), through PawnIO's LpcIO module: its fans
+//! (RPM, duty, how they're controlled), voltages and temperatures, the inputs Linux's
+//! nct6775, it87 and f71882fg drivers list (register facts from the chips' datasheets
+//! and those drivers; the code is cpuview's own).
 //!
 //! Guarded, as other monitoring tools are: every access holds the mutex they share
 //! for the ISA bus (Global\Access_ISABUS.HTP.Method). Nothing is written but the
-//! Super I/O's configuration key and device select, the chip's index and bank
-//! registers and, on NCT6791 and later, the lock the firmware may set on the
-//! monitor's I/O window: each read opens it and closes it again, as the board's own
-//! firmware does around each access (ASUS's), and puts the device select, index and
-//! bank back as they were. Read at most every 1.5 s (as Linux's driver caches it); a
+//! Super I/O's configuration key, exit and device select, the chip's index and (a
+//! Nuvoton's) bank registers and, on NCT6791 and later, the lock the firmware may
+//! set on the monitor's I/O window: each read opens it and closes it again, as the
+//! board's own firmware does around each access (ASUS's), and puts the device select,
+//! index and bank back as they were. Read at most every 1.5 s (as Linux's driver caches it); a
 //! chip whose readings make no sense is left alone.
 
+use super::chips::*;
 use super::pawnio::Module;
 use super::svc::{Reading, B_CHIP, B_FAN, B_TEMP, B_VOLT};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
@@ -219,12 +221,14 @@ fn isa_mutex() -> HANDLE {
     h
 }
 
-/// A run of register reads through LpcIO: the index port (base + 5), the bank set
-/// now; and what `begin` changed, for `end` to put back: the configuration entered
-/// (at this port), the device select and the lock as they were, the index and bank.
+/// A run of register reads through LpcIO: the index port (base + 5), whether the chip
+/// is a Nuvoton (banks, 16-bit registers), the bank set now; and what `begin` changed,
+/// for `end` to put back: the configuration entered (at this port), the device
+/// select and the lock as they were, the index and bank.
 struct Io<'a> {
     m: &'a Module,
     port: u64,
+    nct: bool,
     bank: u8,
     sio: Option<u64>,
     ldn: Option<u8>,
@@ -235,10 +239,10 @@ struct Io<'a> {
 impl<'a> Io<'a> {
     /// Begin: with `sio` (the Super I/O's port, for a chip whose window may be
     /// locked), enter its configuration, select the monitor and open the lock; then
-    /// note the index and bank. False if something failed (`end` still undoes what
-    /// was done).
-    fn begin(m: &'a Module, port: u64, sio: Option<u64>) -> (Io<'a>, bool) {
-        let mut io = Io { m, port, bank: 0, sio: None, ldn: None, lock: None, saved: None };
+    /// note the index (and a Nuvoton's bank). False if something failed (`end` still
+    /// undoes what was done).
+    fn begin(m: &'a Module, port: u64, nct: bool, sio: Option<u64>) -> (Io<'a>, bool) {
+        let mut io = Io { m, port, nct, bank: 0, sio: None, ldn: None, lock: None, saved: None };
         let ok = io.open(sio).is_some();
         (io, ok)
     }
@@ -263,8 +267,10 @@ impl<'a> Io<'a> {
             }
         }
         let index = self.inb(self.port)?;
-        self.outb(self.port, REG_BANK)?;
-        self.bank = self.inb(self.port + 1)?;
+        if self.nct {
+            self.outb(self.port, REG_BANK)?;
+            self.bank = self.inb(self.port + 1)?;
+        }
         self.saved = Some((index, self.bank));
         Some(())
     }
@@ -300,7 +306,7 @@ impl<'a> Io<'a> {
         self.m.read("ioctl_pio_inb", port).map(|v| v as u8)
     }
 
-    /// One byte of a register (bank in the high byte).
+    /// One byte of a register (a Nuvoton's bank in the high byte).
     fn byte(&mut self, r: u16) -> Option<u8> {
         let b = (r >> 8) as u8;
         if b != self.bank {
@@ -312,10 +318,10 @@ impl<'a> Io<'a> {
         self.inb(self.port + 1)
     }
 
-    /// A register, 8 or 16 bits.
+    /// A register, 8 or 16 bits (a Nuvoton's word registers).
     fn reg(&mut self, r: u16) -> Option<u16> {
         let v = self.byte(r)? as u16;
-        if word(r) {
+        if self.nct && word(r) {
             Some(v << 8 | self.byte(r + 1)? as u16)
         } else {
             Some(v)
@@ -323,30 +329,58 @@ impl<'a> Io<'a> {
     }
 }
 
+/// Which family a chip is of.
+#[derive(Clone, Copy, PartialEq)]
+enum Fam {
+    Nct,
+    Ite(&'static Ite),
+    Fin(&'static Fin),
+}
+
+/// A chip found: its family (and a Nuvoton's details), monitor base, the Super I/O's
+/// port, and an ITE's GPIO register 0x2C (which inputs are internal).
+struct Found {
+    fam: Fam,
+    nct: Option<Kind>,
+    name: &'static str,
+    base: u64,
+    port: u64,
+    gpio2c: u8,
+}
+
+/// No register (an item's unused slot).
+const NONE: usize = usize::MAX;
+
 /// A reading made of registers: what it is, its number and label, and where its
-/// registers are in `Board::regs` (fans: speed, duty, mode; voltages: the input).
+/// registers are in `Board::regs` (Nuvoton fans: speed, duty, mode; ITE fans:
+/// count's low and high bytes, PWM control, duty; Fintek fans: count's high and low
+/// bytes, duty; voltages and temperatures: the input), the scale (voltages: V per
+/// step; 8-bit ITE fans: the divisor's register 0x0B is in `Board::div`) and limits.
 struct Item {
     kind: u8,
     n: u8,
     label: &'static str,
-    at: [usize; 3],
+    at: [usize; 4],
     scale: f32,
     lo: f32,
     hi: f32,
 }
 
 /// The chip, found: LpcIO (holding its address), the ISA mutex, the index port, the
-/// Super I/O's port if the monitor's window may be locked, what to read, and the
-/// last readings and when.
+/// Super I/O's port if the monitor's window may be locked, its family, what to read
+/// (and where the registers every fan needs are: ITE's main control and divisors,
+/// Fintek's modes, PWM bank and open diodes), and the last readings and when.
 pub struct Board {
     m: Module,
     mutex: HANDLE,
     port: u64,
     sio: Option<u64>,
+    fam: Fam,
     pub name: &'static str,
     regs: Vec<u16>,
     order: Vec<usize>,
     items: Vec<Item>,
+    shared: [usize; 3],
     last: Vec<Reading>,
     at: u64,
 }
@@ -368,8 +402,8 @@ pub enum Missing {
 }
 
 impl Board {
-    /// Find the chip (LpcIO.bin from `dir`): a Nuvoton one at 0x2E or 0x4E, its
-    /// hardware monitor enabled; then what it has, read once and checked.
+    /// Find the chip (LpcIO.bin from `dir`): a Nuvoton, ITE or Fintek one at 0x2E or
+    /// 0x4E, its hardware monitor enabled; then what it has, read once and checked.
     pub fn open(dir: &std::path::Path) -> Result<Board, Missing> {
         let blob = std::fs::read(dir.join("LpcIO.bin")).map_err(|_| Missing::Later)?;
         let m = Module::load(&blob).ok_or(Missing::Later)?;
@@ -377,18 +411,48 @@ impl Board {
         if mutex.is_null() {
             return Err(Missing::Later);
         }
-        let mut b = Board { m, mutex, port: 0, sio: None, name: "", regs: Vec::new(), order: Vec::new(), items: Vec::new(), last: Vec::new(), at: 0 };
+        let mut b = Board {
+            m,
+            mutex,
+            port: 0,
+            sio: None,
+            fam: Fam::Nct,
+            name: "",
+            regs: Vec::new(),
+            order: Vec::new(),
+            items: Vec::new(),
+            shared: [NONE; 3],
+            last: Vec::new(),
+            at: 0,
+        };
         let found = {
             let Some(_held) = b.hold() else { return Err(Missing::Later) };
             b.find()
         };
-        let (k, base, sio) = found.map_err(Missing::Never)?;
-        (b.port, b.name, b.sio) = (base + 5, k.name, k.lock.then_some(sio));
-        b.plan(&k).ok_or(Missing::Later)?;
+        let f = found.map_err(Missing::Never)?;
+        (b.port, b.name, b.fam) = (f.base + 5, f.name, f.fam);
+        b.sio = f.nct.as_ref().is_some_and(|k| k.lock).then_some(f.port);
+        let planned = {
+            let Some(_held) = b.hold() else { return Err(Missing::Later) };
+            let (mut io, ok) = Io::begin(&b.m, b.port, f.fam == Fam::Nct, b.sio);
+            let p = if ok { plan(&f, &mut io) } else { Err(String::new()) };
+            io.end();
+            p
+        };
+        match planned {
+            Ok((regs, items, shared)) => {
+                // (a Nuvoton's registers bank by bank)
+                let mut order: Vec<usize> = (0..regs.len()).collect();
+                order.sort_by_key(|&i| regs[i] >> 8);
+                (b.regs, b.order, b.items, b.shared) = (regs, order, items, shared);
+            }
+            Err(e) if e.is_empty() => return Err(Missing::Later),
+            Err(e) => return Err(Missing::Never(e)),
+        }
         let v = b.read_now().ok_or(Missing::Later)?;
         if !plausible(&v) {
             let say: Vec<String> = v.iter().filter(|r| matches!(r.kind, B_VOLT | B_TEMP)).map(|r| format!("{}{} {}", r.kind, r.n, r.val)).collect();
-            return Err(Missing::Never(format!("{} at {base:#x}: readings make no sense: {}", k.name, say.join(", "))));
+            return Err(Missing::Never(format!("{} at {:#x}: readings make no sense: {}", f.name, f.base, say.join(", "))));
         }
         b.last = v;
         Ok(b)
@@ -402,31 +466,91 @@ impl Board {
         }
     }
 
-    /// The Super I/O's configuration: enter it (the key, twice), read the chip's ID,
-    /// let LpcIO find the devices' address ranges (it allows only those), read the
-    /// hardware monitor's base; leave it. (with the mutex)
-    fn find(&self) -> Result<(Kind, u64, u64), String> {
+    /// The Super I/O's configuration, at 0x2E then 0x4E: an ITE chip that's already
+    /// in it (Gigabyte's second chips stay so), else Nuvoton's and Fintek's key (0x87
+    /// twice), else ITE's (0x87 0x01 0x55 0x55, 0xAA at 0x4E); the chip's ID; LpcIO
+    /// finds the devices' address ranges (it allows only those); the monitor's base
+    /// and whether it's on; then the configuration left as found. (with the mutex)
+    fn find(&self) -> Result<Found, String> {
         let m = &self.m;
         let outb = |port: u64, v: u64| m.call("ioctl_pio_outb", &[port, v], &mut []);
-        let sio = |r: u64| m.read("ioctl_superio_inb", r);
+        let sin = |r: u64| m.read("ioctl_superio_inb", r).map(|v| v as u8);
+        let sout = |r: u64, v: u64| m.call("ioctl_superio_outb", &[r, v], &mut []);
+        let inw = |r: u64| m.read("ioctl_superio_inw", r).unwrap_or(0xffff) as u16;
         let mut seen = Vec::new();
         for (slot, port) in [(0u64, 0x2eu64), (1, 0x4e)] {
-            if m.call("ioctl_select_slot", &[slot], &mut []).is_none() || outb(port, 0x87).and_then(|_| outb(port, 0x87)).is_none() {
+            if m.call("ioctl_select_slot", &[slot], &mut []).is_none() {
                 seen.push(format!("{port:#x}: no access"));
                 continue;
             }
-            let id = m.read("ioctl_superio_inw", SIO_ID).unwrap_or(0xffff) as u16;
-            let mut got = Err(format!("{port:#x}: chip ID {id:#06x}"));
-            if let Some(k) = kind(id) {
-                if m.call("ioctl_find_bars", &[], &mut []).is_some() && m.call("ioctl_superio_outb", &[0x07, LD_HWM], &mut []).is_some() {
-                    let base = m.read("ioctl_superio_inw", SIO_ADDR).unwrap_or(0) & 0xfff8;
-                    let on = sio(SIO_ENABLE).is_some_and(|v| v & 1 != 0);
-                    got = if base >= 0x100 && on { Ok((k, base, port)) } else { Err(format!("{port:#x}: {} with its monitor at {base:#x}, {}", k.name, if on { "on" } else { "off" })) };
+            // (which key, if any, was sent: 0 none, 1 Nuvoton/Fintek, 2 ITE)
+            let mut key = 0;
+            let mut id = inw(SIO_ID);
+            let mut fam = ite(id).map(Fam::Ite);
+            if fam.is_none() {
+                if outb(port, 0x87).and_then(|_| outb(port, 0x87)).is_none() {
+                    seen.push(format!("{port:#x}: no access"));
+                    continue;
+                }
+                key = 1;
+                id = inw(SIO_ID);
+                fam = if kind(id).is_some() {
+                    Some(Fam::Nct)
+                } else if inw(0x23) == FIN_VENDOR {
+                    fin(id).map(Fam::Fin)
                 } else {
-                    got = Err(format!("{port:#x}: {}, no address ranges", k.name));
+                    None
+                };
+            }
+            if fam.is_none() {
+                outb(port, 0xaa);
+                let second = if port == 0x4e { 0xaa } else { 0x55 };
+                if [0x87, 0x01, 0x55, second].iter().all(|&b| outb(port, b).is_some()) {
+                    key = 2;
+                    id = inw(SIO_ID);
+                    fam = ite(id).map(Fam::Ite);
                 }
             }
-            outb(port, 0xaa);
+            let Some(fam) = fam else {
+                seen.push(format!("{port:#x}: chip ID {id:#06x}"));
+                if key == 2 {
+                    sout(0x02, 0x02);
+                }
+                continue;
+            };
+            let (name, ld) = match fam {
+                Fam::Nct => (kind(id).map_or("", |k| k.name), LD_HWM),
+                Fam::Ite(c) => (c.name, ITE_LD),
+                Fam::Fin(c) => (c.name, FIN_LD),
+            };
+            let ldn0 = sin(SIO_LDSEL);
+            let mut got = Err(format!("{port:#x}: {name}, no address ranges"));
+            if m.call("ioctl_find_bars", &[], &mut []).is_some() && sout(SIO_LDSEL, ld).is_some() {
+                let base = m.read("ioctl_superio_inw", SIO_ADDR).unwrap_or(0) & 0xfff8;
+                let on = sin(SIO_ENABLE).is_some_and(|v| v & 1 != 0);
+                let mut gpio2c = 0;
+                if matches!(fam, Fam::Ite(_)) && sout(SIO_LDSEL, ITE_GPIO_LD).is_some() {
+                    gpio2c = sin(0x2c).unwrap_or(0);
+                }
+                got = if base >= 0x100 && on {
+                    Ok(Found { fam, nct: kind(id).filter(|_| fam == Fam::Nct), name, base, port, gpio2c })
+                } else {
+                    Err(format!("{port:#x}: {name} with its monitor at {base:#x}, {}", if on { "on" } else { "off" }))
+                };
+            }
+            // (the device select back; the configuration left only if this entered it)
+            if let Some(l) = ldn0 {
+                sout(SIO_LDSEL, l as u64);
+            }
+            match key {
+                1 => {
+                    outb(port, 0xaa);
+                }
+                2 => {
+                    sout(0x02, 0x02);
+                }
+                _ => {}
+            }
             match got {
                 Ok(f) => return Ok(f),
                 Err(e) => seen.push(e),
@@ -435,55 +559,12 @@ impl Board {
         Err(seen.join("; "))
     }
 
-    /// What to read each time: the fans' speed, duty and mode, the voltage inputs,
-    /// and the temperatures the chip monitors (their sources and the voltage limits
-    /// are read now, once).
-    fn plan(&mut self, k: &Kind) -> Option<()> {
-        let _held = self.hold()?;
-        let (mut io, ok) = Io::begin(&self.m, self.port, self.sio);
-        if !ok {
-            io.end();
-            return None;
-        }
-        let mut regs = Vec::new();
-        let mut add = |r: u16| {
-            regs.push(r);
-            regs.len() - 1
-        };
-        let mut items = Vec::new();
-        for i in 0..REG_FAN.len() {
-            items.push(Item { kind: B_FAN, n: i as u8 + 1, label: "", at: [add(REG_FAN[i]), add(REG_PWM[i]), add(REG_FAN_MODE[i])], scale: 1.0, lo: 0.0, hi: 0.0 });
-        }
-        let mut fail = false;
-        for i in 0..k.ins {
-            let scale = k.scale[i] as f32 / 100_000.0;
-            let mut lim = |r: u16| io.reg(r).map_or_else(|| { fail = true; 0.0 }, |v| v as f32 * scale);
-            let (lo, hi) = (lim(REG_IN_MIN[i]), lim(REG_IN_MAX[i]));
-            items.push(Item { kind: B_VOLT, n: i as u8, label: "", at: [add(REG_IN[i]), 0, 0], scale, lo, hi });
-        }
-        for (n, reg, x) in temps(k, &mut |r| io.reg(r).map(|v| v as u8)) {
-            let label = k.labels[x as usize];
-            if !label.is_empty() {
-                items.push(Item { kind: B_TEMP, n, label, at: [add(reg), 0, 0], scale: 1.0, lo: 0.0, hi: 0.0 });
-            }
-        }
-        io.end();
-        if fail {
-            return None;
-        }
-        // (read bank by bank)
-        let mut order: Vec<usize> = (0..regs.len()).collect();
-        order.sort_by_key(|&i| regs[i] >> 8);
-        (self.regs, self.order, self.items) = (regs, order, items);
-        Some(())
-    }
-
     /// Read every register now (with the mutex) and make the readings.
     fn read_now(&mut self) -> Option<Vec<Reading>> {
         let mut v = vec![0u16; self.regs.len()];
         {
             let _held = self.hold()?;
-            let (mut io, mut ok) = Io::begin(&self.m, self.port, self.sio);
+            let (mut io, mut ok) = Io::begin(&self.m, self.port, self.fam == Fam::Nct, self.sio);
             for &i in self.order.iter().take(if ok { usize::MAX } else { 0 }) {
                 match io.reg(self.regs[i]) {
                     Some(x) => v[i] = x,
@@ -498,19 +579,39 @@ impl Board {
                 return None;
             }
         }
+        let byte = |i: usize| if i == NONE { 0 } else { v[i] as u8 };
+        let s8 = |i: usize| byte(i) as i8 as f32;
         let mut out = vec![Reading { kind: B_CHIP, label: self.name.into(), ..Reading::default() }];
         for it in &self.items {
-            let x = v[it.at[0]];
             let mut r = Reading { kind: it.kind, n: it.n, label: it.label.into(), pwm: -1.0, en: -1, ..Reading::default() };
-            match it.kind {
-                B_FAN => {
-                    let (duty, mode) = (v[it.at[1]] as u8, (v[it.at[2]] >> 4) as u8 & 7);
-                    r.val = x as f32;
+            match (it.kind, self.fam) {
+                (B_FAN, Fam::Nct) => {
+                    let (duty, mode) = (byte(it.at[1]), (byte(it.at[2]) >> 4) & 7);
+                    r.val = v[it.at[0]] as f32;
                     r.pwm = duty as f32 / 255.0;
                     r.en = if mode == 0 && duty == 255 { 0 } else { mode as i8 + 1 };
                 }
-                B_VOLT => (r.val, r.lo, r.hi) = (x as f32 * it.scale, it.lo, it.hi),
-                _ => r.val = temp_c(self.regs[it.at[0]], x),
+                (B_FAN, Fam::Ite(c)) => {
+                    let wide = it.at[1] != NONE;
+                    let count = if wide { (byte(it.at[1]) as u16) << 8 | byte(it.at[0]) as u16 } else { byte(it.at[0]) as u16 };
+                    let rpm = ite_rpm(count, wide, ite_div(byte(self.shared[1]), it.n));
+                    r.val = rpm.unwrap_or(-1.0);
+                    if it.at[2] != NONE {
+                        (r.pwm, r.en) = ite_pwm(c, it.n, byte(self.shared[0]), byte(it.at[2]), byte(it.at[3]));
+                    }
+                }
+                (B_FAN, Fam::Fin(c)) => {
+                    r.val = fin_rpm((byte(it.at[0]) as u16) << 8 | byte(it.at[1]) as u16);
+                    (r.pwm, r.en) = fin_pwm(c, it.n - 1, byte(self.shared[0]), byte(self.shared[1]), byte(it.at[2]));
+                }
+                (B_VOLT, _) => (r.val, r.lo, r.hi) = (v[it.at[0]] as f32 * it.scale, it.lo, it.hi),
+                (_, Fam::Nct) => r.val = temp_c(self.regs[it.at[0]], v[it.at[0]]),
+                (_, Fam::Fin(c)) => {
+                    // (an open diode: no reading)
+                    let open = byte(self.shared[2]) & (1 << (c.t0 + it.n - 1)) != 0;
+                    r.val = if open { -128.0 } else { s8(it.at[0]) };
+                }
+                _ => r.val = s8(it.at[0]),
             }
             out.push(r);
         }
@@ -530,12 +631,92 @@ impl Board {
     }
 }
 
-/// Does a first reading look like a working chip: the CPU's core voltage (in0) in
-/// range and some temperature a computer's insides could have? (a wrong address
-/// reads all ones or zeros)
+/// What to read each time, by the chip's family (its configuration read now, once):
+/// the registers, the readings made of them and the registers every fan needs; an
+/// error says why a chip isn't read (empty: try again later).
+type Plan = (Vec<u16>, Vec<Item>, [usize; 3]);
+
+fn plan(f: &Found, io: &mut Io) -> Result<Plan, String> {
+    let later = || String::new();
+    let mut regs = Vec::new();
+    let mut add = |r: u16| {
+        regs.push(r);
+        regs.len() - 1
+    };
+    let mut items = Vec::new();
+    let mut shared = [NONE; 3];
+    let item = |kind, n, label, at, scale| Item { kind, n, label, at, scale, lo: 0.0, hi: 0.0 };
+    match f.fam {
+        Fam::Nct => {
+            let k = f.nct.as_ref().ok_or_else(later)?;
+            for i in 0..REG_FAN.len() {
+                items.push(item(B_FAN, i as u8 + 1, "", [add(REG_FAN[i]), add(REG_PWM[i]), add(REG_FAN_MODE[i]), NONE], 1.0));
+            }
+            for i in 0..k.ins {
+                let scale = k.scale[i] as f32 / 100_000.0;
+                let lo = io.reg(REG_IN_MIN[i]).ok_or_else(later)? as f32 * scale;
+                let hi = io.reg(REG_IN_MAX[i]).ok_or_else(later)? as f32 * scale;
+                items.push(Item { lo, hi, ..item(B_VOLT, i as u8, "", [add(REG_IN[i]), NONE, NONE, NONE], scale) });
+            }
+            for (n, reg, x) in temps(k, &mut |r| io.reg(r).map(|v| v as u8)) {
+                let label = k.labels[x as usize];
+                if !label.is_empty() {
+                    items.push(item(B_TEMP, n, label, [add(reg), NONE, NONE, NONE], 1.0));
+                }
+            }
+        }
+        Fam::Ite(c) => {
+            let mut r = |x: u16| io.reg(x).map(|v| v as u8).ok_or_else(later);
+            // (the chip's own check: its vendor register, and the reset bit clear)
+            if r(ITE_VENDOR)? != 0x90 || r(0x00)? & 0x80 != 0 {
+                return Err(format!("{} at {:#x}: not answering as one", c.name, f.base));
+            }
+            let (main, fan16) = (r(ITE_MAIN)?, r(ITE_FAN16)?);
+            let (en, extra) = (r(ITE_TEMP_EN)?, if c.f & SIX_TEMP != 0 { r(ITE_TEMP_EXTRA)? } else { 0 });
+            shared = [add(ITE_MAIN), add(ITE_DIV), NONE];
+            for (n, wide) in ite_fans(c, main, fan16) {
+                let i = n as usize - 1;
+                let hi = if wide { add(ITE_FAN_HI[i]) } else { NONE };
+                let (ctl, duty) = if i < c.pwms { (add(ITE_PWM_CTL[i]), if c.f & NEWER_PWM != 0 { add(ITE_PWM_DUTY[i]) } else { NONE }) } else { (NONE, NONE) };
+                items.push(item(B_FAN, n, "", [add(ITE_FAN_LO[i]), hi, ctl, duty], 1.0));
+            }
+            for (n, reg, mul, label) in ite_ins(c, f.gpio2c) {
+                items.push(item(B_VOLT, n, label, [add(reg), NONE, NONE, NONE], c.lsb * mul / 1000.0));
+            }
+            for (n, reg) in ite_temps(c, en, extra) {
+                items.push(item(B_TEMP, n, "", [add(reg), NONE, NONE, NONE], 1.0));
+            }
+        }
+        Fam::Fin(c) => {
+            let start = io.reg(FIN_START).ok_or_else(later)? as u8;
+            if start & 4 != 0 || start & 3 == 0 {
+                return Err(format!("{} at {:#x}: its monitor is off", c.name, f.base));
+            }
+            shared = [add(FIN_MODES), if c.banked { add(FIN_BANK) } else { NONE }, add(FIN_OPEN)];
+            if start & 2 != 0 {
+                for i in 0..c.fans as u16 {
+                    let b = 0xa0 + 16 * i;
+                    items.push(item(B_FAN, i as u8 + 1, "", [add(b), add(b + 1), add(b + 3), NONE], 1.0));
+                }
+            }
+            if start & 1 != 0 {
+                for n in (0..11u8).filter(|&n| c.ins & (1 << n) != 0) {
+                    items.push(item(B_VOLT, n, "", [add(0x20 + n as u16), NONE, NONE, NONE], 0.008));
+                }
+                for i in 0..c.temps {
+                    items.push(item(B_TEMP, i + 1, "", [add(0x70 + 2 * (c.t0 + i) as u16), NONE, NONE, NONE], 1.0));
+                }
+            }
+        }
+    }
+    Ok((regs, items, shared))
+}
+
+/// Does a first reading look like a working chip: a voltage a board's rails could
+/// have and a temperature a computer's insides could have? (a wrong address, or a
+/// window that's shut, reads all ones or zeros)
 pub fn plausible(v: &[Reading]) -> bool {
-    let vcore = v.iter().find(|r| r.kind == B_VOLT && r.n == 0).map_or(0.0, |r| r.val);
-    (0.2..=2.5).contains(&vcore) && v.iter().any(|r| r.kind == B_TEMP && (5.0..=110.0).contains(&r.val))
+    v.iter().any(|r| r.kind == B_VOLT && (0.2..=2.5).contains(&r.val)) && v.iter().any(|r| r.kind == B_TEMP && (5.0..=110.0).contains(&r.val))
 }
 
 #[cfg(test)]
@@ -590,6 +771,8 @@ mod tests {
         let r = |kind, n, val| Reading { kind, n, val, ..Reading::default() };
         assert!(plausible(&[r(B_VOLT, 0, 1.25), r(B_TEMP, 1, 31.0)]));
         assert!(!plausible(&[r(B_VOLT, 0, 2.04), r(B_TEMP, 1, -1.0)]));
+        assert!(plausible(&[r(B_VOLT, 0, 3.3), r(B_VOLT, 1, 1.2), r(B_TEMP, 1, 31.0)]));
         assert!(!plausible(&[r(B_VOLT, 0, 0.0), r(B_TEMP, 1, 31.0)]));
+        assert!(!plausible(&[r(B_VOLT, 0, 6.12), r(B_TEMP, 1, 31.0)]));
     }
 }

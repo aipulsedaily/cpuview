@@ -3,6 +3,7 @@
 //! fills the same structures; `term` (the console) is loaded in place of term.rs.
 
 pub mod board;
+pub mod chips;
 pub mod cputemp;
 pub mod drive;
 pub mod pawnio;
