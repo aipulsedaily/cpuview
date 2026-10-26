@@ -1389,6 +1389,7 @@ impl App {
                 (u * 100.0).round() as u64,
                 (f / 10.0) as u64,
                 t.round() as u64,
+                self.title_watts().map_or(0, |w| w.round() as u64),
             ])
         } else {
             0
@@ -1568,6 +1569,16 @@ impl App {
     }
 
     /// Total load, fastest clock (MHz) and hottest sensor (°C, 0 if none).
+    /// Windows, where the CPU's temperature needs a driver but its power doesn't:
+    /// the package's watts where the CPU page would show its temperature.
+    fn title_watts(&self) -> Option<f32> {
+        if cfg!(windows) && self.s.temps.is_empty() {
+            self.z.cpu_watts().0
+        } else {
+            None
+        }
+    }
+
     fn summary(&self) -> (f32, f32, f32) {
         let (u, _, f) = self.totals();
         let t = (0..self.s.temps.len())
@@ -1685,6 +1696,15 @@ impl App {
             t.temp.at((st - 30.0) / 65.0),
         );
         let has_t = !self.s.temps.is_empty();
+        // (Windows without a CPU temperature: the CPU's watts in its place)
+        let tw = self.title_watts();
+        let pw = tw.map_or(F::new(), watts);
+        let (pt, ct) = if has_t || tw.is_none() {
+            (pt, ct)
+        } else {
+            (fc(&["  ", pw.s()]), t.fg | BOLD)
+        };
+        let has_t = has_t || tw.is_some();
         let sum_full: [(&str, u32); 7] = [
             ("  cpu", t.dim),
             (pu.s(), cu),
@@ -2277,7 +2297,10 @@ impl App {
         let mut y = ir.y;
         let maxy = ir.y + ir.h;
         let maxx = ir.x + ir.w;
-        if s.temps.is_empty() {
+        // (Windows: no temperature without a driver, the power always: it comes first,
+        // the hint last)
+        let power_first = self.title_watts().is_some();
+        if s.temps.is_empty() && !power_first {
             Self::line(
                 scr,
                 ir.x,
@@ -2342,7 +2365,7 @@ impl App {
             }
             y += 1;
         }
-        if !skip_blank {
+        if !skip_blank && !power_first {
             y += 1;
         }
         let maxf = s.t.maxf;
@@ -2441,7 +2464,8 @@ impl App {
             &[]
         };
         let power = (self.z.role(crate::sensors::R_PKG).is_some() || locked).then_some(power);
-        for vs in rows.into_iter().chain(power) {
+        let (first, power) = if power_first { (power, None) } else { (None, power) };
+        for vs in first.into_iter().chain(rows).chain(power) {
             if y >= maxy {
                 break;
             }
@@ -2460,6 +2484,10 @@ impl App {
                 .find(|v| Self::spans_len(v) <= ir.w)
                 .unwrap_or(&vs[vs.len() - 1]);
             Self::line(scr, ir.x, y, maxx, bg, sp);
+            y += 1;
+        }
+        if power_first && y < maxy && parts & 1 != 0 {
+            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: run LibreHardwareMonitor with its web server on", th.dim)]);
             y += 1;
         }
         // spare height: one line per CCD (load bar, mean load, mean core clock)
