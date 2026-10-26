@@ -4,6 +4,7 @@
 
 pub mod board;
 pub mod cputemp;
+pub mod drive;
 pub mod pawnio;
 pub mod setup;
 pub mod svc;

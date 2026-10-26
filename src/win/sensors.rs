@@ -9,7 +9,8 @@
 //! - the battery and mains (GetSystemPowerStatus; watts from the battery's IOCTLs),
 //! - the firmware's ACPI thermal zones (PDH "Thermal Zone Information": often a fixed
 //!   or board value, so never called the CPU's),
-//! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence).
+//! - drives' temperatures (NVMe: a storage query, ~0.2 ms of wall time; SATA: their
+//!   SMART tables, while spun up; slow cadence).
 
 use super::*;
 use crate::win::svc::{self, B_CHIP, B_CPU, B_FAN, B_TEMP, B_VOLT};
@@ -104,15 +105,9 @@ fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
     }
 }
 
-/// A drive's temperature (°C), as mem.rs's helper thread reads it.
+/// A drive's temperature (°C), as win/drive.rs reads it.
 fn drive_temp(h: HANDLE) -> Option<f32> {
-    let mut q = [0u8; 12];
-    q[..4].copy_from_slice(&(StorageDeviceTemperatureProperty as u32).to_le_bytes());
-    let mut d: STORAGE_TEMPERATURE_DATA_DESCRIPTOR = unsafe { std::mem::zeroed() };
-    if !ioctl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, &mut d) || d.InfoCount == 0 {
-        return None;
-    }
-    Some(d.TemperatureInfo[0].Temperature as f32)
+    crate::win::drive::temp(h).map(|t| t.0)
 }
 
 impl Sens {
@@ -452,13 +447,13 @@ impl Sens {
         }
     }
 
-    /// NVMe drives that report a temperature: one source each (read slowly).
+    /// Drives that report a temperature (NVMe as Linux's nvme driver has them, SATA
+    /// drives' SMART temperature as its drivetemp has them): one source each, read
+    /// slowly.
     fn drives(&mut self) {
-        let (g, what, class) = chip_info("nvme");
         let mut miss = 0;
         for i in 0..64 {
-            let p = wide(&["\\\\.\\PhysicalDrive", &n2s(i)].concat());
-            let h = unsafe { CreateFileW(p.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+            let h = crate::win::drive::open(i);
             if h == INVALID_HANDLE_VALUE {
                 miss += 1;
                 if miss > 8 {
@@ -467,14 +462,16 @@ impl Sens {
                 continue;
             }
             miss = 0;
-            if drive_temp(h).is_none() {
+            let Some((_, smart)) = crate::win::drive::temp(h) else {
                 close(h);
                 continue;
-            }
-            let dev = ["disk", &n2s(i)].concat();
-            let s = self.src("nvme", "stornvme", what, &dev, S_DRIVE, class, g);
-            let (name, tg, _) = temp_name("nvme", "Composite", 1);
-            let mut r = rd(K_TEMP, s, tg, h2fd(h), "Composite", &name);
+            };
+            let (chip, driver, lab) = if smart { ("drivetemp", "SMART", "temp1") } else { ("nvme", "stornvme", "Composite") };
+            let (g, what, class) = chip_info(chip);
+            let dev = ["disk", &n2s(i as u32), " ", &crate::win::drive::model(h)].concat();
+            let s = self.src(chip, driver, what, dev.trim_end(), S_DRIVE, class, g);
+            let (name, tg, _) = temp_name(chip, if smart { "" } else { lab }, 1);
+            let mut r = rd(K_TEMP, s, tg, h2fd(h), lab, &name);
             (r.warn, r.crit) = temp_limits(tg, None, None);
             self.add(s, r);
         }
