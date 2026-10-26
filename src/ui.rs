@@ -2487,7 +2487,7 @@ impl App {
             y += 1;
         }
         if power_first && y < maxy && parts & 1 != 0 {
-            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: run LibreHardwareMonitor with its web server on", th.dim)]);
+            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: see cpuview --setup-sensors", th.dim)]);
             y += 1;
         }
         // spare height: one line per CCD (load bar, mean load, mean core clock)
