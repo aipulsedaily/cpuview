@@ -2500,7 +2500,7 @@ impl App {
                     continue;
                 }
                 let (bu, u, f) = self.ccd(d);
-                let lab = f!("CCD{d}");
+                let lab = s.t.dom_name(d);
                 scr.text(ir.x, y, lab.s(), th.mid, bg, ir.x + 6);
                 for x in ir.x + lab.n..ir.x + 6 {
                     scr.put(x, y, ' ', 0, bg);
@@ -2826,7 +2826,7 @@ impl App {
             let geo = self.geo(cw, l.mode);
             let lead = if l.mode == M_MICRO { "" } else { " " };
             let label = |d: usize, scr: &mut Screen, y: usize| -> usize {
-                let lab = f!("{lead}CCD{d}");
+                let lab = fc(&[lead, s.t.dom_name(d).s()]);
                 let mut x = scr.text(x0, y, lab.s(), th.text | BOLD, bg, maxx);
                 if let Some(temp) = self.dom_temp(d) {
                     let tt = num(" ", temp, 0, "°");
@@ -2854,7 +2854,7 @@ impl App {
             if let (true, Some(d)) = (l.div && self.sort == 0, first) {
                 x = label(d, scr, ir.y);
             } else if s.t.ndom > 1 && !multi && dom != usize::MAX && self.sort == 0 {
-                let lab = f!("{lead}CCD{dom}");
+                let lab = fc(&[lead, s.t.dom_name(dom).s()]);
                 x = scr.text(x0, ir.y, lab.s(), th.text | BOLD, bg, maxx);
                 if let Some(temp) = self.dom_temp(dom) {
                     let tt = num(" ", temp, 0, "°");
@@ -3470,7 +3470,7 @@ impl App {
         for k in 0..rows {
             if div == Some(k) {
                 let d = self.s.t.ccd[2 * k];
-                let lab = f!("CCD{d}");
+                let lab = self.s.t.dom_name(d);
                 let mut x = scr.text(ir.x, y, lab.s(), th.dim, bg, hx);
                 while x < hx + hw {
                     scr.put(x, y, if x >= hx { '─' } else { ' ' }, th.border, bg);
@@ -3796,7 +3796,7 @@ impl App {
         let mut yy = y;
         let name = f!("C{:0w$}", gi, w = self.idw);
         let ccd = if s.t.ndom > 1 {
-            f!("  ·  CCD{}", s.t.ccd[gi])
+            fc(&["  ·  ", s.t.dom_name(s.t.ccd[gi]).s()])
         } else {
             f!("")
         };
@@ -3819,6 +3819,11 @@ impl App {
             ],
             &mut yy,
         );
+        // (where each core's temperature is known: Windows, with the sensor service)
+        if let Some(&c) = s.core_t.get(gi).filter(|&&c| c > 0.0) {
+            let tc = num("", c, 0, "°C");
+            line(&[("temp    ", th.dim), (tc.s(), th.temp.at((c - 30.0) / 65.0) | BOLD)], &mut yy);
+        }
         let rank = s.t.rank[gi];
         if rank >= 0 {
             let pos = 1 + s.t.rank.iter().filter(|&&r| r > rank).count();
