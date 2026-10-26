@@ -841,18 +841,17 @@ impl App {
         let z = &self.z;
         let th = &self.t;
         let m = z.fan_hint.as_ref().map_or("", |h| h.0.as_str());
-        l.row(2, th.warn, th.dim, -1.0, 0);
-        // (Windows: one line, whatever else Windows itself gives)
+        // (Windows: what needs a driver, in one dim line; two where it doesn't fit)
         if !z.vm && z.fan_hint.as_ref().is_some_and(|h| h.1 == 4) {
-            l.s("CPU temperature and fans: ");
+            l.row(2, th.dim, th.dim, -1.0, 0);
+            l.s("CPU temperature, fans, voltages: ");
             if two {
                 l.row(2, th.dim, 0, -1.0, 0);
-            } else {
-                l.f();
             }
-            l.s("run LibreHardwareMonitor with its web server on");
+            l.s("Windows has none without a driver");
             return;
         }
+        l.row(2, th.warn, th.dim, -1.0, 0);
         let b = match z.fan_hint.as_ref().map(|h| h.1) {
             _ if z.vm => {
                 l.s("no fans: this is a virtual machine");
@@ -997,7 +996,7 @@ impl App {
             l.s(if z.vm {
                 "no power meters (a virtual machine)"
             } else if cfg!(windows) {
-                "no power meters: Windows has none (LibreHardwareMonitor can)"
+                "no power meters: Windows has none here"
             } else {
                 "no power meters on this machine"
             });
@@ -1230,7 +1229,7 @@ impl App {
             }
             _ => {
                 l.s(if cfg!(windows) {
-                    "CPU power: Windows has no energy meter here (LibreHardwareMonitor can read it)"
+                    "CPU power: Windows has no energy meter for this CPU"
                 } else {
                     "CPU power: no energy counters on this CPU"
                 });

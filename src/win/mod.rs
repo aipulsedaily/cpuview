@@ -2,7 +2,6 @@
 //! module it serves, declared there (`sys` → win/cpu.rs, `mem` → win/mem.rs …) so it
 //! fills the same structures; `term` (the console) is loaded in place of term.rs.
 
-pub mod lhm;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{VirtualQuery, VirtualUnlock, MEMORY_BASIC_INFORMATION, MEM_IMAGE};

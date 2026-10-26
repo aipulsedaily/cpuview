@@ -2309,7 +2309,7 @@ impl App {
                 bg,
                 &[(
                     if cfg!(windows) {
-                        "CPU temperature: run LibreHardwareMonitor with its web server on"
+                        "CPU temperature: Windows has none without a driver"
                     } else {
                         "no CPU temperature sensor found"
                     },
@@ -2487,7 +2487,7 @@ impl App {
             y += 1;
         }
         if power_first && y < maxy && parts & 1 != 0 {
-            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: run LibreHardwareMonitor with its web server on", th.dim)]);
+            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: Windows has none without a driver", th.dim)]);
             y += 1;
         }
         // spare height: one line per CCD (load bar, mean load, mean core clock)

@@ -9,13 +9,10 @@
 //! - the battery and mains (GetSystemPowerStatus; watts from the battery's IOCTLs),
 //! - the firmware's ACPI thermal zones (PDH "Thermal Zone Information": often a fixed
 //!   or board value, so never called the CPU's),
-//! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence),
-//! - LibreHardwareMonitor's readings while it runs with its web server (see
-//!   win/lhm.rs): CPU and board temperatures, fans, pump, voltages; looked for while
-//!   cpuview runs, as it may start later or close.
+//! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence).
 
 use super::*;
-use crate::win::{close, fd2h, from_pwstr, from_wide, h2fd, lhm, reg_str, wide};
+use crate::win::{close, fd2h, from_pwstr, from_wide, h2fd, reg_str, wide};
 use windows_sys::Wdk::Graphics::Direct3D::*;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
@@ -27,11 +24,10 @@ use windows_sys::Win32::System::Power::*;
 use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
-/// Windows sources (beyond S_BAT): ACPI zones, a drive, LibreHardwareMonitor, the
-/// energy meter, a graphics card
+/// Windows sources (beyond S_BAT): ACPI zones, a drive, the energy meter, a
+/// graphics card
 pub(super) const S_ACPI: u8 = 6;
 pub(super) const S_DRIVE: u8 = 7;
-pub(super) const S_LHM: u8 = 8;
 pub(super) const S_EMI: u8 = 9;
 pub(super) const S_GPU: u8 = 10;
 
@@ -39,8 +35,7 @@ pub(super) const S_GPU: u8 = 10;
 type NvPower = unsafe extern "C" fn(usize, *mut u32) -> i32;
 
 /// What the Windows sources keep: the thermal zones' query, the energy meter's
-/// query (energy, time), the graphics cards (D3DKMT handle, NVML device or 0), LHM
-/// sensor ids by reading, the snapshot last copied, since when LHM hasn't answered.
+/// query (energy, time), the graphics cards (D3DKMT handle, NVML device or 0).
 pub struct State {
     zq: PDH_HQUERY,
     zc: PDH_HCOUNTER,
@@ -52,9 +47,6 @@ pub struct State {
     earr: Vec<u64>,
     gpus: Vec<(u32, usize)>,
     nv_power: Option<NvPower>,
-    lhm_id: Vec<(usize, String)>,
-    lhm_gen: u32,
-    lhm_gone: Option<i64>,
 }
 
 impl State {
@@ -69,16 +61,14 @@ impl State {
             earr: Vec::new(),
             gpus: Vec::new(),
             nv_power: None,
-            lhm_id: Vec::new(),
-            lhm_gen: 0,
-            lhm_gone: None,
         }
     }
 }
 
-/// The hint while LibreHardwareMonitor isn't running (sensui.rs: kind 4).
-fn lhm_hint() -> Option<(String, u8)> {
-    Some(("LibreHardwareMonitor".into(), 4))
+/// The CPU's temperatures, the board's fans and voltages need a driver (sensui.rs:
+/// hint kind 4).
+fn driver_hint() -> Option<(String, u8)> {
+    Some((String::new(), 4))
 }
 
 fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
@@ -108,41 +98,6 @@ fn drive_temp(h: HANDLE) -> Option<f32> {
     Some(d.TemperatureInfo[0].Temperature as f32)
 }
 
-/// LibreHardwareMonitor's hardware id → group.
-fn lhm_group(hwid: &str) -> u8 {
-    let h = hwid.trim_start_matches('/');
-    let p = |s: &str| h.starts_with(s);
-    if p("intelcpu") || p("amdcpu") || p("cpu") {
-        G_CPU
-    } else if p("gpu") {
-        G_GPU
-    } else if p("lpc") || p("mainboard") || p("motherboard") || p("ec") {
-        G_BOARD
-    } else if p("nvme") || p("hdd") || p("ssd") || p("storage") || p("ata") || p("scsi") {
-        G_DISK
-    } else if p("ram") || p("memory") || p("dimm") {
-        G_MEM
-    } else if p("nic") {
-        G_NET
-    } else {
-        G_OTHER
-    }
-}
-
-/// Plain names for LibreHardwareMonitor's CPU temperatures on the CPU page: the
-/// package (Intel), Tctl and the CCDs' (AMD); the labels sys.rs's domains look for.
-pub fn cpu_temp_label(text: &str) -> Option<String> {
-    if text == "CPU Package" {
-        Some("Pkg".into())
-    } else if text.starts_with("Core (Tctl") {
-        Some("Tctl".into())
-    } else if let Some(n) = text.strip_prefix("CCD").and_then(|r| r.split([' ', '(']).next()) {
-        n.parse::<u32>().ok().map(|n| ["Tccd", &n2s(n)].concat())
-    } else {
-        None
-    }
-}
-
 impl Sens {
     /// Find everything, once, and read it.
     pub fn detect(&mut self, now: i64) {
@@ -158,73 +113,15 @@ impl Sens {
         self.emi();
         self.gpus();
         self.drives();
-        self.lhm(true);
         self.batteries();
         self.finish_names();
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
-        if !self.vm && !self.srcs.iter().any(|s| s.kind == S_LHM) {
-            self.fan_hint = lhm_hint();
+        if !self.vm {
+            self.fan_hint = driver_hint();
         }
         for i in 0..self.srcs.len() {
             self.read_src(i, now);
         }
-    }
-
-    /// LibreHardwareMonitor started or closed since detection: its readings added
-    /// when it first answers (from the helper's snapshot, asked for after its server
-    /// was seen listening: lhm::look), and dropped, the hint back, when it hasn't
-    /// answered for 20 s (they keep their last values until then).
-    pub(super) fn win_tick(&mut self, now: i64) {
-        if self.vm {
-            return;
-        }
-        if let Some(s) = self.srcs.iter().position(|s| s.kind == S_LHM) {
-            if lhm::live() {
-                self.w.lhm_gone = None;
-            } else if now - *self.w.lhm_gone.get_or_insert(now) >= 20 * SEC {
-                self.w.lhm_gone = None;
-                self.drop_src(s);
-                self.fan_hint = lhm_hint();
-            }
-            return;
-        }
-        if !lhm::live() {
-            // (the main loop's time, charged as such: not part of the sensors' plan)
-            lhm::look(now);
-            return;
-        }
-        let (t0, n, hists) = (thread_ns(), self.srcs.len(), self.rd.iter().any(|r| r.hist.is_some()));
-        self.lhm(false);
-        if self.srcs.len() > n {
-            self.finish_names();
-            self.hists(hists);
-            self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
-            self.fan_hint = None;
-            self.spent += (thread_ns() - t0).max(0);
-            self.read_src(n, now);
-        }
-    }
-
-    /// Source `s` and its readings gone (LibreHardwareMonitor closed): the indices
-    /// after them move down.
-    fn drop_src(&mut self, s: usize) {
-        let gone: Vec<bool> = self.rd.iter().map(|r| r.src as usize == s).collect();
-        for b in &mut self.bats {
-            b.rd -= gone[..b.rd].iter().filter(|&&g| g).count();
-        }
-        let mut k = 0;
-        self.rd.retain(|_| {
-            k += 1;
-            !gone[k - 1]
-        });
-        for r in &mut self.rd {
-            if r.src as usize > s {
-                r.src -= 1;
-            }
-        }
-        self.srcs.remove(s);
-        self.w.lhm_id.clear();
-        self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
     }
 
     /// The firmware's thermal zones (one PDH query for all of them).
@@ -453,88 +350,6 @@ impl Sens {
         }
     }
 
-    /// LibreHardwareMonitor's sensors, if its web server answers (`fetch`: asked now,
-    /// else from the helper's snapshot): its temperatures, fans, voltages and power
-    /// readings, grouped by the hardware they belong to. Not what Windows already
-    /// gives here: the CPU's package / cores / RAM power (the energy meter reads the
-    /// same counters), a card's temperature, fans and power, the drives'.
-    fn lhm(&mut self, fetch: bool) {
-        let v = if !fetch {
-            lhm::with(|v| v.to_vec())
-        } else if lhm::listening() {
-            lhm::fetch().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if v.is_empty() {
-            return;
-        }
-        let emi = self.srcs.iter().any(|s| s.kind == S_EMI);
-        let gpus = self.srcs.iter().any(|s| s.kind == S_GPU);
-        let drives = self.srcs.iter().any(|s| s.kind == S_DRIVE);
-        let mut s = usize::MAX;
-        let mut gpu = gpus;
-        for (k, x) in v.iter().enumerate() {
-            let kind = match x.typ.as_str() {
-                "Temperature" => K_TEMP,
-                "Fan" => K_FAN,
-                "Voltage" => K_VOLT,
-                "Power" => K_POWER,
-                _ => continue,
-            };
-            // (TjMax distances repeat the temperatures; the cores' are too many)
-            if x.text.starts_with("Distance to TjMax") {
-                continue;
-            }
-            let g = lhm_group(&x.hwid);
-            let dup = match (g, kind) {
-                (G_CPU, K_POWER) => emi && matches!(x.text.as_str(), "CPU Package" | "Package" | "CPU Cores" | "Cores" | "CPU Memory"),
-                (G_GPU, K_FAN | K_POWER) => gpus,
-                (G_GPU, K_TEMP) => gpus && x.text == "GPU Core",
-                (G_DISK, K_TEMP) => drives,
-                _ => false,
-            };
-            if dup {
-                continue;
-            }
-            if s == usize::MAX {
-                s = self.src("LibreHardwareMonitor", "LHM", "LibreHardwareMonitor (web server)", "", S_LHM, 1, G_BOARD);
-            }
-            let generic = matches!(x.text.as_str(), "Temperature" | "Composite Temperature" | "Power" | "Fan" | "Total");
-            let name = if generic || g == G_GPU && !x.text.starts_with("GPU") { [&x.hw, " ", &x.text].concat() } else { x.text.clone() };
-            // (beside the name: the hardware it belongs to; fans keep their own)
-            let raw = if kind == K_FAN { &x.text } else { &x.hw };
-            let mut r = rd(kind, s, g, k as c_int, raw, &name);
-            match kind {
-                K_TEMP => {
-                    (r.warn, r.crit) = temp_limits(g, None, None);
-                    r.minor = g == G_CPU && (x.text.starts_with("CPU Core #") || x.text.starts_with("Core #") || x.text.starts_with("P-Core #") || x.text.starts_with("E-Core #"));
-                }
-                K_FAN => r.group = G_BOARD,
-                K_POWER => {
-                    r.role = match (g, x.text.as_str()) {
-                        (G_CPU, "CPU Package" | "Package") => R_PKG,
-                        (G_CPU, "CPU Cores" | "Cores") => R_CORES,
-                        (G_CPU, "CPU Memory") => R_DRAM,
-                        (G_CPU, t) if t.contains("Core #") => R_CORE,
-                        (G_GPU, t) if !gpu && (t.contains("Package") || t.contains("Power") || t.contains("Total")) => {
-                            gpu = true;
-                            R_GPU
-                        }
-                        _ => R_OTHER,
-                    };
-                    r.minor = r.role == R_CORE;
-                }
-                _ => {}
-            }
-            self.w.lhm_id.push((self.rd.len(), x.id.clone()));
-            self.add(s, r);
-        }
-        if fetch {
-            lhm::set(v);
-        }
-    }
-
     /// The battery (GetSystemPowerStatus) and, where its driver answers, its watts.
     fn batteries(&mut self) {
         let mut ps: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
@@ -598,7 +413,7 @@ impl Sens {
         }
     }
 
-    /// Read a Windows source (ACPI zones, a drive, LibreHardwareMonitor's snapshot).
+    /// Read a Windows source (ACPI zones, a drive, the energy meter, a graphics card).
     pub(super) fn read_win(&mut self, i: usize) {
         match self.srcs[i].kind {
             S_ACPI => {
@@ -650,38 +465,6 @@ impl Sens {
                         r.max = r.max.max(r.val);
                     }
                 }
-            }
-            S_LHM => {
-                // the helper's last snapshot, and a fresh one asked for (its cost: the
-                // helper's last fetch)
-                let g = lhm::gen();
-                if g != self.w.lhm_gen {
-                    self.w.lhm_gen = g;
-                    self.srcs[i].cost = self.srcs[i].cost.max(lhm::COST.load(std::sync::atomic::Ordering::Relaxed));
-                }
-                lhm::request();
-                // (no answer: the last values stay, see win_tick)
-                if !lhm::live() {
-                    return;
-                }
-                let (ids, rd) = (&self.w.lhm_id, &mut self.rd);
-                lhm::with(|v| {
-                    for (k, id) in ids {
-                        let r = &mut rd[*k];
-                        let x = v.get(r.fd as usize).filter(|x| x.id == *id).or_else(|| v.iter().find(|x| x.id == *id));
-                        let val = x.map_or(f32::NAN, |x| x.val);
-                        r.ok = match r.kind {
-                            K_TEMP => temp_ok(val, false, None),
-                            K_FAN => (0.0..30000.0).contains(&val),
-                            _ => val.is_finite(),
-                        };
-                        r.val = if r.ok { val } else { 0.0 };
-                        if r.ok && (r.kind != K_FAN || r.val > 0.0) {
-                            r.seen = true;
-                            r.max = r.max.max(r.val);
-                        }
-                    }
-                });
             }
             _ => {}
         }
@@ -766,7 +549,7 @@ fn battery_device() -> Option<(HANDLE, u32)> {
     }
 }
 
-/// `cpuview --setup-sensors` on Windows: nothing to set up, only what to run.
+/// `cpuview --setup-sensors` on Windows: what Windows offers, and what needs a driver.
 pub fn setup(_undo: bool, _per_core: bool, _bmc: bool, _dry: bool) -> i32 {
     println!(
         "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
@@ -774,23 +557,7 @@ disks, network, processes, the CPU's power (Windows' energy meter), graphics car
 temperature, fan and (NVIDIA) watts, the battery, NVMe drive temperatures and the
 firmware's ACPI thermal zones. Windows has no interface for CPU temperatures, the
 board's fans (CPU fan, case fans, pump) or voltages without a kernel driver, and
-cpuview installs none.
-
-To see them, run LibreHardwareMonitor (https://github.com/LibreHardwareMonitor/
-LibreHardwareMonitor, free) and turn on Options → Remote Web Server (port 8085;
-it listens on your network too: allow it in the firewall only for this computer).
-cpuview then reads its sensors from http://localhost:8085/data.json, on the
-Sensors & Power page and the CPU page, also when it starts after cpuview (set
-CPUVIEW_LHM=host:port for another port). cpuview itself needs no administrator
-rights."
+this build of cpuview loads none."
     );
-    if lhm::listening() {
-        match lhm::fetch() {
-            Some(v) => println!("\nLibreHardwareMonitor answers: {} readings.", v.len()),
-            None => println!("\nSomething listens on its port, but data.json didn't come back."),
-        }
-    } else {
-        println!("\nLibreHardwareMonitor's web server isn't running now.");
-    }
     0
 }

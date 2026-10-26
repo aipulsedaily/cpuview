@@ -15,12 +15,12 @@
 use crate::sys::{isort, pread, Ring};
 use std::os::raw::c_int;
 
-/// The Windows sources (battery, ACPI zones, drives, LibreHardwareMonitor).
+/// The Windows sources (battery, ACPI zones, drives, the energy meter, graphics cards).
 #[cfg(windows)]
 #[path = "win/sensors.rs"]
 mod win;
 #[cfg(windows)]
-pub use win::{cpu_temp_label, setup};
+pub use win::setup;
 
 pub const SEC: i64 = 1_000_000_000;
 
@@ -1352,9 +1352,6 @@ impl Sens {
         if !self.detected {
             self.enter(now);
         }
-        // (Windows: LibreHardwareMonitor may have started or closed meanwhile)
-        #[cfg(windows)]
-        self.win_tick(now);
         // (eco: one dear read (over 0.2 ms) at a time, 30 s apart unless twice
         // overdue, so their costs don't pile up in the same minute)
         let mut ld = i64::MIN;
@@ -1477,8 +1474,6 @@ impl Sens {
         if !self.detected {
             self.enter(now);
         }
-        #[cfg(windows)]
-        self.win_tick(now);
         if enter {
             self.hists(false);
         }

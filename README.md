@@ -82,11 +82,8 @@ graphics cards' temperature and fan (any vendor, as Task Manager shows them) and
 card's watts (NVML, which comes with its driver; ~14 MB of memory), the battery, NVMe
 drives' temperatures and the firmware's ACPI thermal zones all come from Windows itself. CPU
 temperatures, the board's fans (CPU fan, case fans, pump) and voltages don't: Windows has no
-interface for them without a kernel driver, and cpuview loads none. Run
-[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) with its
-web server on (Options → Remote Web Server) and cpuview shows them on the Sensors & Power
-page and the CPU page, also when it starts after cpuview (`cpuview --setup-sensors`
-explains). Linux-only: containers, systemd services, a server board's BMC, per-core RAPL,
+interface for them without a kernel driver, and this build loads none (the pages say so in
+one dim line). Linux-only: containers, systemd services, a server board's BMC, per-core RAPL,
 Ctrl-Z. The load average is an estimate (the busy CPUs, decayed like Linux's); processes'
 read / write counts are all their I/O (disk, network and pipes together).
 
