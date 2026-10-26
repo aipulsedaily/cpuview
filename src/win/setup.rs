@@ -1,17 +1,19 @@
-//! `cpuview --setup-sensors` on Windows: what cpuview reads and how to see more, and
-//! installing / removing cpuview's sensor service (win/svc.rs): CPU temperatures
-//! through the PawnIO driver, which it doesn't install (`winget install
-//! namazso.PawnIO`).
+//! `cpuview --setup-sensors` on Windows: everything the sensors need, in one step:
+//! the PawnIO driver (through winget), its signed modules and cpuview's sensor
+//! service (win/svc.rs); `--undo` removes what it added (PawnIO too, if it installed
+//! it).
 //!
-//! It shows what it would do and asks first; then it runs itself elevated (one UAC
-//! prompt), and that does everything in places only administrators may write: a SYSTEM
-//! service must never run a program from a folder the user can change. The modules
-//! come from PawnIO.Modules' release, pinned by SHA-256 (the driver checks their
-//! signatures too). Where things go never comes from the user's environment, which
-//! the elevated run inherits (Program Files from the registry, System32 from Windows),
-//! and its log is in the program's folder there: never anywhere a user may create
-//! files or links (%ProgramData%'s default lets them), which an elevated program
-//! could be made to overwrite any file through.
+//! It shows what it would do and why, and asks first; then it runs itself elevated
+//! (one UAC prompt), and that does everything in places only administrators may
+//! write: a SYSTEM service must never run a program from a folder the user can
+//! change. PawnIO comes at a pinned version through winget (which checks its
+//! installer's hash), run from its package's folder, never the user's alias of it;
+//! the modules come from PawnIO.Modules' release, pinned by SHA-256 (the driver
+//! checks their signatures too). Where things go never comes from the user's
+//! environment, which the elevated run inherits (Program Files from the registry,
+//! System32 from Windows), and its log is in the program's folder there: never
+//! anywhere a user may create files or links (%ProgramData%'s default lets them),
+//! which an elevated program could be made to overwrite any file through.
 
 use super::svc::{self, SERVICE};
 use super::*;
@@ -28,10 +30,18 @@ use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_
 /// PawnIO.Modules' signed release, and the modules taken from it (with its licence)
 const MODULES_URL: &str = "https://github.com/namazso/PawnIO.Modules/releases/download/0.2.11/release_0_2_11.zip";
 const MODULES_SHA256: &str = "43608cb89bc84247fef1368a139013f7d043e17db6d6c8dfc9b46bf0905a81f4";
-const MODULES: [(&str, &str); 2] = [
+const MODULES: [(&str, &str); 3] = [
     ("IntelMSR.bin", "d6ed85d65ab17a22f813ef98207d6d537155ee2ded5976a21cb48413c9b92e5f"),
     ("AMDFamily17.bin", "dae74615761b78bdf064dfb3e136252ddcc6fc727d88f14738d0e5800d427a91"),
+    ("LpcIO.bin", "b3896a1cab0d808fca31fe2ebcae045d59dac690da87b17c858bb8da357eb45e"),
 ];
+/// PawnIO through winget, at the version cpuview was tested with
+const PAWNIO_ID: &str = "namazso.PawnIO";
+const PAWNIO_VERSION: &str = "2.2.0";
+/// in the program's folder: PawnIO was installed by cpuview (--undo removes it)
+const PAWNIO_MARK: &str = "pawnio-installed-by-cpuview";
+/// winget's package family
+const WINGET_FAMILY: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
 
 /// %ProgramFiles%\cpuview, Program Files as the registry has it (only administrators
 /// may change that; the environment variable is the user's).
@@ -55,25 +65,59 @@ fn log_path() -> PathBuf {
     program_dir().join("setup.log")
 }
 
+/// winget, from its package's folder under Program Files\WindowsApps (only the system
+/// may change it), as Windows' package registry has it: never the alias in the user's
+/// folder, which a program of the user's could replace before it runs elevated.
+fn winget() -> Option<PathBuf> {
+    use windows_sys::Win32::Storage::Packaging::Appx::{GetPackagePathByFullName, GetPackagesByPackageFamily};
+    let fam = wide(WINGET_FAMILY);
+    let (mut n, mut len) = (0u32, 0u32);
+    unsafe { GetPackagesByPackageFamily(fam.as_ptr(), &mut n, std::ptr::null_mut(), &mut len, std::ptr::null_mut()) };
+    if n == 0 || len == 0 {
+        return None;
+    }
+    let mut names = vec![std::ptr::null_mut::<u16>(); n as usize];
+    let mut buf = vec![0u16; len as usize];
+    if unsafe { GetPackagesByPackageFamily(fam.as_ptr(), &mut n, names.as_mut_ptr(), &mut len, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let apps = program_dir().parent()?.join("WindowsApps");
+    names.iter().take(n as usize).rev().find_map(|&full| {
+        let mut plen = 0u32;
+        unsafe { GetPackagePathByFullName(full, &mut plen, std::ptr::null_mut()) };
+        let mut p = vec![0u16; plen.max(1) as usize];
+        if unsafe { GetPackagePathByFullName(full, &mut plen, p.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let dir = PathBuf::from(from_wide(&p));
+        let exe = dir.join("winget.exe");
+        (dir.starts_with(&apps) && exe.is_file()).then_some(exe)
+    })
+}
+
 /// `cpuview --setup-sensors [--undo] [--dry-run]`.
 pub fn setup(undo: bool, dry: bool) -> i32 {
     if std::env::args().any(|a| a == "--elevated") {
         return elevated(undo);
     }
     let svc_state = svc::installed();
+    let (has_pawnio, dir) = (pawnio::installed(), program_dir());
+    let ours = dir.join(PAWNIO_MARK).exists();
     println!(
         "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
 disks, network, processes, the CPU's power (Windows' energy meter), graphics cards'
 temperature, fan and (NVIDIA) watts, the battery, NVMe drive temperatures and the
-firmware's ACPI thermal zones. CPU temperatures, the board's fans (CPU fan, case
-fans, pump) and voltages need a kernel driver.
+firmware's ACPI thermal zones. The CPU's temperatures, the board's fans (CPU fan,
+case fans, pump), voltages and temperatures need a kernel driver: Windows has no
+interface for them.
 
-CPU temperatures: cpuview's sensor service reads them through PawnIO, a signed
-driver (https://pawnio.eu) for hardware tools. The service runs as
-SYSTEM, only reads, and idles until cpuview asks; cpuview runs as you."
+cpuview's sensor service reads them through PawnIO (https://pawnio.eu), a signed
+driver that runs only signed modules. The service runs as SYSTEM, only reads,
+idles until cpuview asks and gives cpuview the values, nothing else; cpuview keeps
+running as you."
     );
     println!();
-    println!("now: PawnIO driver {}", if pawnio::installed() { "installed" } else { "not installed" });
+    println!("now: PawnIO driver {}", if has_pawnio { if ours { "installed (by cpuview)" } else { "installed" } } else { "not installed" });
     println!(
         "     sensor service {}",
         match svc_state {
@@ -83,23 +127,34 @@ SYSTEM, only reads, and idles until cpuview asks; cpuview runs as you."
         }
     );
     println!();
-    let dir = program_dir();
     if undo {
         if svc_state.is_none() && !dir.exists() {
             println!("Nothing to remove.");
             return 0;
         }
-        println!("To remove: the {SERVICE} service and {}.", dir.display());
+        println!("To remove (asks for administrator rights once):");
+        println!("  - the {SERVICE} service and {}", dir.display());
+        if ours {
+            println!("  - the PawnIO driver (cpuview installed it), through winget");
+        }
     } else {
-        if !pawnio::installed() {
-            println!("First install PawnIO (it asks for administrator rights):\n    winget install namazso.PawnIO\nthen run cpuview --setup-sensors again.");
+        if !has_pawnio && winget().is_none() {
+            println!(
+                "PawnIO isn't installed, and winget (App Installer) isn't here to install it.
+Install PawnIO from https://pawnio.eu (or App Installer from the Microsoft Store),
+then run cpuview --setup-sensors again."
+            );
             return 1;
         }
         println!("To install (asks for administrator rights once):");
-        println!("  - copy cpuview.exe to {}", dir.display());
-        println!("  - download PawnIO.Modules 0.2.11 (signed modules, LGPL-2.1) and keep");
-        println!("    {} with its licence in {}", MODULES.map(|m| m.0).join(", "), dir.join("pawnio").display());
-        println!("  - add the {SERVICE} service (starts with Windows, runs as SYSTEM, read-only)");
+        if !has_pawnio {
+            println!("  - the PawnIO driver {PAWNIO_VERSION} through winget ({PAWNIO_ID}): the kernel driver that");
+            println!("    lets the service read the CPU's and the board's sensor registers");
+        }
+        println!("  - PawnIO.Modules 0.2.11 (signed, LGPL-2.1): {} with its", MODULES.map(|m| m.0).join(", "));
+        println!("    licence, in {} (checked by SHA-256)", dir.join("pawnio").display());
+        println!("  - cpuview.exe in {} and the {SERVICE} service", dir.display());
+        println!("    (starts with Windows, runs as SYSTEM, read-only)");
         println!("Undo with: cpuview --setup-sensors --undo");
     }
     if dry {
@@ -131,6 +186,10 @@ SYSTEM, only reads, and idles until cpuview asks; cpuview runs as you."
         Some(U_FILES) => {
             println!("The service is gone, but {} couldn't be removed (in use?).", program_dir().display());
             U_FILES as i32
+        }
+        Some(U_PAWNIO) => {
+            println!("The service is gone, but winget couldn't remove PawnIO: `winget uninstall {PAWNIO_ID}` can.");
+            U_PAWNIO as i32
         }
         Some(c) => {
             println!("It didn't finish (code {c}).");
@@ -193,6 +252,20 @@ fn install(say: &mut dyn FnMut(&str)) -> Result<(), String> {
     let dir = program_dir();
     let mods = dir.join("pawnio");
     std::fs::create_dir_all(&mods).map_err(|e| format!("{}: {e}", mods.display()))?;
+    // the driver, if it isn't there: through winget, at the version tested
+    if !pawnio::installed() {
+        let w = winget().ok_or("winget isn't here to install PawnIO")?;
+        let ok = std::process::Command::new(&w)
+            .args(["install", "--id", PAWNIO_ID, "--version", PAWNIO_VERSION, "--exact", "--silent", "--source", "winget"])
+            .args(["--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok || !pawnio::installed() {
+            return Err("winget couldn't install PawnIO".into());
+        }
+        let _ = std::fs::write(dir.join(PAWNIO_MARK), PAWNIO_VERSION);
+        say(&["PawnIO ", PAWNIO_VERSION, ": installed through winget"].concat());
+    }
     // (a running service holds its program: stop it before replacing it)
     service(|s| {
         let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
@@ -289,8 +362,10 @@ fn install(say: &mut dyn FnMut(&str)) -> Result<(), String> {
 /// `--undo`'s exit codes: the service, or the folder, couldn't be removed
 const U_SERVICE: u32 = 4;
 const U_FILES: u32 = 5;
+const U_PAWNIO: u32 = 6;
 
-/// Stop and delete the service, then its folder: 0, or what failed.
+/// Stop and delete the service, PawnIO if cpuview installed it, then the folder: 0,
+/// or what failed.
 fn remove() -> u32 {
     let mut gone = true;
     service(|s| {
@@ -303,6 +378,17 @@ fn remove() -> u32 {
         return U_SERVICE;
     }
     let dir = program_dir();
+    if dir.join(PAWNIO_MARK).exists() {
+        let ok = winget().is_some_and(|w| {
+            std::process::Command::new(w)
+                .args(["uninstall", "--id", PAWNIO_ID, "--exact", "--silent", "--source", "winget", "--accept-source-agreements", "--disable-interactivity"])
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+        if !ok {
+            return U_PAWNIO;
+        }
+    }
     if dir.exists() && std::fs::remove_dir_all(&dir).is_err() {
         return U_FILES;
     }
@@ -355,6 +441,10 @@ mod tests {
         assert!(pd.is_absolute() && pd.ends_with("cpuview"), "{}", pd.display());
         assert_eq!(log_path().parent(), Some(pd.as_path()));
         assert!(tar.is_absolute() && tar.exists(), "{}", tar.display());
+        // (winget, where it is: in its package's folder, never the user's alias)
+        if let Some(w) = winget() {
+            assert!(w.starts_with(pd.parent().unwrap().join("WindowsApps")) && w.is_file(), "{}", w.display());
+        }
     }
 
     #[test]
