@@ -2,11 +2,16 @@
 //! Helper: the interface table, ~0.5–0.9 ms with Windows' dozens of filter and
 //! miniport interfaces, so only when the links are looked up; then one GetIfEntry2
 //! per link that is up, ~12–75 µs), addresses, connection counts, listening ports and
-//! connections with their owning processes. Containers and systemd services are Linux
-//! concepts: the page doesn't show them here.
+//! connections with their owning processes, and Windows services in place of
+//! systemd's: the service manager's running services (~0.35 ms), each with its
+//! process's CPU and memory. Those come from the full process list, as Task Manager
+//! has them for processes a user can't open (most services run as SYSTEM): 18 ms
+//! with ~15 000 threads, so read on entering the page, then every 30 s (10 min in
+//! eco); their CPU is the average since the last read, as Linux's is in eco.
 
 use super::*;
-use crate::win::{from_wide, prog_name, ProcList};
+use crate::win::{from_pwstr, from_wide, prog_name, ProcList};
+use windows_sys::Win32::System::Services::*;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
@@ -431,4 +436,100 @@ impl Net {
 
     /// (sockets are found from the tables directly: no process scan)
     pub(super) fn scan_step(&mut self, _n: usize) {}
+}
+
+/// The running Windows services (not drivers) and their processes: (name, process
+/// id), from the service manager (one call, ~1 ms).
+fn running_services() -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    unsafe {
+        let m = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ENUMERATE_SERVICE);
+        if m.is_null() {
+            return out;
+        }
+        let mut buf = vec![0u64; 8192];
+        let (mut need, mut n, mut resume) = (0u32, 0u32, 0u32);
+        loop {
+            let ok = EnumServicesStatusExW(
+                m,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_WIN32,
+                SERVICE_ACTIVE,
+                buf.as_mut_ptr() as *mut u8,
+                (buf.len() * 8) as u32,
+                &mut need,
+                &mut n,
+                &mut resume,
+                std::ptr::null(),
+            ) != 0;
+            let it = std::slice::from_raw_parts(buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW, n as usize);
+            for e in it {
+                let pid = e.ServiceStatusProcess.dwProcessId;
+                if pid != 0 {
+                    out.push((from_pwstr(e.lpServiceName), pid));
+                }
+            }
+            // (ERROR_MORE_DATA: the rest from `resume`)
+            if ok || n == 0 {
+                break;
+            }
+        }
+        CloseServiceHandle(m);
+    }
+    out
+}
+
+impl Net {
+    /// Windows services in place of the cgroup walk (not for the overview): one
+    /// per process (its id in `fd[1]`), named after its service (a process hosting
+    /// several: the first and how many more). Services that stopped go; new ones are
+    /// added, and their numbers read.
+    pub(super) fn win_services(&mut self, now: i64) {
+        if self.lite {
+            return;
+        }
+        let list = running_services();
+        self.docker_vm = std::path::Path::new(r"\\.\pipe\docker_engine").exists();
+        let mut procs: Vec<(u32, String, u32)> = Vec::new();
+        for (name, pid) in list {
+            match procs.iter_mut().find(|p| p.0 == pid) {
+                Some(p) => p.2 += 1,
+                None => procs.push((pid, name, 0)),
+            }
+        }
+        let named = |p: &(u32, String, u32)| if p.2 == 0 { p.1.clone() } else { [&p.1, " +", &p.2.to_string()].concat() };
+        self.svcs.retain(|s| procs.iter().any(|p| p.0 as c_int == s.fd[1] && named(p) == s.name));
+        let n = self.svcs.len();
+        for p in &procs {
+            if self.svcs.len() >= 160 || self.svcs.iter().any(|s| s.fd[1] == p.0 as c_int) {
+                continue;
+            }
+            self.svcs.push(Svc::new(named(p), [-1, p.0 as c_int, -1], false, now));
+        }
+        if self.svcs.len() > n {
+            self.win_read_svcs(now);
+        }
+    }
+
+    /// The services' processes' CPU (since the last read) and private working set,
+    /// from the full process list.
+    pub(super) fn win_read_svcs(&mut self, now: i64) {
+        if self.svcs.is_empty() {
+            return;
+        }
+        let mut pl = ProcList::new();
+        if !pl.read(true) {
+            return;
+        }
+        let svcs = &mut self.svcs;
+        pl.each(&mut |e| {
+            let Some(f) = e.full else { return };
+            if let Some(s) = svcs.iter_mut().find(|s| s.fd[1] == e.pid as c_int) {
+                let us = (f.user + f.kernel).max(0) as u64 / 10;
+                s.cpu = cpu_pct(s.prev, now, us);
+                s.prev = (now, us);
+                s.mem = f.ws_private.max(0) as f32;
+            }
+        });
+    }
 }
