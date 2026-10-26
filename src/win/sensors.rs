@@ -417,8 +417,13 @@ impl Sens {
                 let mut reg: D3DKMT_ADAPTERREGISTRYINFO = unsafe { std::mem::zeroed() };
                 kmt(a.hAdapter, KMTQAITYPE_ADAPTERREGISTRYINFO, &mut reg);
                 let mut at = D3DKMT_ADAPTERADDRESS { BusNumber: u32::MAX, DeviceNumber: 0, FunctionNumber: 0 };
-                kmt(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut at);
-                cards.push((a.hAdapter, from_wide(&reg.AdapterString), at.BusNumber, caps));
+                // a card has a PCI address; adapters without one (Remote Desktop's,
+                // other virtual displays) pass on a real card's numbers: it twice
+                if kmt(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut at) && at.DeviceNumber != 0xffff {
+                    cards.push((a.hAdapter, from_wide(&reg.AdapterString), at.BusNumber, caps));
+                    continue;
+                }
+                unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter }) };
             } else {
                 unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter }) };
             }
