@@ -1389,7 +1389,7 @@ impl App {
                 (u * 100.0).round() as u64,
                 (f / 10.0) as u64,
                 t.round() as u64,
-                self.title_watts().map_or(0, |w| w.round() as u64),
+                (if cfg!(windows) { self.z.cpu_watts().0 } else { None }).map_or(0, |w| w.round() as u64),
             ])
         } else {
             0
@@ -1704,6 +1704,8 @@ impl App {
         } else {
             (fc(&["  ", pw.s()]), t.fg | BOLD)
         };
+        // (Windows with one: the watts after it, as the page has no sensors box here)
+        let ew = if cfg!(windows) && has_t { self.z.cpu_watts().0.map_or(F::new(), |w| fc(&["  ", watts(w).s()])) } else { F::new() };
         let has_t = has_t || tw.is_some();
         let sum_full: [(&str, u32); 7] = [
             ("  cpu", t.dim),
@@ -1712,7 +1714,7 @@ impl App {
             (pf.s(), cf),
             (" GHz", t.dim),
             (if has_t { pt.s() } else { "" }, ct),
-            ("", 0),
+            (ew.s(), t.fg | BOLD),
         ];
         let sum_short: [(&str, u32); 2] =
             [(pu.s(), cu), (if has_t { &pt.s()[1..] } else { "" }, ct)];
@@ -2297,10 +2299,11 @@ impl App {
         let mut y = ir.y;
         let maxy = ir.y + ir.h;
         let maxx = ir.x + ir.w;
-        // (Windows: no temperature without a driver, the power always: it comes first,
-        // the hint last)
-        let power_first = self.title_watts().is_some();
-        if s.temps.is_empty() && !power_first {
+        // (Windows: the CPU's watts come right after the temperatures, where every size
+        // shows them; with no temperature yet, the hint how to get one last)
+        let no_temp_hint = self.title_watts().is_some();
+        let power_first = cfg!(windows) && self.z.cpu_watts().0.is_some();
+        if s.temps.is_empty() && !no_temp_hint {
             Self::line(
                 scr,
                 ir.x,
@@ -2486,7 +2489,7 @@ impl App {
             Self::line(scr, ir.x, y, maxx, bg, sp);
             y += 1;
         }
-        if power_first && y < maxy && parts & 1 != 0 {
+        if no_temp_hint && y < maxy && parts & 1 != 0 {
             Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: cpuview --setup-sensors", th.dim)]);
             y += 1;
         }
