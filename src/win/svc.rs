@@ -1,5 +1,6 @@
-//! cpuview's sensor service: CPU temperatures that need a driver (PawnIO, see
-//! win/pawnio.rs and win/cputemp.rs), read by a small service that runs as SYSTEM
+//! cpuview's sensor service: CPU temperatures and the motherboard chip's fans,
+//! voltages and temperatures, which need a driver (PawnIO, see win/pawnio.rs,
+//! win/cputemp.rs and win/board.rs), read by a small service that runs as SYSTEM
 //! (the driver opens for SYSTEM and administrators only) and published read-only for
 //! cpuview, which runs as the user.
 //!
@@ -10,8 +11,10 @@
 //! `cpuview --setup-sensors` (win/sensors.rs), which copies cpuview.exe and the
 //! modules to where only administrators may write.
 
-use super::cputemp::{Cpu, Reading};
+use super::board::{Board, Missing};
+use super::cputemp::Cpu;
 use super::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows_sys::Win32::Foundation::{LocalFree, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -24,17 +27,53 @@ use windows_sys::Win32::System::Threading::{CreateEventW, OpenEventW, SetEvent, 
 
 pub const SERVICE: &str = "cpuview-sensors";
 /// the snapshot's size, its header, an entry, entries at most
-const SIZE: usize = 4096;
+const SIZE: usize = 16384;
 const HEAD: usize = 24;
-const ENTRY: usize = 32;
+const ENTRY: usize = 64;
 const MAX: usize = (SIZE - HEAD) / ENTRY;
+/// an entry: value, flags, kind, number, mode, duty, limits, label length, label
+/// (from here)
+const LABEL: usize = 21;
 const MAGIC: u32 = u32::from_le_bytes(*b"CPVS");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// header status: the service runs but has nothing to read (driver or module missing,
 /// or a CPU it doesn't know)
 pub const ST_NONE: u32 = 1;
 /// entry flags
 const F_MINOR: u8 = 1;
+/// what a reading is: a CPU temperature, or the motherboard chip's name (its label),
+/// a temperature, fan or voltage of it
+pub const B_CPU: u8 = 0;
+pub const B_CHIP: u8 = 1;
+pub const B_TEMP: u8 = 2;
+pub const B_FAN: u8 = 3;
+pub const B_VOLT: u8 = 4;
+
+/// One reading: what it is (B_*), its input number (the chip's: fanN, inN, tempN)
+/// and label ("Pkg", "Core 3", "Tctl", "Tccd1"; the chip's temperature sources),
+/// the value (°C, RPM, V), whether it's one of many (each core's); fans: duty 0..1
+/// (-1: not read) and how the fan is controlled, as Linux's pwmN_enable (0 full
+/// speed, 1 a fixed duty, 2 and up the chip's curves; -1 unknown); voltages: the
+/// chip's limits (0: none).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reading {
+    pub kind: u8,
+    pub n: u8,
+    pub label: String,
+    pub val: f32,
+    pub minor: bool,
+    pub pwm: f32,
+    pub en: i8,
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl Reading {
+    /// A CPU temperature.
+    pub fn cpu(label: impl Into<String>, val: f32, minor: bool) -> Reading {
+        Reading { label: label.into(), val, minor, pwm: -1.0, en: -1, ..Reading::default() }
+    }
+}
 
 /// The snapshot's and the event's names: global (the service's session isn't the
 /// user's), or (CPUVIEW_SENSORS_NS=Local) in the session, to try the service out
@@ -45,8 +84,7 @@ fn name(what: &str) -> Vec<u16> {
 }
 
 /// A snapshot in memory: header (magic, version, sequence: odd while being written,
-/// count, status, the service's clock in ms at the read) and entries (°C, flags,
-/// label length, label).
+/// count, status, the service's clock in ms at the read) and entries (see LABEL).
 fn write(p: *mut u8, rd: &[Reading], status: u32) {
     let seq = unsafe { &*(p.add(8) as *const AtomicU32) };
     let s = seq.load(Ordering::Relaxed);
@@ -57,12 +95,17 @@ fn write(p: *mut u8, rd: &[Reading], status: u32) {
         for (k, r) in rd.iter().take(n).enumerate() {
             let e = p.add(HEAD + k * ENTRY);
             let l = r.label.as_bytes();
-            let ln = l.len().min(ENTRY - 7);
+            let ln = l.len().min(ENTRY - LABEL);
             std::ptr::write_unaligned(e as *mut f32, r.val);
             *e.add(4) = if r.minor { F_MINOR } else { 0 };
-            *e.add(5) = 1;
-            *e.add(6) = ln as u8;
-            std::ptr::copy_nonoverlapping(l.as_ptr(), e.add(7), ln);
+            *e.add(5) = r.kind;
+            *e.add(6) = r.n;
+            *e.add(7) = r.en as u8;
+            std::ptr::write_unaligned(e.add(8) as *mut f32, r.pwm);
+            std::ptr::write_unaligned(e.add(12) as *mut f32, r.lo);
+            std::ptr::write_unaligned(e.add(16) as *mut f32, r.hi);
+            *e.add(20) = ln as u8;
+            std::ptr::copy_nonoverlapping(l.as_ptr(), e.add(LABEL), ln);
         }
         std::ptr::write_unaligned(p.add(12) as *mut u32, n as u32);
         std::ptr::write_unaligned(p.add(16) as *mut u32, status);
@@ -98,9 +141,11 @@ fn read(p: *const u8) -> Option<(u32, u32, Vec<Reading>)> {
         let mut out = Vec::with_capacity(n.min(MAX));
         for k in 0..n.min(MAX) {
             let e = unsafe { p.add(HEAD + k * ENTRY) };
-            let (val, fl, ln) = unsafe { (std::ptr::read_unaligned(e as *const f32), *e.add(4), (*e.add(6) as usize).min(ENTRY - 7)) };
-            let label = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(e.add(7), ln) }).into_owned();
-            out.push(Reading { label, val, minor: fl & F_MINOR != 0 });
+            let f = |o: usize| unsafe { std::ptr::read_unaligned(e.add(o) as *const f32) };
+            let b = |o: usize| unsafe { *e.add(o) };
+            let ln = (b(20) as usize).min(ENTRY - LABEL);
+            let label = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(e.add(LABEL), ln) }).into_owned();
+            out.push(Reading { kind: b(5), n: b(6), label, val: f(0), minor: b(4) & F_MINOR != 0, pwm: f(8), en: b(7) as i8, lo: f(12), hi: f(16) });
         }
         std::sync::atomic::fence(Ordering::Acquire);
         if seq.load(Ordering::Relaxed) == s {
@@ -111,7 +156,7 @@ fn read(p: *const u8) -> Option<(u32, u32, Vec<Reading>)> {
 }
 
 /// A security descriptor from SDDL (LocalFree it).
-fn sd(sddl: &str) -> *mut core::ffi::c_void {
+pub(super) fn sd(sddl: &str) -> *mut core::ffi::c_void {
     let mut p = std::ptr::null_mut();
     unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).as_ptr(), 1, &mut p, std::ptr::null_mut()) };
     p
@@ -133,6 +178,9 @@ pub fn main() -> i32 {
     if unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } != 0 {
         return 0;
     }
+    if std::env::args().any(|a| a == "--print") {
+        return print();
+    }
     if std::env::args().any(|a| a == "--console") {
         let stop = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         println!("cpuview sensor service: serving (Ctrl-C ends)");
@@ -140,6 +188,26 @@ pub fn main() -> i32 {
     }
     eprintln!("cpuview: --sensor-service is run by Windows' service manager (cpuview --setup-sensors installs it)");
     2
+}
+
+/// `--print` (as an administrator): what the service would read here, once.
+fn print() -> i32 {
+    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("pawnio"))).unwrap_or_default();
+    let mut v = Cpu::open(&dir).map(|c| c.read()).unwrap_or_default();
+    match Board::open(&dir) {
+        Ok(mut b) => v.extend(b.read()),
+        Err(Missing::Later) => println!("board chip: not readable now (driver, module or the ISA bus)"),
+        Err(Missing::Never(why)) => println!("board chip: none cpuview reads ({why})"),
+    }
+    for r in &v {
+        let what = ["CPU", "chip", "temp", "fan", "in"].get(r.kind as usize).unwrap_or(&"?");
+        println!("{what}{} {:?} {} pwm {} en {} limits {}..{}", r.n, r.label, r.val, r.pwm, r.en, r.lo, r.hi);
+    }
+    if v.is_empty() {
+        1
+    } else {
+        0
+    }
 }
 
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core::PWSTR) {
@@ -188,21 +256,33 @@ fn set_status_code(state: SERVICE_STATUS_CURRENT_STATE, code: u32) {
     }
 }
 
-/// Serve the CPU's temperatures until `stop` is set. The modules come from the
-/// `pawnio` folder next to this program (where the installer put them: only
-/// administrators may write there); without a reader (no driver yet, a CPU it
-/// doesn't know) it tries again a minute later when asked.
+/// Serve the CPU's temperatures and the board chip's readings until `stop` is set.
+/// The modules come from the `pawnio` folder next to this program (where the
+/// installer put them: only administrators may write there); without a reader (no
+/// driver yet, a CPU it doesn't know, the ISA bus busy) it tries again a minute
+/// later when asked; a board without a chip it reads is looked at once.
 fn serve(stop: HANDLE) -> i32 {
     let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("pawnio"))).unwrap_or_default();
     let mut cpu = Cpu::open(&dir);
+    let mut board = Board::open(&dir);
     let mut tried = unsafe { GetTickCount64() };
     serve_with(stop, &mut || {
         let now = unsafe { GetTickCount64() };
-        if cpu.is_none() && now >= tried + 60_000 {
+        let later = matches!(board, Err(Missing::Later));
+        if (cpu.is_none() || later) && now >= tried + 60_000 {
             tried = now;
-            cpu = Cpu::open(&dir);
+            if cpu.is_none() {
+                cpu = Cpu::open(&dir);
+            }
+            if later {
+                board = Board::open(&dir);
+            }
         }
-        cpu.as_ref().map(|c| c.read())
+        let mut v = cpu.as_ref().map(|c| c.read()).unwrap_or_default();
+        if let Ok(b) = board.as_mut() {
+            v.extend(b.read());
+        }
+        (cpu.is_some() || board.is_ok()).then_some(v)
     })
 }
 
@@ -254,13 +334,14 @@ fn serve_with(stop: HANDLE, read: &mut dyn FnMut() -> Option<Vec<Reading>>) -> i
 
 // ── cpuview's side ─────────────────────────────────────────────────────────
 
-/// The service's snapshot, mapped read-only, its event, the last sequence seen, and
-/// since when (ms) it hasn't moved although asked.
+/// The service's snapshot, mapped read-only, its event, the last sequence seen and
+/// its readings, and since when (ms) it hasn't moved although asked.
 struct Client {
     map: HANDLE,
     view: *const u8,
     ask: HANDLE,
     seq: u32,
+    last: Option<Arc<Vec<Reading>>>,
     stuck: u64,
 }
 
@@ -281,7 +362,7 @@ impl Client {
             close(map);
             return None;
         }
-        Some(Client { map, view, ask, seq: u32::MAX, stuck: 0 })
+        Some(Client { map, view, ask, seq: u32::MAX, last: None, stuck: 0 })
     }
 }
 
@@ -297,9 +378,10 @@ static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 static LOOKED: Mutex<u64> = Mutex::new(0);
 
 /// The service's last readings (None: no service, or it reads nothing here), and a
-/// fresh read asked for. While there is none, whether one started is looked at every
-/// 10 s (opening its snapshot: a few µs); one that stops answering for 5 s is let go.
-pub fn readings() -> Option<Vec<Reading>> {
+/// fresh read asked for (a snapshot already seen isn't copied again). While there is
+/// none, whether one started is looked at every 10 s (opening its snapshot: a few
+/// µs); one that stops answering for 5 s is let go.
+pub fn readings() -> Option<Arc<Vec<Reading>>> {
     let now = unsafe { GetTickCount64() };
     let mut c = CLIENT.lock().unwrap_or_else(|e| e.into_inner());
     if c.is_none() {
@@ -312,19 +394,23 @@ pub fn readings() -> Option<Vec<Reading>> {
     }
     let cl = c.as_mut()?;
     unsafe { SetEvent(cl.ask) };
-    let Some((seq, st, v)) = read(cl.view) else {
-        *c = None;
-        return None;
-    };
+    let seq = unsafe { &*(cl.view.add(8) as *const AtomicU32) }.load(Ordering::Acquire);
     if seq != cl.seq {
+        let Some((seq, st, v)) = read(cl.view) else {
+            *c = None;
+            return None;
+        };
         (cl.seq, cl.stuck) = (seq, 0);
-    } else if cl.stuck == 0 {
+        cl.last = (st == 0 && !v.is_empty()).then(|| Arc::new(v));
+        return cl.last.clone();
+    }
+    if cl.stuck == 0 {
         cl.stuck = now;
     } else if now > cl.stuck + 5_000 {
         *c = None;
         return None;
     }
-    (st == 0 && !v.is_empty()).then_some(v)
+    cl.last.clone()
 }
 
 /// Is the service installed (and its state: running or not)?
@@ -355,15 +441,17 @@ mod tests {
         let p = b.as_mut_ptr() as *mut u8;
         assert!(read(p).is_none());
         let rd = vec![
-            Reading { label: "Pkg".into(), val: 47.0, minor: false },
-            Reading { label: "Core 23".into(), val: 41.5, minor: true },
-            Reading { label: "a label that is far too long to fit".into(), val: 1.0, minor: false },
+            Reading::cpu("Pkg", 47.0, false),
+            Reading::cpu("Core 23", 41.5, true),
+            Reading { kind: B_FAN, n: 2, val: 1234.0, pwm: 0.5, en: 5, ..Reading::default() },
+            Reading { kind: B_VOLT, n: 0, val: 1.25, lo: 0.5, hi: 1.6, ..Reading::default() },
+            Reading::cpu("a label that is far too long to fit in an entry", 1.0, false),
         ];
         write(p, &rd, 0);
         let (s1, st, v) = read(p).unwrap();
-        assert_eq!((st, v.len()), (0, 3));
-        assert_eq!(v[..2], rd[..2]);
-        assert_eq!(v[2].label, "a label that is far too l");
+        assert_eq!((st, v.len()), (0, 5));
+        assert_eq!(v[..4], rd[..4]);
+        assert_eq!(v[4].label, rd[4].label[..ENTRY - LABEL]);
         write(p, &[], ST_NONE);
         let (s2, st, v) = read(p).unwrap();
         assert!(s2 > s1 && s2 % 2 == 0);
@@ -383,7 +471,7 @@ mod tests {
             let mut n = 0;
             serve_with(stop as HANDLE, &mut || {
                 n += 1;
-                Some(vec![Reading { label: "Pkg".into(), val: 40.0 + n as f32, minor: false }, Reading { label: "Core 0".into(), val: 39.5, minor: true }])
+                Some(vec![Reading::cpu("Pkg", 40.0 + n as f32, false), Reading::cpu("Core 0", 39.5, true)])
             })
         });
         // (the snapshot exists once the loop runs; the first look asks, a later one
@@ -419,8 +507,18 @@ mod tests {
         let t = std::thread::spawn(move || {
             serve_with(stop as HANDLE, &mut || {
                 let w = (t0.elapsed().as_secs_f32() / 5.0).sin() * 8.0;
-                let mut v = vec![Reading { label: "Pkg".into(), val: 52.0 + w, minor: false }];
-                v.extend((0..24).map(|k| Reading { label: ["Core ", &k.to_string()].concat(), val: 45.0 + w + (k % 5) as f32, minor: true }));
+                let mut v = vec![Reading::cpu("Pkg", 52.0 + w, false)];
+                v.extend((0..24).map(|k| Reading::cpu(["Core ", &k.to_string()].concat(), 45.0 + w + (k % 5) as f32, true)));
+                v.push(Reading { kind: B_CHIP, label: "nct6798".into(), ..Reading::default() });
+                for (k, rpm) in [(1, 0.0), (2, 1100.0 + 20.0 * w), (5, 1080.0 + 20.0 * w), (6, 2700.0)] {
+                    v.push(Reading { kind: B_FAN, n: k, val: rpm, pwm: 0.4 + w / 40.0, en: if k == 6 { 1 } else { 5 }, ..Reading::default() });
+                }
+                for (k, x) in [(0, 1.2), (1, 1.02), (2, 3.36), (3, 3.34), (4, 1.0), (7, 3.36), (8, 3.2)] {
+                    v.push(Reading { kind: B_VOLT, n: k, val: x, pwm: -1.0, en: -1, ..Reading::default() });
+                }
+                for (k, l, x) in [(1, "SYSTIN", 31.0), (2, "CPUTIN", 38.0), (3, "AUXTIN0", 25.0), (7, "PECI Agent 0", 52.0 + w)] {
+                    v.push(Reading { kind: B_TEMP, n: k, label: l.into(), val: x, pwm: -1.0, en: -1, ..Reading::default() });
+                }
                 Some(v)
             })
         });

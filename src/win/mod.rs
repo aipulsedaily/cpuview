@@ -2,6 +2,7 @@
 //! module it serves, declared there (`sys` → win/cpu.rs, `mem` → win/mem.rs …) so it
 //! fills the same structures; `term` (the console) is loaded in place of term.rs.
 
+pub mod board;
 pub mod cputemp;
 pub mod pawnio;
 pub mod setup;

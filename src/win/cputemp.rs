@@ -5,6 +5,7 @@
 //! the modules allow these reads and nothing here writes.
 
 use super::pawnio::Module;
+use super::svc::Reading;
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadGroupAffinity};
 
@@ -13,15 +14,6 @@ const MSR_IA32_TEMPERATURE_TARGET: u64 = 0x1a2;
 const MSR_IA32_PACKAGE_THERM_STATUS: u64 = 0x1b1;
 /// SMN: the reported temperature (Tctl), and the CCDs' from here + an offset by model
 const ZEN_REPORTED_TEMP: u64 = 0x0005_9800;
-
-/// One reading: its label ("Pkg", "Core 3", "Tctl", "Tccd1"), °C, and whether it is
-/// one of many (each core's).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Reading {
-    pub label: String,
-    pub val: f32,
-    pub minor: bool,
-}
 
 pub enum Cpu {
     /// the module, TjMax, and per core its label and the processor group and number
@@ -92,7 +84,7 @@ impl Cpu {
         match self {
             Cpu::Intel { m, tjmax, cores } => {
                 if let Some(v) = m.read("ioctl_read_msr", MSR_IA32_PACKAGE_THERM_STATUS).and_then(|s| intel_temp(*tjmax, s, false)) {
-                    out.push(Reading { label: "Pkg".into(), val: v, minor: false });
+                    out.push(Reading::cpu("Pkg", v, false));
                 }
                 // (each core's sensor is read on the core: the thread moves to it)
                 let me = unsafe { GetCurrentThread() };
@@ -103,7 +95,7 @@ impl Cpu {
                     let ok = unsafe { SetThreadGroupAffinity(me, &a, if moved { std::ptr::null_mut() } else { &mut prev }) } != 0;
                     moved |= ok;
                     if let Some(v) = ok.then(|| m.read("ioctl_read_msr", MSR_IA32_THERM_STATUS)).flatten().and_then(|s| intel_temp(*tjmax, s, true)) {
-                        out.push(Reading { label: label.clone(), val: v, minor: true });
+                        out.push(Reading::cpu(label.clone(), v, true));
                     }
                 }
                 if moved {
@@ -112,11 +104,11 @@ impl Cpu {
             }
             Cpu::Amd { m, ccd_offset, ccds } => {
                 if let Some(v) = m.read("ioctl_read_smn", ZEN_REPORTED_TEMP) {
-                    out.push(Reading { label: "Tctl".into(), val: amd_tctl(v as u32), minor: false });
+                    out.push(Reading::cpu("Tctl", amd_tctl(v as u32), false));
                 }
                 for (k, &i) in ccds.iter().enumerate() {
                     if let Some(c) = m.read("ioctl_read_smn", ZEN_REPORTED_TEMP + ccd_offset + 4 * i).and_then(|v| amd_ccd(v as u32)) {
-                        out.push(Reading { label: ["Tccd", &(k + 1).to_string()].concat(), val: c, minor: ccds.len() > 4 });
+                        out.push(Reading::cpu(["Tccd", &(k + 1).to_string()].concat(), c, ccds.len() > 4));
                     }
                 }
             }

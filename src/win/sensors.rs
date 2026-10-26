@@ -12,7 +12,8 @@
 //! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence).
 
 use super::*;
-use crate::win::{close, cputemp, fd2h, from_pwstr, from_wide, h2fd, reg_str, svc, wide};
+use crate::win::svc::{self, B_CHIP, B_CPU, B_FAN, B_TEMP, B_VOLT};
+use crate::win::{close, fd2h, from_pwstr, from_wide, h2fd, reg_str, wide};
 use windows_sys::Wdk::Graphics::Direct3D::*;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
@@ -49,6 +50,10 @@ pub struct State {
     gpus: Vec<(u32, usize)>,
     nv_power: Option<NvPower>,
     svc_gone: Option<i64>,
+    /// an ASUS board (its fan headers' names)
+    asus: bool,
+    /// the board's unlabelled temperature inputs found floating (`fd` keys)
+    floating: Vec<c_int>,
 }
 
 impl State {
@@ -64,14 +69,23 @@ impl State {
             gpus: Vec::new(),
             nv_power: None,
             svc_gone: None,
+            asus: false,
+            floating: Vec::new(),
         }
     }
 }
 
-/// What needs cpuview's sensor service, in one dim line (sensui.rs: hint kind 4; 5:
-/// the service runs, the board's chip isn't one it reads).
-fn driver_hint(svc: bool) -> Option<(String, u8)> {
-    Some((String::new(), if svc { 5 } else { 4 }))
+impl Sens {
+    /// What needs cpuview's sensor service, in one dim line (sensui.rs: hint kind 4;
+    /// 5: the service runs, the board's chip isn't one it reads); none once it reads
+    /// the board's fans.
+    fn driver_hint(&self) -> Option<(String, u8)> {
+        let svc: Vec<usize> = (0..self.srcs.len()).filter(|&s| self.srcs[s].kind == S_SVC).collect();
+        if self.rd.iter().any(|r| r.kind == K_FAN && svc.contains(&(r.src as usize))) {
+            return None;
+        }
+        Some((String::new(), if svc.is_empty() { 4 } else { 5 }))
+    }
 }
 
 fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
@@ -109,6 +123,7 @@ impl Sens {
         let r = |v: &str| reg_str(HKEY_LOCAL_MACHINE, bios, v).unwrap_or_default();
         let (bv, bn, sv, pn) = (r("BaseBoardManufacturer"), r("BaseBoardProduct"), r("SystemManufacturer"), r("SystemProductName"));
         let vendor = short_vendor(if bv.is_empty() { sv.clone() } else { bv });
+        self.w.asus = vendor.starts_with("ASUS");
         let model = if !bn.is_empty() && !bn.starts_with("To be filled") { &bn } else { &pn };
         self.board = if model.is_empty() { String::new() } else { [&vendor, " ", model].concat() };
         self.vm = is_vm(&[&sv, " ", &pn].concat().to_ascii_lowercase());
@@ -123,7 +138,7 @@ impl Sens {
         self.finish_names();
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
         if !self.vm {
-            self.fan_hint = driver_hint(self.srcs.iter().any(|s| s.kind == S_SVC));
+            self.fan_hint = self.driver_hint();
         }
         for i in 0..self.srcs.len() {
             self.read_src(i, now);
@@ -138,20 +153,24 @@ impl Sens {
         if self.vm {
             return;
         }
-        if let Some(s) = self.srcs.iter().position(|s| s.kind == S_SVC) {
+        if self.srcs.iter().any(|s| s.kind == S_SVC) {
             if self.w.svc_gone.is_some_and(|t| now - t >= 20 * SEC) {
                 self.w.svc_gone = None;
-                self.drop_src(s);
-                self.fan_hint = driver_hint(false);
+                while let Some(s) = self.srcs.iter().position(|s| s.kind == S_SVC) {
+                    self.drop_src(s);
+                }
+                self.fan_hint = self.driver_hint();
             }
         } else if let Some(v) = svc::readings() {
-            let (t0, hists) = (thread_ns(), self.rd.iter().any(|r| r.hist.is_some()));
+            let (t0, hists, first) = (thread_ns(), self.rd.iter().any(|r| r.hist.is_some()), self.srcs.len());
             self.svc(&v);
             self.finish_names();
             self.hists(hists);
-            self.fan_hint = driver_hint(true);
+            self.fan_hint = self.driver_hint();
             self.spent += (thread_ns() - t0).max(0);
-            self.read_src(self.srcs.len() - 1, now);
+            for s in first..self.srcs.len() {
+                self.read_src(s, now);
+            }
         }
     }
 
@@ -176,20 +195,61 @@ impl Sens {
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
     }
 
-    /// cpuview's sensor service (win/svc.rs): the CPU's temperatures through PawnIO
-    /// (the package, Tctl and the CCDs; each core's as minor ones).
-    fn svc(&mut self, v: &[cputemp::Reading]) {
-        let s = self.src("cpuview-sensors", "PawnIO", "cpuview's sensor service (PawnIO)", "", S_SVC, C_CPU, G_CPU);
-        for (k, x) in v.iter().enumerate() {
-            let name = match x.label.as_str() {
-                "Pkg" => "CPU package".to_string(),
-                "Tctl" => "CPU (Tctl)".to_string(),
-                l if l.starts_with("Tccd") => ["CCD ", &l[4..]].concat(),
-                l => l.replacen("Core", "core", 1),
-            };
-            let mut r = rd(K_TEMP, s, G_CPU, k as c_int, &x.label, &name);
-            (r.warn, r.crit) = temp_limits(G_CPU, None, None);
-            r.minor = x.minor;
+    /// cpuview's sensor service (win/svc.rs), two sources named as Linux's drivers
+    /// name theirs: the CPU's temperatures (as coretemp's or k10temp's: the package,
+    /// Tctl, the CCDs; each core's as minor ones) and the motherboard chip's fans,
+    /// voltages and temperatures (as hwmon's nct6775: `hwmon` on Linux). The board's
+    /// readings are found again by kind and number (`fd`: 0x200 and up), the CPU's by
+    /// label.
+    fn svc(&mut self, v: &[svc::Reading]) {
+        let intel = v.iter().any(|x| x.kind == B_CPU && x.label == "Pkg");
+        let chip = if intel { "coretemp" } else { "k10temp" };
+        if v.iter().any(|x| x.kind == B_CPU) {
+            let (g, what, class) = chip_info(chip);
+            let s = self.src(chip, "PawnIO", what, "", S_SVC, class, g);
+            for (k, x) in v.iter().filter(|x| x.kind == B_CPU).enumerate() {
+                let lab = if x.label == "Pkg" { "Package id 0" } else { x.label.as_str() };
+                let (name, tg, fl) = temp_name(chip, lab, 0);
+                let mut r = rd(K_TEMP, s, tg, k.min(0xff) as c_int, &x.label, &name);
+                (r.warn, r.crit) = temp_limits(tg, None, None);
+                (r.flags, r.minor) = (fl, x.minor || fl & F_MINOR != 0);
+                self.add(s, r);
+            }
+        }
+        let Some(c) = v.iter().find(|x| x.kind == B_CHIP) else { return };
+        let name = c.label.clone();
+        let (g, what, class) = chip_info(&name);
+        let s = self.src(&name, "PawnIO", what, "", S_SVC, class, g);
+        for x in v.iter().filter(|x| matches!(x.kind, B_TEMP | B_FAN | B_VOLT)) {
+            let key = (x.kind as c_int) << 8 | x.n as c_int;
+            let n = x.n as u32;
+            let base = [["", "", "temp", "fan", "in"][x.kind as usize], &n2s(n)].concat();
+            let mut r = rd(K_TEMP, s, g, key, if x.label.is_empty() { &base } else { &x.label }, "");
+            match x.kind {
+                B_FAN => {
+                    r.kind = K_FAN;
+                    (r.name, r.raw, r.guess) = fan_name(&name, "", n, self.w.asus);
+                    if g == G_OTHER {
+                        r.group = G_BOARD;
+                    }
+                }
+                B_TEMP => {
+                    let (pn, tg, fl) = temp_name(&name, &x.label, n);
+                    if fl & F_DROP != 0 {
+                        continue;
+                    }
+                    (r.name, r.flags, r.minor, r.guess, r.group) = (pn, fl, fl & F_MINOR != 0, fl & F_AUX != 0, tg);
+                    (r.warn, r.crit) = temp_limits(r.group, None, None);
+                }
+                _ => {
+                    r.kind = K_VOLT;
+                    let mul;
+                    (r.name, mul) = volt_name(&name, "", n, x.val);
+                    r.mul = mul;
+                    (r.warn, r.crit) = (x.lo * mul, x.hi * mul);
+                    r.guess = r.name.starts_with("in");
+                }
+            }
             self.add(s, r);
         }
     }
@@ -544,12 +604,51 @@ impl Sens {
                     return;
                 };
                 self.w.svc_gone = None;
+                let (mut board, floating) = (None, &mut self.w.floating);
                 for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
-                    let val = v.iter().find(|x| x.label == r.raw).map_or(f32::NAN, |x| x.val);
-                    r.ok = temp_ok(val, false, None);
-                    if r.ok {
-                        (r.val, r.seen) = (val, true);
+                    let x = if r.fd < 0x100 {
+                        v.iter().find(|x| x.kind == B_CPU && x.label == r.raw)
+                    } else {
+                        v.iter().find(|x| x.kind != B_CPU && ((x.kind as c_int) << 8 | x.n as c_int) == r.fd)
+                    };
+                    let Some(x) = x else {
+                        r.ok = false;
+                        continue;
+                    };
+                    match r.kind {
+                        K_FAN => {
+                            r.ok = (0.0..30000.0).contains(&x.val);
+                            r.val = if r.ok { x.val } else { 0.0 };
+                            if r.val > 0.0 {
+                                r.seen = true;
+                                r.max = r.max.max(r.val);
+                            }
+                            if r.seen {
+                                (r.pwm, r.en) = (x.pwm, x.en);
+                            }
+                        }
+                        K_VOLT => (r.val, r.ok) = (x.val * r.mul, x.val > 0.0),
+                        _ => {
+                            // (an unlabelled input that jumps 10 °C between two reads,
+                            // 1.5 s or more apart, is a pin with nothing on it: no
+                            // temperature inside a computer does that)
+                            if r.flags & F_AUX != 0 && r.seen && (x.val - r.val).abs() > 10.0 && !floating.contains(&r.fd) {
+                                floating.push(r.fd);
+                            }
+                            r.ok = temp_ok(x.val, false, None) && !floating.contains(&r.fd);
+                            if r.ok {
+                                r.val = x.val;
+                                if r.flags & F_REF != 0 {
+                                    board = Some(r.val);
+                                }
+                            }
+                        }
                     }
+                    r.seen |= r.ok && r.kind != K_FAN;
+                }
+                // unidentified board inputs: real only if not colder than the board
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i && r.kind == K_TEMP && r.flags & F_AUX != 0 && r.ok) {
+                    r.ok = temp_ok(r.val, true, board);
                 }
             }
             _ => {}

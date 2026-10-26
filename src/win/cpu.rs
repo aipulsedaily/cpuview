@@ -471,7 +471,7 @@ impl Cpu {
     /// and the CCDs as the CPU page shows them. They go when it stops answering.
     pub fn svc_temps(&mut self, temps: &mut Vec<Sensor>) {
         if let Some(v) = svc::readings() {
-            let v: Vec<_> = v.into_iter().filter(|r| !r.minor).collect();
+            let v: Vec<_> = v.iter().filter(|r| r.kind == svc::B_CPU && !r.minor).collect();
             if !self.from_svc || temps.len() != v.len() || temps.iter().zip(&v).any(|(s, r)| s.label != r.label) {
                 *temps = v.iter().map(|r| Sensor { label: r.label.clone(), fd: -1, val: r.val, hist: Ring::new(), max: 0.0 }).collect();
                 self.from_svc = true;

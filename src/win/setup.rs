@@ -112,9 +112,10 @@ case fans, pump), voltages and temperatures need a kernel driver: Windows has no
 interface for them.
 
 cpuview's sensor service reads them through PawnIO (https://pawnio.eu), a signed
-driver that runs only signed modules. The service runs as SYSTEM, only reads,
-idles until cpuview asks and gives cpuview the values, nothing else; cpuview keeps
-running as you."
+driver that runs only signed modules. The service runs as SYSTEM, only reads (on
+boards whose monitoring chip keeps its sensors locked, it unlocks them for each
+read and locks them again, as the board's own firmware does), idles until cpuview
+asks and gives cpuview the values, nothing else; cpuview keeps running as you."
     );
     println!();
     println!("now: PawnIO driver {}", if has_pawnio { if ours { "installed (by cpuview)" } else { "installed" } } else { "not installed" });
@@ -176,7 +177,7 @@ then run cpuview --setup-sensors again."
     }
     match code {
         Some(0) => {
-            println!("{}", if undo { "Removed." } else { "Done: cpuview shows CPU temperatures now (on the CPU and Sensors & Power pages)." });
+            println!("{}", if undo { "Removed." } else { "Done: cpuview shows the CPU's temperatures and the board's fans, voltages and temperatures now." });
             0
         }
         Some(U_SERVICE) => {
@@ -340,7 +341,7 @@ fn install(say: &mut dyn FnMut(&str)) -> Result<(), String> {
             CloseServiceHandle(m);
             return Err(["adding the service: error ", &e.to_string()].concat());
         }
-        let mut desc = wide("CPU temperatures for cpuview, read-only, through the PawnIO driver. Idle unless cpuview asks.");
+        let mut desc = wide("CPU temperatures and the board's fans, voltages and temperatures for cpuview, read through the PawnIO driver. Idle unless cpuview asks.");
         let d = SERVICE_DESCRIPTIONW { lpDescription: desc.as_mut_ptr() };
         ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &d as *const _ as *const _);
         // (only the privileges it needs: making its global snapshot)
