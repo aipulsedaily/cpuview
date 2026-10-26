@@ -6,9 +6,8 @@
 //! none: estimated from the busy CPUs).
 
 use crate::win::{from_wide, wide, NtQuerySystemInformationEx};
-use crate::sensors::cpu_temp_label;
 use crate::sys::{isort, Ring, Sensor, Topo};
-use crate::win::{lhm, svc};
+use crate::win::svc;
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
 use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::{CallNtPowerInformation, PowerGetActiveScheme, PowerReadFriendlyName, ProcessorInformation};
@@ -49,8 +48,6 @@ pub struct Cpu {
     read: Vec<bool>,
     /// load average: the time of its last update
     la_t: i64,
-    /// LibreHardwareMonitor's CPU temperatures: when a fresh snapshot was last asked for
-    lhm_t: i64,
     /// the temperatures came from cpuview's sensor service (win/svc.rs)
     from_svc: bool,
     /// active power plan
@@ -155,37 +152,9 @@ fn rated_max() -> f32 {
     0.0
 }
 
-/// The CPU's temperatures where LibreHardwareMonitor's web server runs (Windows has
-/// none of its own): the package (Intel), Tctl and the CCDs' (AMD).
+/// The CPU's temperatures: Windows has no interface for them without a driver.
 pub fn find_sensors() -> Vec<Sensor> {
-    if !lhm::listening() {
-        return Vec::new();
-    }
-    let Some(v) = lhm::fetch() else {
-        return Vec::new();
-    };
-    let out = cpu_sensors(&v);
-    lhm::set(v);
-    out
-}
-
-/// The CPU's temperatures among LibreHardwareMonitor's readings.
-fn cpu_sensors(v: &[lhm::Reading]) -> Vec<Sensor> {
-    let mut out = Vec::new();
-    for x in v {
-        if let (true, Some(l)) = (x.typ == "Temperature" && x.hwid.contains("cpu"), cpu_temp_label(&x.text)) {
-            if !out.iter().any(|s: &Sensor| s.label == l) {
-                out.push(Sensor {
-                    label: l,
-                    fd: -1,
-                    val: if x.val.is_finite() { x.val } else { 0.0 },
-                    hist: Ring::new(),
-                    max: 0.0,
-                });
-            }
-        }
-    }
-    out
+    Vec::new()
 }
 
 pub fn topo() -> Topo {
@@ -327,7 +296,6 @@ impl Cpu {
             map: Vec::new(),
             nominal: 0.0,
             la_t: 0,
-            lhm_t: 0,
             from_svc: false,
             ceil: f32::MAX,
             read: Vec::new(),
@@ -351,7 +319,6 @@ impl Cpu {
             map: Vec::new(),
             nominal: nominal_mhz(n),
             la_t: 0,
-            lhm_t: 0,
             from_svc: false,
             ceil: if rated_max() > 0.0 { 1.2 * rated_max() } else { f32::MAX },
             read: Vec::new(),
@@ -499,17 +466,10 @@ impl Cpu {
         self.la_t = now;
     }
 
-    /// The CPU temperatures: from cpuview's sensor service where it is installed (see
-    /// win/svc.rs), else from LibreHardwareMonitor's last snapshot; a fresh one is
-    /// asked for every 2 s (`all`: smooth) or 30 s (its parse costs a few hundred µs).
-    ///
-    /// LibreHardwareMonitor may start after cpuview, or close: while there are none,
-    /// whether it started is looked at now and then (lhm::look), and the
-    /// temperatures come from the helper's first snapshot; they go when it stops
-    /// answering.
-    pub fn lhm_temps(&mut self, temps: &mut Vec<Sensor>, all: bool) {
-        // cpuview's sensor service first (its snapshot, a fresh one asked for: a few
-        // µs), the package / Tctl / CCDs as the CPU page shows them
+    /// The CPU temperatures from cpuview's sensor service, where it is installed (see
+    /// win/svc.rs): its snapshot, a fresh one asked for (a few µs); the package, Tctl
+    /// and the CCDs as the CPU page shows them. They go when it stops answering.
+    pub fn svc_temps(&mut self, temps: &mut Vec<Sensor>) {
         if let Some(v) = svc::readings() {
             let v: Vec<_> = v.into_iter().filter(|r| !r.minor).collect();
             if !self.from_svc || temps.len() != v.len() || temps.iter().zip(&v).any(|(s, r)| s.label != r.label) {
@@ -520,36 +480,9 @@ impl Cpu {
                     s.val = r.val;
                 }
             }
-            return;
-        }
-        if std::mem::take(&mut self.from_svc) {
+        } else if std::mem::take(&mut self.from_svc) {
             temps.clear();
         }
-        let now = crate::term::mono();
-        if temps.is_empty() {
-            if lhm::live() {
-                *temps = lhm::with(cpu_sensors);
-            } else {
-                lhm::look(now);
-            }
-            return;
-        }
-        if !lhm::live() {
-            temps.clear();
-            return;
-        }
-        if now - self.lhm_t >= if all { 2 } else { 30 } * 1_000_000_000 {
-            self.lhm_t = now;
-            lhm::request();
-        }
-        lhm::with(|v| {
-            for s in temps.iter_mut() {
-                let x = v.iter().find(|x| x.typ == "Temperature" && x.hwid.contains("cpu") && cpu_temp_label(&x.text).as_deref() == Some(s.label.as_str()));
-                if let Some(x) = x.filter(|x| x.val.is_finite()) {
-                    s.val = x.val;
-                }
-            }
-        });
     }
 
     /// The active power plan's name (read again only when the plan changes).

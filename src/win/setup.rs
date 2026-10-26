@@ -60,7 +60,6 @@ pub fn setup(undo: bool, dry: bool) -> i32 {
     if std::env::args().any(|a| a == "--elevated") {
         return elevated(undo);
     }
-    let lhm = lhm::listening();
     let svc_state = svc::installed();
     println!(
         "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
@@ -70,10 +69,8 @@ firmware's ACPI thermal zones. CPU temperatures, the board's fans (CPU fan, case
 fans, pump) and voltages need a kernel driver.
 
 CPU temperatures: cpuview's sensor service reads them through PawnIO, a signed
-driver (https://pawnio.eu, the one LibreHardwareMonitor uses). The service runs as
-SYSTEM, only reads, and idles until cpuview asks; cpuview runs as you.
-Fans, voltages and CPU temperatures too: LibreHardwareMonitor with Options → Remote
-Web Server on (port 8085); cpuview reads it, also when it starts later."
+driver (https://pawnio.eu) for hardware tools. The service runs as
+SYSTEM, only reads, and idles until cpuview asks; cpuview runs as you."
     );
     println!();
     println!("now: PawnIO driver {}", if pawnio::installed() { "installed" } else { "not installed" });
@@ -85,7 +82,6 @@ Web Server on (port 8085); cpuview reads it, also when it starts later."
             None => "not installed",
         }
     );
-    println!("     LibreHardwareMonitor's web server {}", if lhm { "running" } else { "not running" });
     println!();
     let dir = program_dir();
     if undo {

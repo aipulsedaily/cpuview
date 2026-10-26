@@ -3,7 +3,6 @@
 //! fills the same structures; `term` (the console) is loaded in place of term.rs.
 
 pub mod cputemp;
-pub mod lhm;
 pub mod pawnio;
 pub mod setup;
 pub mod svc;

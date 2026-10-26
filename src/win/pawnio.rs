@@ -1,5 +1,5 @@
-//! PawnIO (https://pawnio.eu), the signed driver LibreHardwareMonitor and others read
-//! hardware through: cpuview's sensor service (win/svc.rs) talks to it only through
+//! PawnIO (https://pawnio.eu), a signed driver hardware tools read the hardware
+//! through: cpuview's sensor service (win/svc.rs) talks to it only through
 //! its device's IO controls, as its licence's exception for independent programs
 //! asks. A handle runs one module: a signed program the driver checks and runs
 //! (IntelMSR, AMDFamily17: PawnIO.Modules, LGPL-2.1), whose functions take and

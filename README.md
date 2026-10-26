@@ -82,15 +82,12 @@ graphics cards' temperature and fan (any vendor, as Task Manager shows them) and
 card's watts (NVML, which comes with its driver; ~14 MB of memory), the battery, NVMe
 drives' temperatures and the firmware's ACPI thermal zones all come from Windows itself. CPU
 temperatures, the board's fans (CPU fan, case fans, pump) and voltages don't: Windows has no
-interface for them without a kernel driver. For the CPU's temperatures (Intel: the package
-and each core; AMD: Tctl and each CCD), `cpuview --setup-sensors` installs cpuview's own
-sensor service once you've installed the signed [PawnIO](https://pawnio.eu) driver
-(`winget install namazso.PawnIO`): a small service that runs as SYSTEM, only reads, idles
-until cpuview asks and hands cpuview a read-only snapshot (it asks first, then for
-administrator rights once; `--undo` removes it). For the fans and voltages too, run
-[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) with its
-web server on (Options → Remote Web Server) and cpuview shows them on the Sensors & Power
-page and the CPU page, also when it starts after cpuview. Linux-only: containers, systemd services, a server board's BMC, per-core RAPL,
+interface for them without a kernel driver. `cpuview --setup-sensors` installs what it takes,
+in one step: it shows what it will add and why, asks, then asks Windows for administrator
+rights once and installs the signed [PawnIO](https://pawnio.eu) driver (through winget), its
+signed modules and cpuview's own sensor service, a small service that runs as SYSTEM, only
+reads, idles until cpuview asks and hands cpuview a read-only snapshot; `--undo` removes all
+of it. Linux-only: containers, systemd services, a server board's BMC, per-core RAPL,
 Ctrl-Z. The load average is an estimate (the busy CPUs, decayed like Linux's); processes'
 read / write counts are all their I/O (disk, network and pipes together).
 

@@ -841,19 +841,18 @@ impl App {
         let z = &self.z;
         let th = &self.t;
         let m = z.fan_hint.as_ref().map_or("", |h| h.0.as_str());
-        l.row(2, th.warn, th.dim, -1.0, 0);
-        // (Windows: one line, whatever else Windows itself gives; 5: cpuview's sensor
-        // service has the CPU's temperatures)
+        // (Windows: what needs cpuview's sensor service, in one dim line, two where it
+        // doesn't fit; 5: the service runs, the board's chip isn't one it reads)
         if let Some(k) = z.fan_hint.as_ref().map(|h| h.1).filter(|&k| !z.vm && (k == 4 || k == 5)) {
-            l.s(if k == 4 { "CPU temperature and fans: " } else { "fans: " });
+            l.row(2, th.dim, th.dim, -1.0, 0);
+            l.s(if k == 4 { "CPU temperature, fans, voltages: " } else { "fans, voltages: " });
             if two {
                 l.row(2, th.dim, 0, -1.0, 0);
-            } else {
-                l.f();
             }
-            l.s("run LibreHardwareMonitor with its web server on");
+            l.s(if k == 4 { "cpuview --setup-sensors" } else { "this board's chip isn't one cpuview reads yet" });
             return;
         }
+        l.row(2, th.warn, th.dim, -1.0, 0);
         let b = match z.fan_hint.as_ref().map(|h| h.1) {
             _ if z.vm => {
                 l.s("no fans: this is a virtual machine");
@@ -998,7 +997,7 @@ impl App {
             l.s(if z.vm {
                 "no power meters (a virtual machine)"
             } else if cfg!(windows) {
-                "no power meters: Windows has none (LibreHardwareMonitor can)"
+                "no power meters: Windows has none here"
             } else {
                 "no power meters on this machine"
             });
@@ -1231,7 +1230,7 @@ impl App {
             }
             _ => {
                 l.s(if cfg!(windows) {
-                    "CPU power: Windows has no energy meter here (LibreHardwareMonitor can read it)"
+                    "CPU power: Windows has no energy meter for this CPU"
                 } else {
                     "CPU power: no energy counters on this CPU"
                 });

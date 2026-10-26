@@ -522,7 +522,8 @@ pub struct Sampler {
     pub eco: bool,
 }
 
-/// (Windows has no CPU temperature interface: LibreHardwareMonitor's, if it runs)
+/// (Windows has no CPU temperature interface without a driver: cpuview's sensor
+/// service's come later, see win::Cpu::svc_temps)
 #[cfg(windows)]
 fn find_sensors() -> Vec<Sensor> {
     win::find_sensors()
@@ -953,10 +954,10 @@ impl Sampler {
         }
     }
 
-    /// Temperatures (Windows: LibreHardwareMonitor's snapshot, see win::Cpu::lhm_temps).
+    /// Temperatures (Windows: cpuview's sensor service's, see win::Cpu::svc_temps).
     #[cfg(windows)]
-    pub fn read_temps(&mut self, all: bool) {
-        self.w.lhm_temps(&mut self.temps, all);
+    pub fn read_temps(&mut self, _all: bool) {
+        self.w.svc_temps(&mut self.temps);
     }
 
     /// Temperatures: k10temp reads go over SMN and cost ~10 µs each on a cold core,
