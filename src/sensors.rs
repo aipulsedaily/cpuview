@@ -1352,6 +1352,9 @@ impl Sens {
         if !self.detected {
             self.enter(now);
         }
+        // (Windows: cpuview's sensor service may have started or stopped meanwhile)
+        #[cfg(windows)]
+        self.win_tick(now);
         // (eco: one dear read (over 0.2 ms) at a time, 30 s apart unless twice
         // overdue, so their costs don't pile up in the same minute)
         let mut ld = i64::MIN;
@@ -1474,6 +1477,8 @@ impl Sens {
         if !self.detected {
             self.enter(now);
         }
+        #[cfg(windows)]
+        self.win_tick(now);
         if enter {
             self.hists(false);
         }

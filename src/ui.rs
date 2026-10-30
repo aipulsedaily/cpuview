@@ -1389,7 +1389,7 @@ impl App {
                 (u * 100.0).round() as u64,
                 (f / 10.0) as u64,
                 t.round() as u64,
-                self.title_watts().map_or(0, |w| w.round() as u64),
+                (if cfg!(windows) { self.z.cpu_watts().0 } else { None }).map_or(0, |w| w.round() as u64),
             ])
         } else {
             0
@@ -1704,6 +1704,8 @@ impl App {
         } else {
             (fc(&["  ", pw.s()]), t.fg | BOLD)
         };
+        // (Windows with one: the watts after it, as the page has no sensors box here)
+        let ew = if cfg!(windows) && has_t { self.z.cpu_watts().0.map_or(F::new(), |w| fc(&["  ", watts(w).s()])) } else { F::new() };
         let has_t = has_t || tw.is_some();
         let sum_full: [(&str, u32); 7] = [
             ("  cpu", t.dim),
@@ -1712,7 +1714,7 @@ impl App {
             (pf.s(), cf),
             (" GHz", t.dim),
             (if has_t { pt.s() } else { "" }, ct),
-            ("", 0),
+            (ew.s(), t.fg | BOLD),
         ];
         let sum_short: [(&str, u32); 2] =
             [(pu.s(), cu), (if has_t { &pt.s()[1..] } else { "" }, ct)];
@@ -2297,10 +2299,11 @@ impl App {
         let mut y = ir.y;
         let maxy = ir.y + ir.h;
         let maxx = ir.x + ir.w;
-        // (Windows: no temperature without a driver, the power always: it comes first,
-        // the hint last)
-        let power_first = self.title_watts().is_some();
-        if s.temps.is_empty() && !power_first {
+        // (Windows: the CPU's watts come right after the temperatures, where every size
+        // shows them; with no temperature yet, the hint how to get one last)
+        let no_temp_hint = self.title_watts().is_some();
+        let power_first = cfg!(windows) && self.z.cpu_watts().0.is_some();
+        if s.temps.is_empty() && !no_temp_hint {
             Self::line(
                 scr,
                 ir.x,
@@ -2309,7 +2312,7 @@ impl App {
                 bg,
                 &[(
                     if cfg!(windows) {
-                        "CPU temperature: Windows has none without a driver"
+                        "CPU temperature: cpuview --setup-sensors"
                     } else {
                         "no CPU temperature sensor found"
                     },
@@ -2486,8 +2489,8 @@ impl App {
             Self::line(scr, ir.x, y, maxx, bg, sp);
             y += 1;
         }
-        if power_first && y < maxy && parts & 1 != 0 {
-            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: Windows has none without a driver", th.dim)]);
+        if no_temp_hint && y < maxy && parts & 1 != 0 {
+            Self::line(scr, ir.x, y, maxx, bg, &[("CPU temperature: cpuview --setup-sensors", th.dim)]);
             y += 1;
         }
         // spare height: one line per CCD (load bar, mean load, mean core clock)
@@ -2500,7 +2503,7 @@ impl App {
                     continue;
                 }
                 let (bu, u, f) = self.ccd(d);
-                let lab = f!("CCD{d}");
+                let lab = s.t.dom_name(d);
                 scr.text(ir.x, y, lab.s(), th.mid, bg, ir.x + 6);
                 for x in ir.x + lab.n..ir.x + 6 {
                     scr.put(x, y, ' ', 0, bg);
@@ -2826,7 +2829,7 @@ impl App {
             let geo = self.geo(cw, l.mode);
             let lead = if l.mode == M_MICRO { "" } else { " " };
             let label = |d: usize, scr: &mut Screen, y: usize| -> usize {
-                let lab = f!("{lead}CCD{d}");
+                let lab = fc(&[lead, s.t.dom_name(d).s()]);
                 let mut x = scr.text(x0, y, lab.s(), th.text | BOLD, bg, maxx);
                 if let Some(temp) = self.dom_temp(d) {
                     let tt = num(" ", temp, 0, "°");
@@ -2854,7 +2857,7 @@ impl App {
             if let (true, Some(d)) = (l.div && self.sort == 0, first) {
                 x = label(d, scr, ir.y);
             } else if s.t.ndom > 1 && !multi && dom != usize::MAX && self.sort == 0 {
-                let lab = f!("{lead}CCD{dom}");
+                let lab = fc(&[lead, s.t.dom_name(dom).s()]);
                 x = scr.text(x0, ir.y, lab.s(), th.text | BOLD, bg, maxx);
                 if let Some(temp) = self.dom_temp(dom) {
                     let tt = num(" ", temp, 0, "°");
@@ -3470,7 +3473,7 @@ impl App {
         for k in 0..rows {
             if div == Some(k) {
                 let d = self.s.t.ccd[2 * k];
-                let lab = f!("CCD{d}");
+                let lab = self.s.t.dom_name(d);
                 let mut x = scr.text(ir.x, y, lab.s(), th.dim, bg, hx);
                 while x < hx + hw {
                     scr.put(x, y, if x >= hx { '─' } else { ' ' }, th.border, bg);
@@ -3796,7 +3799,7 @@ impl App {
         let mut yy = y;
         let name = f!("C{:0w$}", gi, w = self.idw);
         let ccd = if s.t.ndom > 1 {
-            f!("  ·  CCD{}", s.t.ccd[gi])
+            fc(&["  ·  ", s.t.dom_name(s.t.ccd[gi]).s()])
         } else {
             f!("")
         };
@@ -3819,6 +3822,11 @@ impl App {
             ],
             &mut yy,
         );
+        // (where each core's temperature is known: Windows, with the sensor service)
+        if let Some(&c) = s.core_t.get(gi).filter(|&&c| c > 0.0) {
+            let tc = num("", c, 0, "°C");
+            line(&[("temp    ", th.dim), (tc.s(), th.temp.at((c - 30.0) / 65.0) | BOLD)], &mut yy);
+        }
         let rank = s.t.rank[gi];
         if rank >= 0 {
             let pos = 1 + s.t.rank.iter().filter(|&&r| r > rank).count();

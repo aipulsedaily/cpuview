@@ -1,4 +1,5 @@
 # Windows: the C runtime linked into cpuview.exe, so it runs without the Visual C++
-# redistributable
+# redistributable; the system DLLs it imports only from System32, never from its own
+# folder (a Downloads folder could hold a planted one, loaded into the elevated setup)
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]

@@ -322,7 +322,7 @@ impl App {
 
     /// RAM panel: statistics rows (in use, available, cache, swap, waiting, temp).
     fn ram_stats(&self) -> usize {
-        4 + self.m.has_psi as usize + !self.m.dimms.is_empty() as usize
+        4 + self.m.has_psi as usize + (!self.m.dimms.is_empty() || cfg!(windows)) as usize
     }
 
     /// Disk panel: statistics rows (reading, writing, busy, temperature / drive; a
@@ -988,7 +988,8 @@ impl App {
         for p in [INUSE, SWAP, AVAIL, TREND, CACHE, TEMP, WAIT] {
             let ok = match p {
                 WAIT => m.has_psi,
-                TEMP => !m.dimms.is_empty(),
+                // (Windows: a dim line where it can't read them)
+                TEMP => !m.dimms.is_empty() || cfg!(windows),
                 TREND => !chart && iw >= 30,
                 _ => true,
             };
@@ -1131,7 +1132,12 @@ impl App {
             );
             y += 1;
         }
-        if on[TEMP] {
+        if on[TEMP] && a.dimm.is_empty() {
+            // (Windows: the RAM sticks' sensors sit on the SMBus, which RGB lighting
+            // software drives without a lock cpuview could share)
+            Self::line(scr, ir.x, y, maxx, bg, &[("RAM temp", th.text), ("  not read on Windows: its bus is shared with RGB software", th.dim)]);
+            y += 1;
+        } else if on[TEMP] {
             // the warmest module, then each one: "41°C · OK  2 modules: 40, 41°C"
             let mut each = F::new();
             let mut mx = 0.0f32;

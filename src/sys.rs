@@ -307,6 +307,9 @@ pub struct Topo {
     /// L3 domain (≈ CCD) per group
     pub ccd: Vec<usize>,
     pub ndom: usize,
+    /// the domains' names where they aren't CCDs (Windows, hybrid CPUs: "P-cores",
+    /// "E-cores"); empty: "CCD0", "CCD1" …
+    pub dom_names: Vec<&'static str>,
     /// amd-pstate preferred-core ranking per group (-1 = unknown)
     pub rank: Vec<i64>,
     pub maxf: f32,
@@ -337,6 +340,23 @@ fn cpu_model() -> String {
 }
 
 impl Topo {
+    /// A domain's name: "CCD0" …, or what the platform calls it ("P-cores").
+    pub fn dom_name(&self, d: usize) -> crate::ui::F {
+        match self.dom_names.get(d) {
+            Some(n) => {
+                let mut f = crate::ui::F::new();
+                f.str(n);
+                f
+            }
+            None => {
+                let mut f = crate::ui::F::new();
+                f.str("CCD");
+                f.int(d as u32, 0);
+                f
+            }
+        }
+    }
+
     #[cfg(windows)]
     pub fn detect() -> Topo {
         win::topo()
@@ -444,6 +464,7 @@ impl Topo {
             groups,
             ccd,
             ndom,
+            dom_names: Vec::new(),
             rank,
             maxf,
             minf,
@@ -503,6 +524,9 @@ pub struct Sampler {
     pub h_tot: Ring<f32>,
     pub h_avg: Ring<f32>,
     pub temps: Vec<Sensor>,
+    /// each core's temperature (°C, 0: none), where they are known (Windows, with
+    /// cpuview's sensor service)
+    pub core_t: Vec<f32>,
     pub gov: String,
     pub epp: String,
     pub loadavg: [f32; 3],
@@ -522,7 +546,8 @@ pub struct Sampler {
     pub eco: bool,
 }
 
-/// (Windows has no CPU temperature interface without a driver)
+/// (Windows has no CPU temperature interface without a driver: cpuview's sensor
+/// service's come later, see win::Cpu::svc_temps)
 #[cfg(windows)]
 fn find_sensors() -> Vec<Sensor> {
     win::find_sensors()
@@ -680,6 +705,7 @@ impl Sampler {
             h_tot: Ring::new(),
             h_avg: Ring::new(),
             temps: find_sensors(),
+            core_t: Vec::new(),
             gov: String::new(),
             epp: String::new(),
             loadavg: [0.0; 3],
@@ -953,9 +979,11 @@ impl Sampler {
         }
     }
 
-    /// Temperatures (Windows: none without a driver).
+    /// Temperatures (Windows: cpuview's sensor service's, see win::Cpu::svc_temps).
     #[cfg(windows)]
-    pub fn read_temps(&mut self, _all: bool) {}
+    pub fn read_temps(&mut self, _all: bool) {
+        self.w.svc_temps(&mut self.temps, &mut self.core_t, &self.t);
+    }
 
     /// Temperatures: k10temp reads go over SMN and cost ~10 µs each on a cold core,
     /// so the caller reads one sensor at a time (round robin). `all` reads every one.
@@ -1027,8 +1055,9 @@ impl Sampler {
     pub fn domain_temp_idx(&self, d: usize) -> Option<usize> {
         let ccd = |l: &str| l.strip_prefix("Tccd").and_then(|n| n.parse::<usize>().ok());
         let t = &self.temps;
+        let named = self.t.dom_names.get(d).copied().unwrap_or("");
         t.iter()
-            .position(|s| ccd(&s.label) == Some(d + 1))
+            .position(|s| ccd(&s.label) == Some(d + 1) || (!named.is_empty() && named.starts_with(s.label.as_str())))
             .or_else(|| {
                 t.iter()
                     .position(|s| s.label == "Tctl" || s.label.starts_with("Pkg"))
@@ -1248,6 +1277,7 @@ impl Sampler {
             groups: (0..n).map(|i| vec![i]).collect(),
             ccd: vec![0; n],
             ndom: 1,
+            dom_names: Vec::new(),
             rank: vec![-1; n],
             maxf: 1.0,
             minf: 0.0,
@@ -1289,6 +1319,7 @@ impl Sampler {
             h_tot: Ring::new(),
             h_avg: Ring::new(),
             temps: Vec::new(),
+            core_t: Vec::new(),
             gov: String::new(),
             epp: String::new(),
             loadavg: [0.0; 3],

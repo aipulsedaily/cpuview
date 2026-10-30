@@ -9,9 +9,11 @@
 //! - the battery and mains (GetSystemPowerStatus; watts from the battery's IOCTLs),
 //! - the firmware's ACPI thermal zones (PDH "Thermal Zone Information": often a fixed
 //!   or board value, so never called the CPU's),
-//! - NVMe drives' temperatures (a storage query, ~0.2 ms of wall time: slow cadence).
+//! - drives' temperatures (NVMe: a storage query, ~0.2 ms of wall time; SATA: their
+//!   SMART tables, while spun up; slow cadence).
 
 use super::*;
+use crate::win::svc::{self, B_CHIP, B_CPU, B_FAN, B_TEMP, B_VOLT};
 use crate::win::{close, fd2h, from_pwstr, from_wide, h2fd, reg_str, wide};
 use windows_sys::Wdk::Graphics::Direct3D::*;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
@@ -25,11 +27,12 @@ use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Windows sources (beyond S_BAT): ACPI zones, a drive, the energy meter, a
-/// graphics card
+/// graphics card, cpuview's sensor service
 pub(super) const S_ACPI: u8 = 6;
 pub(super) const S_DRIVE: u8 = 7;
 pub(super) const S_EMI: u8 = 9;
 pub(super) const S_GPU: u8 = 10;
+pub(super) const S_SVC: u8 = 11;
 
 /// NVML's power reading: device, milliwatts
 type NvPower = unsafe extern "C" fn(usize, *mut u32) -> i32;
@@ -47,6 +50,11 @@ pub struct State {
     earr: Vec<u64>,
     gpus: Vec<(u32, usize)>,
     nv_power: Option<NvPower>,
+    svc_gone: Option<i64>,
+    /// an ASUS board (its fan headers' names)
+    asus: bool,
+    /// the board's unlabelled temperature inputs found floating (`fd` keys)
+    floating: Vec<c_int>,
 }
 
 impl State {
@@ -61,14 +69,24 @@ impl State {
             earr: Vec::new(),
             gpus: Vec::new(),
             nv_power: None,
+            svc_gone: None,
+            asus: false,
+            floating: Vec::new(),
         }
     }
 }
 
-/// The CPU's temperatures, the board's fans and voltages need a driver (sensui.rs:
-/// hint kind 4).
-fn driver_hint() -> Option<(String, u8)> {
-    Some((String::new(), 4))
+impl Sens {
+    /// What needs cpuview's sensor service, in one dim line (sensui.rs: hint kind 4;
+    /// 5: the service runs, the board's chip isn't one it reads); none once it reads
+    /// the board's fans.
+    fn driver_hint(&self) -> Option<(String, u8)> {
+        let svc: Vec<usize> = (0..self.srcs.len()).filter(|&s| self.srcs[s].kind == S_SVC).collect();
+        if self.rd.iter().any(|r| r.kind == K_FAN && svc.contains(&(r.src as usize))) {
+            return None;
+        }
+        Some((String::new(), if svc.is_empty() { 4 } else { 5 }))
+    }
 }
 
 fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
@@ -87,15 +105,9 @@ fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
     }
 }
 
-/// A drive's temperature (°C), as mem.rs's helper thread reads it.
+/// A drive's temperature (°C), as win/drive.rs reads it.
 fn drive_temp(h: HANDLE) -> Option<f32> {
-    let mut q = [0u8; 12];
-    q[..4].copy_from_slice(&(StorageDeviceTemperatureProperty as u32).to_le_bytes());
-    let mut d: STORAGE_TEMPERATURE_DATA_DESCRIPTOR = unsafe { std::mem::zeroed() };
-    if !ioctl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, &mut d) || d.InfoCount == 0 {
-        return None;
-    }
-    Some(d.TemperatureInfo[0].Temperature as f32)
+    crate::win::drive::temp(h).map(|t| t.0)
 }
 
 impl Sens {
@@ -106,6 +118,7 @@ impl Sens {
         let r = |v: &str| reg_str(HKEY_LOCAL_MACHINE, bios, v).unwrap_or_default();
         let (bv, bn, sv, pn) = (r("BaseBoardManufacturer"), r("BaseBoardProduct"), r("SystemManufacturer"), r("SystemProductName"));
         let vendor = short_vendor(if bv.is_empty() { sv.clone() } else { bv });
+        self.w.asus = vendor.starts_with("ASUS");
         let model = if !bn.is_empty() && !bn.starts_with("To be filled") { &bn } else { &pn };
         self.board = if model.is_empty() { String::new() } else { [&vendor, " ", model].concat() };
         self.vm = is_vm(&[&sv, " ", &pn].concat().to_ascii_lowercase());
@@ -113,14 +126,126 @@ impl Sens {
         self.emi();
         self.gpus();
         self.drives();
+        if let Some(v) = svc::readings() {
+            self.svc(&v);
+        }
         self.batteries();
         self.finish_names();
         self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
         if !self.vm {
-            self.fan_hint = driver_hint();
+            self.fan_hint = self.driver_hint();
         }
         for i in 0..self.srcs.len() {
             self.read_src(i, now);
+        }
+    }
+
+    /// cpuview's sensor service started or stopped since detection: its readings are
+    /// added when it first answers (its snapshot, looked for every 10 s:
+    /// svc::readings) and dropped when it hasn't for 20 s (they keep their last
+    /// values until then).
+    pub(super) fn win_tick(&mut self, now: i64) {
+        if self.vm {
+            return;
+        }
+        if self.srcs.iter().any(|s| s.kind == S_SVC) {
+            if self.w.svc_gone.is_some_and(|t| now - t >= 20 * SEC) {
+                self.w.svc_gone = None;
+                while let Some(s) = self.srcs.iter().position(|s| s.kind == S_SVC) {
+                    self.drop_src(s);
+                }
+                self.fan_hint = self.driver_hint();
+            }
+        } else if let Some(v) = svc::readings() {
+            let (t0, hists, first) = (thread_ns(), self.rd.iter().any(|r| r.hist.is_some()), self.srcs.len());
+            self.svc(&v);
+            self.finish_names();
+            self.hists(hists);
+            self.fan_hint = self.driver_hint();
+            self.spent += (thread_ns() - t0).max(0);
+            for s in first..self.srcs.len() {
+                self.read_src(s, now);
+            }
+        }
+    }
+
+    /// Source `s` and its readings gone (the sensor service stopped): the indices
+    /// after them move down.
+    fn drop_src(&mut self, s: usize) {
+        let gone: Vec<bool> = self.rd.iter().map(|r| r.src as usize == s).collect();
+        for b in &mut self.bats {
+            b.rd -= gone[..b.rd].iter().filter(|&&g| g).count();
+        }
+        let mut k = 0;
+        self.rd.retain(|_| {
+            k += 1;
+            !gone[k - 1]
+        });
+        for r in &mut self.rd {
+            if r.src as usize > s {
+                r.src -= 1;
+            }
+        }
+        self.srcs.remove(s);
+        self.cpu_power = if self.role(R_PKG).is_some() { P_OK } else { P_NONE };
+    }
+
+    /// cpuview's sensor service (win/svc.rs), two sources named as Linux's drivers
+    /// name theirs: the CPU's temperatures (as coretemp's or k10temp's: the package,
+    /// Tctl, the CCDs; each core's as minor ones) and the motherboard chip's fans,
+    /// voltages and temperatures (as hwmon's nct6775: `hwmon` on Linux). The board's
+    /// readings are found again by kind and number (`fd`: 0x200 and up), the CPU's by
+    /// label.
+    fn svc(&mut self, v: &[svc::Reading]) {
+        let intel = v.iter().any(|x| x.kind == B_CPU && x.label == "Pkg");
+        let chip = if intel { "coretemp" } else { "k10temp" };
+        if v.iter().any(|x| x.kind == B_CPU) {
+            let (g, what, class) = chip_info(chip);
+            let s = self.src(chip, "PawnIO", what, "", S_SVC, class, g);
+            for (k, x) in v.iter().filter(|x| x.kind == B_CPU).enumerate() {
+                let lab = if x.label == "Pkg" { "Package id 0" } else { x.label.as_str() };
+                let (name, tg, fl) = temp_name(chip, lab, 0);
+                let mut r = rd(K_TEMP, s, tg, k.min(0xff) as c_int, &x.label, &name);
+                (r.warn, r.crit) = temp_limits(tg, None, None);
+                (r.flags, r.minor) = (fl, x.minor || fl & F_MINOR != 0);
+                self.add(s, r);
+            }
+        }
+        let Some(c) = v.iter().find(|x| x.kind == B_CHIP) else { return };
+        let name = c.label.clone();
+        let (g, what, class) = chip_info(&name);
+        let s = self.src(&name, "PawnIO", what, "", S_SVC, class, g);
+        for x in v.iter().filter(|x| matches!(x.kind, B_TEMP | B_FAN | B_VOLT)) {
+            let key = (x.kind as c_int) << 8 | x.n as c_int;
+            let n = x.n as u32;
+            let base = [["", "", "temp", "fan", "in"][x.kind as usize], &n2s(n)].concat();
+            let mut r = rd(K_TEMP, s, g, key, if x.label.is_empty() { &base } else { &x.label }, "");
+            match x.kind {
+                B_FAN => {
+                    r.kind = K_FAN;
+                    (r.name, r.raw, r.guess) = fan_name(&name, "", n, self.w.asus);
+                    if g == G_OTHER {
+                        r.group = G_BOARD;
+                    }
+                }
+                B_TEMP => {
+                    let (pn, tg, fl) = temp_name(&name, &x.label, n);
+                    if fl & F_DROP != 0 {
+                        continue;
+                    }
+                    (r.name, r.flags, r.minor, r.guess, r.group) = (pn, fl, fl & F_MINOR != 0, fl & F_AUX != 0, tg);
+                    (r.warn, r.crit) = temp_limits(r.group, None, None);
+                }
+                _ => {
+                    r.kind = K_VOLT;
+                    let mul;
+                    (r.name, mul) = volt_name(&name, &x.label, n, x.val);
+                    r.mul = mul;
+                    (r.warn, r.crit) = (x.lo * mul, x.hi * mul);
+                    r.guess = x.label.is_empty() && r.name.starts_with("in");
+                }
+            }
+            self.add(s, r);
         }
     }
 
@@ -292,8 +417,13 @@ impl Sens {
                 let mut reg: D3DKMT_ADAPTERREGISTRYINFO = unsafe { std::mem::zeroed() };
                 kmt(a.hAdapter, KMTQAITYPE_ADAPTERREGISTRYINFO, &mut reg);
                 let mut at = D3DKMT_ADAPTERADDRESS { BusNumber: u32::MAX, DeviceNumber: 0, FunctionNumber: 0 };
-                kmt(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut at);
-                cards.push((a.hAdapter, from_wide(&reg.AdapterString), at.BusNumber, caps));
+                // a card has a PCI address; adapters without one (Remote Desktop's,
+                // other virtual displays) pass on a real card's numbers: it twice
+                if kmt(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut at) && at.DeviceNumber != 0xffff {
+                    cards.push((a.hAdapter, from_wide(&reg.AdapterString), at.BusNumber, caps));
+                    continue;
+                }
+                unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter }) };
             } else {
                 unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter }) };
             }
@@ -322,13 +452,13 @@ impl Sens {
         }
     }
 
-    /// NVMe drives that report a temperature: one source each (read slowly).
+    /// Drives that report a temperature (NVMe as Linux's nvme driver has them, SATA
+    /// drives' SMART temperature as its drivetemp has them): one source each, read
+    /// slowly.
     fn drives(&mut self) {
-        let (g, what, class) = chip_info("nvme");
         let mut miss = 0;
         for i in 0..64 {
-            let p = wide(&["\\\\.\\PhysicalDrive", &n2s(i)].concat());
-            let h = unsafe { CreateFileW(p.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+            let h = crate::win::drive::open(i);
             if h == INVALID_HANDLE_VALUE {
                 miss += 1;
                 if miss > 8 {
@@ -337,14 +467,16 @@ impl Sens {
                 continue;
             }
             miss = 0;
-            if drive_temp(h).is_none() {
+            let Some((_, smart)) = crate::win::drive::temp(h) else {
                 close(h);
                 continue;
-            }
-            let dev = ["disk", &n2s(i)].concat();
-            let s = self.src("nvme", "stornvme", what, &dev, S_DRIVE, class, g);
-            let (name, tg, _) = temp_name("nvme", "Composite", 1);
-            let mut r = rd(K_TEMP, s, tg, h2fd(h), "Composite", &name);
+            };
+            let (chip, driver, lab) = if smart { ("drivetemp", "SMART", "temp1") } else { ("nvme", "stornvme", "Composite") };
+            let (g, what, class) = chip_info(chip);
+            let dev = ["disk", &n2s(i as u32), " ", &crate::win::drive::model(h)].concat();
+            let s = self.src(chip, driver, what, dev.trim_end(), S_DRIVE, class, g);
+            let (name, tg, _) = temp_name(chip, if smart { "" } else { lab }, 1);
+            let mut r = rd(K_TEMP, s, tg, h2fd(h), lab, &name);
             (r.warn, r.crit) = temp_limits(tg, None, None);
             self.add(s, r);
         }
@@ -466,6 +598,61 @@ impl Sens {
                     }
                 }
             }
+            S_SVC => {
+                // the service's last snapshot, a fresh one asked for (none: the last
+                // values stay, and win_tick lets the service go after 20 s)
+                let Some(v) = svc::readings() else {
+                    self.w.svc_gone.get_or_insert(crate::term::mono());
+                    return;
+                };
+                self.w.svc_gone = None;
+                let (mut board, floating) = (None, &mut self.w.floating);
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i) {
+                    let x = if r.fd < 0x100 {
+                        v.iter().find(|x| x.kind == B_CPU && x.label == r.raw)
+                    } else {
+                        v.iter().find(|x| x.kind != B_CPU && ((x.kind as c_int) << 8 | x.n as c_int) == r.fd)
+                    };
+                    let Some(x) = x else {
+                        r.ok = false;
+                        continue;
+                    };
+                    match r.kind {
+                        K_FAN => {
+                            r.ok = (0.0..30000.0).contains(&x.val);
+                            r.val = if r.ok { x.val } else { 0.0 };
+                            if r.val > 0.0 {
+                                r.seen = true;
+                                r.max = r.max.max(r.val);
+                            }
+                            if r.seen {
+                                (r.pwm, r.en) = (x.pwm, x.en);
+                            }
+                        }
+                        K_VOLT => (r.val, r.ok) = (x.val * r.mul, x.val > 0.0),
+                        _ => {
+                            // (an unlabelled input that jumps 10 °C between two reads,
+                            // 1.5 s or more apart, is a pin with nothing on it: no
+                            // temperature inside a computer does that)
+                            if r.flags & F_AUX != 0 && r.seen && (x.val - r.val).abs() > 10.0 && !floating.contains(&r.fd) {
+                                floating.push(r.fd);
+                            }
+                            r.ok = temp_ok(x.val, false, None) && !floating.contains(&r.fd);
+                            if r.ok {
+                                r.val = x.val;
+                                if r.flags & F_REF != 0 {
+                                    board = Some(r.val);
+                                }
+                            }
+                        }
+                    }
+                    r.seen |= r.ok && r.kind != K_FAN;
+                }
+                // unidentified board inputs: real only if not colder than the board
+                for r in self.rd.iter_mut().filter(|r| r.src as usize == i && r.kind == K_TEMP && r.flags & F_AUX != 0 && r.ok) {
+                    r.ok = temp_ok(r.val, true, board);
+                }
+            }
             _ => {}
         }
     }
@@ -549,15 +736,7 @@ fn battery_device() -> Option<(HANDLE, u32)> {
     }
 }
 
-/// `cpuview --setup-sensors` on Windows: what Windows offers, and what needs a driver.
-pub fn setup(_undo: bool, _per_core: bool, _bmc: bool, _dry: bool) -> i32 {
-    println!(
-        "cpuview on Windows reads what Windows itself offers: CPU load and clocks, memory,
-disks, network, processes, the CPU's power (Windows' energy meter), graphics cards'
-temperature, fan and (NVIDIA) watts, the battery, NVMe drive temperatures and the
-firmware's ACPI thermal zones. Windows has no interface for CPU temperatures, the
-board's fans (CPU fan, case fans, pump) or voltages without a kernel driver, and
-this build of cpuview loads none."
-    );
-    0
+/// `cpuview --setup-sensors` on Windows: the sensor service (see win/setup.rs).
+pub fn setup(undo: bool, _per_core: bool, _bmc: bool, dry: bool) -> i32 {
+    crate::win::setup::setup(undo, dry)
 }

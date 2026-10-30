@@ -7,6 +7,7 @@
 
 use crate::win::{from_wide, wide, NtQuerySystemInformationEx};
 use crate::sys::{isort, Ring, Sensor, Topo};
+use crate::win::svc;
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
 use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::{CallNtPowerInformation, PowerGetActiveScheme, PowerReadFriendlyName, ProcessorInformation};
@@ -47,6 +48,8 @@ pub struct Cpu {
     read: Vec<bool>,
     /// load average: the time of its last update
     la_t: i64,
+    /// the temperatures came from cpuview's sensor service (win/svc.rs)
+    from_svc: bool,
     /// active power plan
     plan: windows_sys::core::GUID,
 }
@@ -110,6 +113,18 @@ fn group_bases() -> (Vec<(u16, usize)>, usize) {
         n = std::thread::available_parallelism().map_or(1, |n| n.get());
     }
     (v, n)
+}
+
+/// Processor group and number in it of each CPU (cpuview's CPU index: the groups'
+/// CPUs one after the other).
+pub fn group_numbers() -> Vec<(u16, u8)> {
+    let (bases, n) = group_bases();
+    (0..n)
+        .map(|c| {
+            let k = bases.iter().rposition(|b| b.1 <= c).unwrap_or(0);
+            (bases[k].0, (c - bases[k].1) as u8)
+        })
+        .collect()
 }
 
 /// Nominal clock (MHz) of the first processor.
@@ -195,6 +210,15 @@ pub fn topo() -> Topo {
         });
         ccd.push(k);
     }
+    // a hybrid CPU with one L3 (Intel's): its performance and efficiency cores as the
+    // two domains, so the CPU page tells them apart as it does AMD's CCDs
+    let top = eff.iter().copied().max().unwrap_or(0);
+    let mut dom_names = Vec::new();
+    if doms.len() <= 1 && eff.iter().any(|&e| e != top) {
+        ccd = eff.iter().map(|&e| (e != top) as usize).collect();
+        doms = vec![0, 1];
+        dom_names = vec!["P-cores", "E-cores"];
+    }
     // the scheduler's preference: efficiency class (hybrid CPUs: performance cores
     // first), then the CPU set's scheduling class (preferred cores); -1 where all equal
     let sched = sched_classes(n, &bases);
@@ -224,6 +248,7 @@ pub fn topo() -> Topo {
         groups,
         ccd,
         ndom: doms.len().max(1),
+        dom_names,
         rank,
         maxf,
         // (raised to the slowest clock seen: idle CPUs show it, as on Linux)
@@ -281,6 +306,7 @@ impl Cpu {
             map: Vec::new(),
             nominal: 0.0,
             la_t: 0,
+            from_svc: false,
             ceil: f32::MAX,
             read: Vec::new(),
             plan: unsafe { std::mem::zeroed() },
@@ -303,6 +329,7 @@ impl Cpu {
             map: Vec::new(),
             nominal: nominal_mhz(n),
             la_t: 0,
+            from_svc: false,
             ceil: if rated_max() > 0.0 { 1.2 * rated_max() } else { f32::MAX },
             read: Vec::new(),
             plan: unsafe { std::mem::zeroed() },
@@ -404,6 +431,11 @@ impl Cpu {
                 continue;
             }
             if f <= 0.0 || f > self.ceil || u < 0.1 {
+                // (barely busy and never read: the slowest clock seen, as idle cores
+                // show, or this reading before there is one)
+                if fr[c] <= 0.0 {
+                    fr[c] = if t.minf > 0.0 { t.minf } else if f > 0.0 && f <= self.ceil { f } else { 0.0 };
+                }
                 continue;
             }
             if t.minf == 0.0 || f < t.minf {
@@ -447,6 +479,49 @@ impl Cpu {
             }
         }
         self.la_t = now;
+    }
+
+    /// The CPU temperatures from cpuview's sensor service, where it is installed (see
+    /// win/svc.rs): its snapshot, a fresh one asked for (a few µs); the package
+    /// ("Pkg0", as Linux's coretemp names it), Tctl and the CCDs as the CPU page shows
+    /// them, on hybrid CPUs the hottest P- and E-core ("P-core", "E-core": the
+    /// domains' temperatures), and each core's (`core_t`, by core). They go when it
+    /// stops answering.
+    pub fn svc_temps(&mut self, temps: &mut Vec<Sensor>, core_t: &mut Vec<f32>, t: &Topo) {
+        let Some(all) = svc::readings() else {
+            if std::mem::take(&mut self.from_svc) {
+                temps.clear();
+                core_t.clear();
+            }
+            return;
+        };
+        core_t.clear();
+        core_t.resize(t.groups.len(), 0.0);
+        for r in all.iter().filter(|r| r.kind == svc::B_CPU && r.minor) {
+            if let Some(k) = r.label.strip_prefix("Core ").and_then(|n| n.parse::<usize>().ok()).filter(|&k| k < core_t.len()) {
+                core_t[k] = r.val;
+            }
+        }
+        let mut v: Vec<(String, f32)> = all
+            .iter()
+            .filter(|r| r.kind == svc::B_CPU && !r.minor)
+            .map(|r| (if r.label == "Pkg" { "Pkg0".to_string() } else { r.label.clone() }, r.val))
+            .collect();
+        for (d, name) in t.dom_names.iter().enumerate() {
+            let hot = (0..core_t.len()).filter(|&k| t.ccd.get(k) == Some(&d)).map(|k| core_t[k]).fold(0.0, f32::max);
+            if hot > 0.0 {
+                // ("P-cores" → "P-core": the hottest of them, in the 6 columns a label has)
+                v.push((name[..6].to_string(), hot));
+            }
+        }
+        if !self.from_svc || temps.len() != v.len() || temps.iter().zip(&v).any(|(s, r)| s.label != r.0) {
+            *temps = v.into_iter().map(|(label, val)| Sensor { label, fd: -1, val, hist: Ring::new(), max: 0.0 }).collect();
+            self.from_svc = true;
+        } else {
+            for (s, r) in temps.iter_mut().zip(&v) {
+                s.val = r.1;
+            }
+        }
     }
 
     /// The active power plan's name (read again only when the plan changes).

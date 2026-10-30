@@ -3,7 +3,8 @@
 //! counters (IOCTL_DISK_PERFORMANCE on \\.\PhysicalDriveN, opened once: ~1–8 µs a
 //! read), fixed volumes (GetDiskFreeSpaceEx, ~10–70 µs each), the processes' memory
 //! (the basic process list, ~0.1–0.4 ms, and process handles kept open: ~1 µs a
-//! query), and NVMe temperatures for the helper thread (~0.2 ms of wall time each).
+//! query), and drive temperatures for the helper thread (NVMe ~0.2 ms of wall time
+//! each; SATA drives' SMART tables).
 
 use super::*;
 use crate::sys::isort;
@@ -115,19 +116,7 @@ fn ioctl<T>(h: HANDLE, code: u32, inp: &[u8], out: &mut T) -> bool {
 }
 
 fn open_drive(i: usize) -> HANDLE {
-    let p = wide(&format!("\\\\.\\PhysicalDrive{i}"));
-    // (no access rights: enough for the statistics, no administrator needed)
-    unsafe {
-        CreateFileW(
-            p.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    }
+    crate::win::drive::open(i)
 }
 
 /// A disk's counters as Linux's diskstats has them: reads, read sectors, writes,
@@ -147,38 +136,9 @@ fn disk_counters(fd: c_int) -> Option<DiskCnt> {
     ])
 }
 
-/// A drive's temperature (°C) as it reports it (NVMe; SATA drives mostly don't).
+/// A drive's temperature (°C), as win/drive.rs reads it.
 fn drive_temp(fd: c_int) -> Option<i32> {
-    let mut q = [0u8; 12];
-    q[..4].copy_from_slice(&(StorageDeviceTemperatureProperty as u32).to_le_bytes());
-    let mut d: STORAGE_TEMPERATURE_DATA_DESCRIPTOR = unsafe { std::mem::zeroed() };
-    if !ioctl(fd2h(fd), IOCTL_STORAGE_QUERY_PROPERTY, &q, &mut d) || d.InfoCount == 0 {
-        return None;
-    }
-    let t = d.TemperatureInfo[0].Temperature as i32;
-    (t > -100 && t < 200).then_some(t)
-}
-
-/// The drive's vendor and product as it names itself.
-fn drive_model(h: HANDLE) -> String {
-    let mut out = [0u64; 128];
-    let q = [0u8; 12]; // StorageDeviceProperty, PropertyStandardQuery
-    if !ioctl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, &mut out) {
-        return String::new();
-    }
-    let b = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, 1024) };
-    let d = unsafe { &*(out.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
-    let at = |o: u32| -> String {
-        let o = o as usize;
-        if o == 0 || o >= b.len() {
-            return String::new();
-        }
-        let n = b[o..].iter().position(|&c| c == 0).unwrap_or(0);
-        String::from_utf8_lossy(&b[o..o + n]).trim().to_string()
-    };
-    let (v, p) = (at(d.VendorIdOffset), at(d.ProductIdOffset));
-    let m = if v.is_empty() || p.starts_with(&v) { p } else { v + " " + &p };
-    m.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::win::drive::temp(fd2h(fd)).map(|t| t.0.round() as i32)
 }
 
 /// Physical disks, numbered as Disk Management numbers them (disk0, disk1 …); NVMe
@@ -203,7 +163,7 @@ pub(super) fn find_disks() -> Vec<Disk> {
             continue;
         }
         let mut d = Disk::new(&format!("disk{i}"));
-        d.model = drive_model(h);
+        d.model = crate::win::drive::model(h);
         d.size = size;
         d.fd = h2fd(h);
         if drive_temp(d.fd).is_some() {

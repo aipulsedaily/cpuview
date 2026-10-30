@@ -75,17 +75,35 @@ From source: `cargo build --release` with the MSVC toolchain (rustup's default o
 with Visual Studio's C++ build tools).
 
 **What Windows can and can't show.** CPU load per thread, the clocks the cores really run at,
-cores and their threads (P- and E-cores), the power plan, RAM and the page file, disks,
-volumes, the network, processes (end, suspend, resume, priority), the CPU's power (package,
-cores and, where the CPU counts them, its built-in GPU and RAM: Windows' energy meter),
-graphics cards' temperature and fan (any vendor, as Task Manager shows them) and an NVIDIA
-card's watts (NVML, which comes with its driver; ~14 MB of memory), the battery, NVMe
-drives' temperatures and the firmware's ACPI thermal zones all come from Windows itself. CPU
-temperatures, the board's fans (CPU fan, case fans, pump) and voltages don't: Windows has no
-interface for them without a kernel driver, and this build loads none (the pages say so in
-one dim line). Linux-only: containers, systemd services, a server board's BMC, per-core RAPL,
-Ctrl-Z. The load average is an estimate (the busy CPUs, decayed like Linux's); processes'
-read / write counts are all their I/O (disk, network and pipes together).
+cores and their threads (P- and E-cores apart, as AMD's CCDs are), the power plan, RAM and
+the page file, disks, volumes, the network, Windows' services (on the network page, where
+Linux shows systemd's), processes (end, suspend, resume, priority), the CPU's power
+(package, cores and, where the CPU counts them, its built-in GPU and RAM: Windows' energy
+meter), graphics cards' temperature and fan (any vendor, as Task Manager shows them) and an
+NVIDIA card's watts (NVML, which comes with its driver; ~14 MB of memory), the battery,
+drives' temperatures (NVMe, and SATA drives' SMART temperature while they're spun up) and
+the firmware's ACPI thermal zones all come from Windows itself. CPU temperatures and the
+board's fans (CPU fan, case fans, pump), voltages and temperatures don't: Windows has no
+interface for them without a kernel driver. `cpuview --setup-sensors` installs what it
+takes, in one step: it shows what it will add and why, asks, then asks Windows for
+administrator rights once and installs the signed [PawnIO](https://pawnio.eu) driver
+(through winget), its signed modules and cpuview's own sensor service, a small service that
+runs as SYSTEM, idles until cpuview asks and hands cpuview a read-only snapshot; `--undo`
+removes all of it. The service reads the CPU's temperatures (Intel: the package and every
+core; AMD: Tctl and each CCD) and the board's monitoring chip (Nuvoton NCT6779–NCT6799,
+ITE IT87xx/IT86xx up to the IT8628 and Gigabyte's IT8792E/IT87952E, Fintek F718xx/F81xxx)
+under the ISA-bus mutex other monitoring tools share. It only reads: the one thing it sets
+is what the board's own firmware sets around each access (on NCT6791 and later, the lock
+on the monitor's I/O window, opened for each read and closed again), and on ASUS boards the
+fans carry their header names (CPU_FAN, CHA_FAN1, AIO_PUMP …) as on Linux.
+`cpuview --sensor-service --print` (as an administrator) shows what it reads. Linux-only:
+containers (Docker Desktop's run in WSL's virtual machine, out of Windows' sight), a server
+board's BMC, per-core RAPL, RAM sticks' temperatures (their sensors share the SMBus with
+RGB lighting software, which takes no lock cpuview could share), the "waiting for RAM"
+pressure figure, Ctrl-Z. The load average is an estimate (the busy CPUs, decayed like
+Linux's); processes' read / write counts are all their I/O (disk, network and pipes
+together); services' CPU and memory come from Windows' full process list (18 ms with
+15 000 threads), so they're read every 30 s (10 min in eco).
 
 ### From source
 
@@ -891,14 +909,21 @@ windows, eco after a minute's warm-up). CPU time is the process's exact cycle co
 eco's ~3–5 ms a minute reads 0 (one tick in a minute would be 260 µs/s), and a smooth
 minute reads anywhere from 0.7× to 2× the cycle count:
 
-| page | eco (3 windows) | smooth (2 windows) | smooth output |
+| page | eco (2 windows) | smooth | smooth output |
 |---|---|---|---|
-| overview | 39–76 µs/s (0) | 3.3–4.3 ms/s (3.1–6.8) | 9–10 KB/s |
-| CPU | 60–66 µs/s (0) | 3.3–3.5 ms/s (5.2–5.5) | 51–52 KB/s |
-| memory & storage | 53–68 µs/s (0) | 2.9–3.6 ms/s (2.6–7.6) | 1.6 KB/s |
-| network | 55–79 µs/s (0) | 3.7–3.8 ms/s (4.2–6.3) | 8 KB/s |
-| processes | 5–79 µs/s (0) | 3.3–4.5 ms/s (4.9–5.2) | 23–41 KB/s |
-| sensors | 43–58 µs/s (0) | 2.5–2.6 ms/s (4.7–5.7) | 0.2 KB/s |
+| overview | 21–57 µs/s (0) | 4.2 ms/s (5.7) | 11 KB/s |
+| CPU | 57–68 µs/s (0) | 4.5 ms/s (6.8) | 70 KB/s |
+| memory & storage | 34–83 µs/s (0) | 4.3 ms/s (7.0) | 3.3 KB/s |
+| network | 4–59 µs/s (0) | 3.8 ms/s (4.9) | 5 KB/s |
+| processes | 9–48 µs/s (0) | 3.8–5.1 ms/s, 3 windows (2.3–4.7) | 19–32 KB/s |
+| sensors | 50–63 µs/s (0) | 4.0 ms/s (8.3) | 6 KB/s |
+
+(With cpuview's sensor service installed and every board sensor shown; a busier desktop than
+earlier runs: ~645 processes, 22 % of the CPU busy with other work.) The sensor service
+itself: ~8 MB of working set (1.4 MB private), no CPU while nothing asks (it waits on an
+event), and while a cpuview asks every second 0.34 ms/s (GetProcessTimes over 26 minutes),
+most of it Intel's per-core temperatures (the service's thread visits every core), which
+it now reads every 5 s.
 
 The same work costs more CPU time when Windows has the core clocked down: in one hour
 with the clocks low, smooth measured up to 7–8 ms/s on the overview and processes pages

@@ -841,14 +841,15 @@ impl App {
         let z = &self.z;
         let th = &self.t;
         let m = z.fan_hint.as_ref().map_or("", |h| h.0.as_str());
-        // (Windows: what needs a driver, in one dim line; two where it doesn't fit)
-        if !z.vm && z.fan_hint.as_ref().is_some_and(|h| h.1 == 4) {
+        // (Windows: what needs cpuview's sensor service, in one dim line, two where it
+        // doesn't fit; 5: the service runs, the board's chip isn't one it reads)
+        if let Some(k) = z.fan_hint.as_ref().map(|h| h.1).filter(|&k| !z.vm && (k == 4 || k == 5)) {
             l.row(2, th.dim, th.dim, -1.0, 0);
-            l.s("CPU temperature, fans, voltages: ");
+            l.s(if k == 4 { "CPU temperature, fans, voltages: " } else { "fans, voltages: " });
             if two {
                 l.row(2, th.dim, 0, -1.0, 0);
             }
-            l.s("Windows has none without a driver");
+            l.s(if k == 4 { "cpuview --setup-sensors" } else { "this board's chip isn't one cpuview reads yet" });
             return;
         }
         l.row(2, th.warn, th.dim, -1.0, 0);

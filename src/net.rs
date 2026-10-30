@@ -1133,7 +1133,15 @@ impl Svc {
     }
 
     fn read(&mut self, v2: bool, now: i64) {
-        if let Some((us, m)) = cg_read(v2, &self.fd, 1) {
+        // (Windows: its numbers come from the process list, win_read_svcs)
+        #[cfg(windows)]
+        let got: Option<(u64, u64)> = {
+            let _ = v2;
+            None
+        };
+        #[cfg(unix)]
+        let got = cg_read(v2, &self.fd, 1);
+        if let Some((us, m)) = got {
             self.cpu = cpu_pct(self.prev, now, us);
             self.prev = (now, us);
             self.mem = m as f32;
@@ -1234,6 +1242,8 @@ pub struct Net {
     pub api: Vec<ApiCtr>,
     pub stopped: u32,
     pub has_systemd: bool,
+    /// Windows: Docker runs here, its containers inside WSL's virtual machine
+    pub docker_vm: bool,
     last: [i64; NJOB],
     last_dev: i64,
     pub entered: bool,
@@ -1281,6 +1291,7 @@ impl Net {
             api: Vec::new(),
             stopped: 0,
             has_systemd: false,
+            docker_vm: false,
             last: [i64::MIN / 2; NJOB],
             last_dev: i64::MIN / 2,
             entered: false,
@@ -1376,6 +1387,8 @@ impl Net {
             let p = match j {
                 J_CTRS if nc == 0 => continue,
                 J_SVCS if ns == 0 => continue,
+                // (Windows: the full process list, 18 ms: see win/net.rs)
+                J_SVCS if cfg!(windows) => if eco { 600 * SEC } else { 30 * SEC },
                 J_CTRS => p.max(nc * SEC / 8),
                 J_SVCS => p.max(ns * SEC / 16),
                 _ => p,
@@ -1833,6 +1846,10 @@ impl Net {
     /// Find containers and services in the cgroup tree (only the branches that
     /// can hold them are read).
     fn walk(&mut self, now: i64) {
+        #[cfg(windows)]
+        if !self.lite {
+            return self.win_services(now);
+        }
         if self.cpu_root.is_empty() {
             return;
         }
@@ -1982,9 +1999,14 @@ impl Net {
     }
 
     fn read_svcs(&mut self, now: i64) {
-        let v2 = self.cg2;
-        for s in self.svcs.iter_mut().chain(self.user.as_mut()) {
-            s.read(v2, now);
+        #[cfg(windows)]
+        self.win_read_svcs(now);
+        #[cfg(unix)]
+        {
+            let v2 = self.cg2;
+            for s in self.svcs.iter_mut().chain(self.user.as_mut()) {
+                s.read(v2, now);
+            }
         }
     }
 
