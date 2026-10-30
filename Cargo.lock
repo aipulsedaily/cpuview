@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "cpuview"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "libc",
  "windows-link",
