@@ -66,10 +66,28 @@ To install it for your user: `cp bin/cpuview ~/.local/bin/` and
 
 ### Windows 10 and 11
 
-Every release has `cpuview-<version>-x86_64-windows.zip`: unpack it anywhere and run
-`cpuview.exe` in Windows Terminal (the classic console window and VS Code's terminal work
-too). No installer, no administrator rights, no Visual C++ runtime; the `wallpapers` folder
-next to it holds the picture themes, settings go to `%APPDATA%\cpuview`. (winget: later.)
+In PowerShell (no administrator rights needed):
+
+```powershell
+irm https://raw.githubusercontent.com/aipulsedaily/cpuview/main/install.ps1 | iex
+```
+
+It downloads the latest release's Windows zip (x86_64 or ARM64, whichever the PC is), checks
+its SHA-256 against the one GitHub publishes, puts `cpuview.exe` and the wallpapers in
+`%LOCALAPPDATA%\Programs\cpuview` and that folder on your PATH: open a new terminal and run
+`cpuview`. Run it again to update (a running cpuview is fine). Then, optionally,
+`cpuview --setup-sensors` for CPU temperatures, fans and voltages (see below). To remove it
+(the sensor service too, if you installed it):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/aipulsedaily/cpuview/main/install.ps1))) -Uninstall
+```
+
+Or by hand: every release has `cpuview-<version>-x86_64-windows.zip` (and `…-aarch64-…`):
+unpack it anywhere and run `cpuview.exe` in Windows Terminal (the classic console window and
+VS Code's terminal work too). No installer, no administrator rights, no Visual C++ runtime;
+the `wallpapers` folder next to it holds the picture themes, settings go to
+`%APPDATA%\cpuview`. (winget: later.)
 
 From source: `cargo build --release` with the MSVC toolchain (rustup's default on Windows,
 with Visual Studio's C++ build tools).
