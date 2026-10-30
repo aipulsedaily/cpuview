@@ -602,8 +602,28 @@ impl App {
         }
     }
 
+    /// The temperatures' springs and digits for every CPU sensor. (Windows: they come
+    /// with the sensor service's first answer, after the start, and go when it stops.)
+    fn fit_temps(&mut self) {
+        let (no, nn) = (self.tt.len(), self.s.temps.len());
+        if no != nn {
+            self.tt = self.s.temps.iter().map(|t| (t.val, 0.0)).collect();
+            // (the totals' and CCDs' digits stay as shown; the temperatures' start at
+            // their values)
+            let nd = 2 * self.s.t.ndom.max(1);
+            let mut hy = vec![0.0; HY_TEMP + nn + nd];
+            hy[..HY_TEMP].copy_from_slice(&self.hy[..HY_TEMP]);
+            for (h, t) in hy[HY_TEMP..].iter_mut().zip(&self.s.temps) {
+                *h = t.val;
+            }
+            hy[HY_TEMP + nn..].copy_from_slice(&self.hy[HY_TEMP + no..]);
+            self.hy = hy;
+        }
+    }
+
     /// Bars jump to the latest sample (every speed but smooth; smooth at start).
     pub fn bars_snap(&mut self) {
+        self.fit_temps();
         let m = self.s.t.maxf;
         for i in 0..self.bf.len() {
             self.bf[i] = (self.s.fe[i] / m).clamp(0.0, 1.0);
@@ -630,6 +650,7 @@ impl App {
     /// window; clock: reading jitter) are ignored, so quiet bars stand still instead
     /// of shimmering at their edge; 0 and 100 % are always exact.
     pub fn retarget(&mut self) {
+        self.fit_temps();
         let m = self.s.t.maxf;
         let db = |t: &mut f32, n: f32, d: f32| {
             if (n - *t).abs() >= d || n <= 0.0 || n >= 1.0 {
@@ -798,7 +819,8 @@ impl App {
 
     /// Sensor `k`: (bar position, shown value) in °C.
     pub fn temp(&self, k: usize) -> (f32, f32) {
-        if self.smooth() {
+        // (a sensor that came since the last sample: its springs come with the next)
+        if self.smooth() && k < self.tt.len() {
             (self.tt[k].0, self.hy[HY_TEMP + k])
         } else {
             let v = self.s.temps[k].val;
@@ -4355,6 +4377,47 @@ mod tests {
         ];
         for (n, f) in fx {
             eprintln!("── {n}\n{}", mem_text(w, h, PG_MEM, f));
+        }
+    }
+
+    /// Windows: the CPU temperatures arrive with the sensor service's first answer,
+    /// after the start, and go when it stops; smooth mode draws through both.
+    #[test]
+    fn smooth_mode_follows_temperatures_that_come_and_go() {
+        use crate::sys::Sensor;
+        for page in [PG_OVERVIEW, PG_CPU] {
+            let mut a = app(8, 2, 2);
+            a.page = page;
+            a.first_size(140, 40);
+            a.speed = SMOOTH;
+            a.bars_snap();
+            let mut scr = Screen::new(140, 40);
+            let dt = 1.0 / crate::anim::FPS as f32;
+            let frames = |a: &mut App, scr: &mut Screen, n: usize| {
+                for _ in 0..n {
+                    a.anim_step(dt);
+                    a.anim_numbers(dt);
+                    a.anim = true;
+                    a.frame += 1;
+                    a.draw(scr, false);
+                }
+            };
+            frames(&mut a, &mut scr, 3);
+            a.s.temps = vec![Sensor::fake("Pkg0", 61.0), Sensor::fake("P-core", 64.0), Sensor::fake("E-core", 55.0)];
+            // (drawn once before the sample's retarget, as the main loop may)
+            a.draw(&mut scr, false);
+            a.retarget();
+            frames(&mut a, &mut scr, 30);
+            assert_eq!(a.tt.len(), 3);
+            assert!((a.temp(0).1 - 61.0).abs() < 1.0, "{:?}", a.temp(0));
+            a.s.temps.truncate(1);
+            a.draw(&mut scr, false);
+            a.retarget();
+            frames(&mut a, &mut scr, 3);
+            a.s.temps.clear();
+            a.retarget();
+            frames(&mut a, &mut scr, 3);
+            assert!(a.tt.is_empty());
         }
     }
 

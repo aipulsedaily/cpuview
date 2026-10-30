@@ -298,6 +298,13 @@ pub struct Sensor {
     pub max: f32,
 }
 
+#[cfg(test)]
+impl Sensor {
+    pub(crate) fn fake(label: &str, val: f32) -> Sensor {
+        Sensor { label: label.into(), fd: -1, val, hist: Ring::new(), max: 0.0 }
+    }
+}
+
 pub struct Topo {
     pub cpus: Vec<usize>,
     /// cpu id → index in `cpus` (or usize::MAX)
