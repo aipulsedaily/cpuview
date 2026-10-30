@@ -15,9 +15,17 @@
 //! (~230 µs per address family), so that runs rarely, and only for a family that has
 //! non-listening sockets (sockstat says). Expensive jobs run one per sample, spread.
 
+// (the Linux parsers stay compiled, and tested, on Windows too)
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 use crate::sys::{isort, open_ro, parse_u64, pread, read_str, Ring};
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
+
+/// The Windows sources (IP Helper instead of /proc, sysfs and netlink).
+#[cfg(windows)]
+#[path = "win/net.rs"]
+mod win;
 
 const SEC: i64 = 1_000_000_000;
 
@@ -45,12 +53,22 @@ fn trim() {
 }
 
 fn close(fd: c_int) {
+    #[cfg(unix)]
     if fd >= 0 {
         unsafe { libc::close(fd) };
     }
+    #[cfg(windows)]
+    let _ = fd;
+}
+
+/// (no sysfs, cgroup tree or /proc to list on Windows)
+#[cfg(windows)]
+fn each_dir(_path: &str, _f: &mut dyn FnMut(&str, bool, u64)) -> bool {
+    false
 }
 
 /// Entries of a directory: (name, is a directory, inode). False if unreadable.
+#[cfg(unix)]
 fn each_dir(path: &str, f: &mut dyn FnMut(&str, bool, u64)) -> bool {
     let Ok(c) = CString::new(path) else {
         return false;
@@ -283,11 +301,13 @@ pub fn parse_wireless(b: &[u8], f: &mut dyn FnMut(&str, i32)) {
 }
 
 /// A file of /sys/class/net/<n>/ (trimmed; empty if unreadable).
+#[cfg(unix)]
 #[inline(never)]
 fn sysnet(n: &str, f: &str) -> String {
     read_str(&cat(&["/sys/class/net/", n, "/", f])).unwrap_or_default()
 }
 
+#[cfg(unix)]
 #[inline(never)]
 fn sysnet_has(n: &str, f: &str) -> bool {
     std::path::Path::new(&cat(&["/sys/class/net/", n, "/", f])).exists()
@@ -306,6 +326,7 @@ pub fn parse_route(t: &str) -> Vec<String> {
 }
 
 /// The number after `key` in a line of words ("TCP: inuse 25 orphan 0 tw 3").
+#[cfg(unix)]
 fn after(l: &str, key: &str) -> u32 {
     let mut it = l.split_ascii_whitespace();
     while let Some(w) = it.next() {
@@ -368,6 +389,7 @@ pub fn fmt_ip(a: &[u8; 16], v6: bool) -> String {
 // ── netlink ────────────────────────────────────────────────────────────────
 
 /// One netlink dump: `req` (type, payload) → every reply message (type, payload).
+#[cfg(unix)]
 fn nl_dump(
     fd: c_int,
     ty: u16,
@@ -413,6 +435,7 @@ fn nl_dump(
     }
 }
 
+#[cfg(unix)]
 fn nl_socket(proto: c_int) -> c_int {
     unsafe {
         libc::socket(
@@ -424,6 +447,7 @@ fn nl_socket(proto: c_int) -> c_int {
 }
 
 /// Netlink attributes (rtattr): (type, payload).
+#[cfg(unix)]
 fn attrs(mut b: &[u8], f: &mut dyn FnMut(u16, &[u8])) {
     while b.len() >= 4 {
         let l = u16::from_ne_bytes([b[0], b[1]]) as usize;
@@ -505,6 +529,7 @@ pub fn parse_proc_socks(t: &str, v6: bool, udp: bool, states: u32, out: &mut Vec
 }
 
 /// inet_diag_msg (+ attributes) → socket.
+#[cfg(unix)]
 fn diag_msg(p: &[u8], udp: bool) -> Option<Sock> {
     if p.len() < 72 {
         return None;
@@ -829,6 +854,14 @@ pub fn parse_api(b: &[u8]) -> Vec<ApiCtr> {
 }
 
 /// GET `path` over a unix socket (HTTP/1.0): the body of a 200 reply.
+/// (Docker Desktop's engine runs in a VM on Windows: its containers aren't this
+/// machine's processes)
+#[cfg(windows)]
+fn http_get(_sock: &str, _path: &str) -> Result<Vec<u8>, c_int> {
+    Err(-1)
+}
+
+#[cfg(unix)]
 fn http_get(sock: &str, path: &str) -> Result<Vec<u8>, c_int> {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
@@ -1100,7 +1133,15 @@ impl Svc {
     }
 
     fn read(&mut self, v2: bool, now: i64) {
-        if let Some((us, m)) = cg_read(v2, &self.fd, 1) {
+        // (Windows: its numbers come from the process list, win_read_svcs)
+        #[cfg(windows)]
+        let got: Option<(u64, u64)> = {
+            let _ = v2;
+            None
+        };
+        #[cfg(unix)]
+        let got = cg_read(v2, &self.fd, 1);
+        if let Some((us, m)) = got {
             self.cpu = cpu_pct(self.prev, now, us);
             self.prev = (now, us);
             self.mem = m as f32;
@@ -1109,6 +1150,7 @@ impl Svc {
 }
 
 /// Program name of a process: argv[0]'s file name, else comm.
+#[cfg(unix)]
 pub fn proc_name(pid: u32) -> String {
     let ps = dec(pid as u64);
     let c = std::fs::read(cat(&["/proc/", &ps, "/cmdline"])).unwrap_or_default();
@@ -1126,6 +1168,7 @@ pub fn proc_name(pid: u32) -> String {
 /// Socket inode → owning program, found by looking through /proc/*/fd a few
 /// processes per sample (only ever processes we may look into).
 struct PidScan {
+    #[cfg(unix)]
     dir: *mut libc::DIR,
     want: Vec<u32>,
 }
@@ -1199,12 +1242,16 @@ pub struct Net {
     pub api: Vec<ApiCtr>,
     pub stopped: u32,
     pub has_systemd: bool,
+    /// Windows: Docker runs here, its containers inside WSL's virtual machine
+    pub docker_vm: bool,
     last: [i64; NJOB],
     last_dev: i64,
     pub entered: bool,
     /// the overview's look-ups: containers only (no services, no cgroup names)
     pub lite: bool,
     cread: u32,
+    #[cfg(windows)]
+    w: win::State,
 }
 
 impl Net {
@@ -1244,14 +1291,18 @@ impl Net {
             api: Vec::new(),
             stopped: 0,
             has_systemd: false,
+            docker_vm: false,
             last: [i64::MIN / 2; NJOB],
             last_dev: i64::MIN / 2,
             entered: false,
             lite: false,
             cread: 0,
+            #[cfg(windows)]
+            w: win::State::default(),
         }
     }
 
+    #[cfg(unix)]
     pub fn new() -> Net {
         let mut n = Net::empty();
         n.dev_fd = open_ro("/proc/net/dev");
@@ -1336,6 +1387,8 @@ impl Net {
             let p = match j {
                 J_CTRS if nc == 0 => continue,
                 J_SVCS if ns == 0 => continue,
+                // (Windows: the full process list, 18 ms: see win/net.rs)
+                J_SVCS if cfg!(windows) => if eco { 600 * SEC } else { 30 * SEC },
                 J_CTRS => p.max(nc * SEC / 8),
                 J_SVCS => p.max(ns * SEC / 16),
                 _ => p,
@@ -1416,6 +1469,7 @@ impl Net {
 
     // ── interfaces ─────────────────────────────────────────────────────────
 
+    #[cfg(unix)]
     fn read_dev(&mut self, now: i64) {
         self.last_dev = now;
         let mut n = pread(self.dev_fd, &mut self.buf);
@@ -1459,6 +1513,7 @@ impl Net {
     }
 
     /// (Re)discover interfaces: kinds, state, speed, default route, order.
+    #[cfg(unix)]
     fn links(&mut self) {
         let mut names = Vec::new();
         each_dir("/sys/class/net", &mut |n, _, _| names.push(n.to_string()));
@@ -1546,6 +1601,7 @@ impl Net {
     /// Addresses of every interface (netlink RTM_GETADDR: no counters touched, and
     /// no libc getifaddrs, which maps another 128 KB of libc): a global one first
     /// (IPv4, then IPv6), a link-local one only when there is nothing else.
+    #[cfg(unix)]
     fn addrs(&mut self) {
         let fd = nl_socket(libc::NETLINK_ROUTE);
         for i in &mut self.ifs {
@@ -1585,6 +1641,7 @@ impl Net {
 
     /// Connection counts: open (ESTABLISHED + CLOSE_WAIT, /proc/net/snmp), closing
     /// (TIME_WAIT) and TCP sockets in use per family (sockstat): O(1) reads.
+    #[cfg(unix)]
     fn read_counts(&mut self) {
         let n = pread(self.snmp_fd, &mut self.buf);
         let t = std::str::from_utf8(&self.buf[..n]).unwrap_or("");
@@ -1617,6 +1674,7 @@ impl Net {
     }
 
     /// Sockets in `states` of one family / protocol: sock_diag netlink, else /proc.
+    #[cfg(unix)]
     fn dump(&mut self, v6: bool, udp: bool, states: u32) {
         if self.diag_fd == -1 {
             self.diag_fd = nl_socket(libc::NETLINK_SOCK_DIAG);
@@ -1655,6 +1713,7 @@ impl Net {
         self.socks = got;
     }
 
+    #[cfg(unix)]
     fn read_listen(&mut self) {
         self.socks.clear();
         for v6 in [false, true] {
@@ -1690,6 +1749,7 @@ impl Net {
     }
 
     /// Look through the fds of up to `n` processes for the sockets wanted.
+    #[cfg(unix)]
     fn scan_step(&mut self, n: usize) {
         let Some(sc) = &mut self.scan else { return };
         let mut done = false;
@@ -1766,6 +1826,7 @@ impl Net {
 
     /// Established connections' remote ends: a walk of the kernel's connection
     /// table per family (skipped when that family has only listening sockets).
+    #[cfg(unix)]
     fn read_peers(&mut self) {
         self.socks.clear();
         // (/proc, not sock_diag: here a netlink dump of all connections costs 3.8 ms,
@@ -1785,6 +1846,10 @@ impl Net {
     /// Find containers and services in the cgroup tree (only the branches that
     /// can hold them are read).
     fn walk(&mut self, now: i64) {
+        #[cfg(windows)]
+        if !self.lite {
+            return self.win_services(now);
+        }
         if self.cpu_root.is_empty() {
             return;
         }
@@ -1934,9 +1999,14 @@ impl Net {
     }
 
     fn read_svcs(&mut self, now: i64) {
-        let v2 = self.cg2;
-        for s in self.svcs.iter_mut().chain(self.user.as_mut()) {
-            s.read(v2, now);
+        #[cfg(windows)]
+        self.win_read_svcs(now);
+        #[cfg(unix)]
+        {
+            let v2 = self.cg2;
+            for s in self.svcs.iter_mut().chain(self.user.as_mut()) {
+                s.read(v2, now);
+            }
         }
     }
 
@@ -1961,7 +2031,7 @@ impl Net {
                     ok = true;
                     break;
                 }
-                Err(e) => self.api_err |= e == libc::EACCES,
+                Err(e) => self.api_err |= e == crate::procs::EACCES,
             }
         }
         if ok {
@@ -2339,6 +2409,7 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         n
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_v2_layout() {
         let id = "52a5348a903a4c74c1735a1d2c894e462ba203c7348d4987f421ed00c26352f9";
@@ -2382,6 +2453,7 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_v1_layout() {
         let id = "9a5accf40992c27149ca038ef901cb80343ab9758c2946a42532a34d7cb425e3";
@@ -2411,6 +2483,7 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_systemd_no_containers() {
         // Alpine / OpenRC on cgroup v2: services as openrc.* groups, no containers
@@ -2435,6 +2508,7 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         let _ = std::fs::remove_dir_all(empty);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore]
     fn bench_jobs() {
@@ -2477,6 +2551,7 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         eprintln!("proc tcp: {} us", (crate::term::cpu_ns() - c0) / 20_000);
     }
 
+    #[cfg(target_env = "gnu")]
     #[test]
     #[ignore]
     fn heap_use() {

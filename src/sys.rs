@@ -1,8 +1,16 @@
 //! CPU topology and sampling: /proc/stat, cpufreq, hwmon, all through persistent file
 //! descriptors read with pread() into preallocated buffers (no allocation per sample).
 
+// (the Linux parsers stay compiled, and tested, on Windows too)
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+#[cfg(unix)]
 use std::ffi::CString;
 use std::os::raw::c_int;
+
+/// The Windows sources (counters and system calls instead of /proc and sysfs).
+#[cfg(windows)]
+#[path = "win/cpu.rs"]
+pub(crate) mod win;
 
 pub const SYS: &str = "/sys/devices/system/cpu";
 pub const HIST: usize = 1024;
@@ -196,11 +204,24 @@ pub fn parse_list(s: &str) -> Vec<usize> {
     out
 }
 
+#[cfg(unix)]
 pub fn open_ro(path: &str) -> c_int {
     let Ok(c) = CString::new(path) else { return -1 };
     unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) }
 }
 
+/// (no procfs or sysfs: the Windows sources use handles, see `win`)
+#[cfg(windows)]
+pub fn open_ro(_path: &str) -> c_int {
+    -1
+}
+
+#[cfg(windows)]
+pub fn pread(_fd: c_int, _buf: &mut [u8]) -> usize {
+    0
+}
+
+#[cfg(unix)]
 #[inline]
 pub fn pread(fd: c_int, buf: &mut [u8]) -> usize {
     if fd < 0 {
@@ -286,6 +307,9 @@ pub struct Topo {
     /// L3 domain (≈ CCD) per group
     pub ccd: Vec<usize>,
     pub ndom: usize,
+    /// the domains' names where they aren't CCDs (Windows, hybrid CPUs: "P-cores",
+    /// "E-cores"); empty: "CCD0", "CCD1" …
+    pub dom_names: Vec<&'static str>,
     /// amd-pstate preferred-core ranking per group (-1 = unknown)
     pub rank: Vec<i64>,
     pub maxf: f32,
@@ -298,6 +322,7 @@ pub struct Topo {
     pub has_freq: bool,
 }
 
+#[cfg(unix)]
 fn cpu_model() -> String {
     let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     for key in ["model name", "Model", "Hardware", "cpu model", "Processor"] {
@@ -315,6 +340,29 @@ fn cpu_model() -> String {
 }
 
 impl Topo {
+    /// A domain's name: "CCD0" …, or what the platform calls it ("P-cores").
+    pub fn dom_name(&self, d: usize) -> crate::ui::F {
+        match self.dom_names.get(d) {
+            Some(n) => {
+                let mut f = crate::ui::F::new();
+                f.str(n);
+                f
+            }
+            None => {
+                let mut f = crate::ui::F::new();
+                f.str("CCD");
+                f.int(d as u32, 0);
+                f
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn detect() -> Topo {
+        win::topo()
+    }
+
+    #[cfg(unix)]
     pub fn detect() -> Topo {
         let mut cpus = read_str(&format!("{SYS}/online"))
             .map(|s| parse_list(&s))
@@ -416,6 +464,7 @@ impl Topo {
             groups,
             ccd,
             ndom,
+            dom_names: Vec::new(),
             rank,
             maxf,
             minf,
@@ -475,6 +524,9 @@ pub struct Sampler {
     pub h_tot: Ring<f32>,
     pub h_avg: Ring<f32>,
     pub temps: Vec<Sensor>,
+    /// each core's temperature (°C, 0: none), where they are known (Windows, with
+    /// cpuview's sensor service)
+    pub core_t: Vec<f32>,
     pub gov: String,
     pub epp: String,
     pub loadavg: [f32; 3],
@@ -486,8 +538,22 @@ pub struct Sampler {
     /// SMT sibling of each CPU index (first other thread of the same core)
     sibling: Vec<usize>,
     f_copy: Option<(usize, usize)>,
+    /// Windows: the system calls and counters that stand in for /proc and sysfs,
+    /// and whether the speed is eco (the clocks' counter collection is dear)
+    #[cfg(windows)]
+    w: win::Cpu,
+    #[cfg(windows)]
+    pub eco: bool,
 }
 
+/// (Windows has no CPU temperature interface without a driver: cpuview's sensor
+/// service's come later, see win::Cpu::svc_temps)
+#[cfg(windows)]
+fn find_sensors() -> Vec<Sensor> {
+    win::find_sensors()
+}
+
+#[cfg(unix)]
 fn find_sensors() -> Vec<Sensor> {
     let mut out = Vec::new();
     let wanted = [
@@ -639,6 +705,7 @@ impl Sampler {
             h_tot: Ring::new(),
             h_avg: Ring::new(),
             temps: find_sensors(),
+            core_t: Vec::new(),
             gov: String::new(),
             epp: String::new(),
             loadavg: [0.0; 3],
@@ -649,6 +716,10 @@ impl Sampler {
             freq_rr: 0,
             sibling: Vec::new(),
             f_copy: None,
+            #[cfg(windows)]
+            w: win::Cpu::new(&t),
+            #[cfg(windows)]
+            eco: false,
             t,
         };
         // size the /proc/stat buffer once (it can be large on many-CPU machines)
@@ -683,6 +754,12 @@ impl Sampler {
         s
     }
 
+    #[cfg(windows)]
+    fn read_stat(&mut self) {
+        self.w.times(&mut self.cur);
+    }
+
+    #[cfg(unix)]
     fn read_stat(&mut self) {
         let mut n = pread(self.stat_fd, &mut self.stat_buf);
         if n == self.stat_buf.len() {
@@ -698,6 +775,18 @@ impl Sampler {
     /// for at least 3% of the load window are read every sample; barely-busy ones are
     /// read round-robin (a quarter per sample) and fully idle ones show their
     /// minimum clock, which is what scaling_cur_freq reports for them anyway.
+    /// (Windows: one counter collection for all of them, see win::Cpu::clocks)
+    /// (eco: every other sample; a collection costs 30-100 µs, most of a sample)
+    #[cfg(windows)]
+    fn read_freq(&mut self) {
+        self.freq_rr = self.freq_rr.wrapping_add(1);
+        if self.eco && self.freq_rr % 2 == 0 {
+            return;
+        }
+        self.w.clocks(&self.ur, &mut self.fr, &mut self.t);
+    }
+
+    #[cfg(unix)]
     fn read_freq(&mut self) {
         let mut buf = [0u8; 24];
         let n = self.freq_fds.len();
@@ -890,8 +979,15 @@ impl Sampler {
         }
     }
 
+    /// Temperatures (Windows: cpuview's sensor service's, see win::Cpu::svc_temps).
+    #[cfg(windows)]
+    pub fn read_temps(&mut self, _all: bool) {
+        self.w.svc_temps(&mut self.temps, &mut self.core_t, &self.t);
+    }
+
     /// Temperatures: k10temp reads go over SMN and cost ~10 µs each on a cold core,
     /// so the caller reads one sensor at a time (round robin). `all` reads every one.
+    #[cfg(unix)]
     pub fn read_temps(&mut self, all: bool) {
         let mut buf = [0u8; 16];
         let n = self.temps.len();
@@ -909,7 +1005,15 @@ impl Sampler {
         }
     }
 
+    /// Load average (Windows: estimated, see win::Cpu::loadavg).
+    #[cfg(windows)]
+    pub fn read_slow(&mut self) {
+        let busy = self.tot_r * self.cur.len() as f32;
+        self.w.loadavg(busy, crate::term::mono(), &mut self.loadavg);
+    }
+
     /// Load average (the kernel updates it every 5 s).
+    #[cfg(unix)]
     pub fn read_slow(&mut self) {
         let mut buf = [0u8; 64];
         let n = pread(self.loadavg_fd, &mut buf);
@@ -919,7 +1023,14 @@ impl Sampler {
         }
     }
 
+    /// The power plan (Windows has no governor or EPP).
+    #[cfg(windows)]
+    pub fn read_policy(&mut self) {
+        self.w.policy(&mut self.gov);
+    }
+
     /// Governor and EPP (rarely change; persistent fds, compared before allocating).
+    #[cfg(unix)]
     pub fn read_policy(&mut self) {
         let mut buf = [0u8; 64];
         for (fd, dst, dflt) in [
@@ -944,8 +1055,9 @@ impl Sampler {
     pub fn domain_temp_idx(&self, d: usize) -> Option<usize> {
         let ccd = |l: &str| l.strip_prefix("Tccd").and_then(|n| n.parse::<usize>().ok());
         let t = &self.temps;
+        let named = self.t.dom_names.get(d).copied().unwrap_or("");
         t.iter()
-            .position(|s| ccd(&s.label) == Some(d + 1))
+            .position(|s| ccd(&s.label) == Some(d + 1) || (!named.is_empty() && named.starts_with(s.label.as_str())))
             .or_else(|| {
                 t.iter()
                     .position(|s| s.label == "Tctl" || s.label.starts_with("Pkg"))
@@ -1165,6 +1277,7 @@ impl Sampler {
             groups: (0..n).map(|i| vec![i]).collect(),
             ccd: vec![0; n],
             ndom: 1,
+            dom_names: Vec::new(),
             rank: vec![-1; n],
             maxf: 1.0,
             minf: 0.0,
@@ -1206,6 +1319,7 @@ impl Sampler {
             h_tot: Ring::new(),
             h_avg: Ring::new(),
             temps: Vec::new(),
+            core_t: Vec::new(),
             gov: String::new(),
             epp: String::new(),
             loadavg: [0.0; 3],
@@ -1216,6 +1330,10 @@ impl Sampler {
             freq_rr: 0,
             sibling: vec![usize::MAX; n],
             f_copy: None,
+            #[cfg(windows)]
+            w: win::Cpu::none(),
+            #[cfg(windows)]
+            eco: false,
         }
     }
     fn parse_stat_buf(&mut self, n: usize) {

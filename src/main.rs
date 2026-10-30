@@ -7,6 +7,7 @@ mod config;
 mod gfx;
 mod image;
 mod input;
+#[cfg(unix)]
 mod ipmi;
 mod mem;
 mod menu;
@@ -18,9 +19,12 @@ mod prof;
 mod screen;
 mod sensors;
 mod sys;
+#[cfg_attr(windows, path = "win/term.rs")]
 mod term;
 mod theme;
 mod ui;
+#[cfg(windows)]
+mod win;
 
 use color::{mix, Ramp};
 use config::Config;
@@ -272,6 +276,7 @@ fn trim_heap() {
 /// and picture decoding run once, and their code would otherwise count in the resident
 /// size for as long as cpuview runs. Done a few samples after start and after a page or
 /// theme change.
+#[cfg(unix)]
 fn trim_code() {
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return;
@@ -1058,10 +1063,16 @@ impl State {
     }
 }
 
+#[cfg(windows)]
+fn trim_code() {
+    win::trim_code();
+}
+
 /// Keep the process on one physical core that the scheduler rarely uses (lowest
 /// amd-pstate preferred-core rank, else the last core): its private L2 then usually
 /// still holds our code and data at the next wakeup, which makes each wakeup ~15 %
 /// cheaper. Only when the affinity wasn't restricted already; CPUVIEW_PIN=off or =N.
+#[cfg(unix)]
 fn auto_pin(t: &sys::Topo) {
     let env = std::env::var("CPUVIEW_PIN").unwrap_or_default();
     if env == "off" || t.cpus.len() < 4 {
@@ -1109,6 +1120,11 @@ fn auto_pin(t: &sys::Topo) {
     }
 }
 
+#[cfg(windows)]
+fn auto_pin(t: &sys::Topo) {
+    sys::win::auto_pin(t);
+}
+
 /// The overview's own sampling (view 0): its sensors (no per-core power, a dear
 /// chip rarely: sensors::Sens::tick_ov), processes and containers
 /// (App::ov_sample). `push`: history seconds for the sensors, `net_held` the links'.
@@ -1121,28 +1137,38 @@ fn ov_work(app: &mut App, now: i64, eco: bool, smooth: bool, push: u32, net_held
 }
 
 fn update_clock(app: &mut App) {
-    let wall = term::now_ns(libc::CLOCK_REALTIME) / 1_000_000_000;
+    let wall = term::now_ns(term::CLOCK_REALTIME) / 1_000_000_000;
     app.clock = term::local_hms(wall);
-    app.uptime = (term::now_ns(libc::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
+    app.uptime = (term::now_ns(term::CLOCK_BOOTTIME) / 1_000_000_000) as u64;
 }
 
 fn doctor(req: Mode, glyphs: Option<mosaic::Glyphs>, no_probe: bool) {
     let env = Env::get();
+    #[cfg(unix)]
     let fd = unsafe {
         libc::open(
             c"/dev/tty".as_ptr(),
             libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
         )
     };
+    // (the console: replies arrive on stdin, queries go to stdout)
+    #[cfg(windows)]
+    let fd = if term::is_tty(0) && term::is_tty(OUT) { 0 } else { -1 };
     let mut caps = Caps::default();
     let (cols, rows, xp, yp) = term::size(if fd >= 0 { fd } else { OUT });
     if fd >= 0 && !no_probe {
+        let out = if cfg!(windows) { OUT } else { fd };
         term::raw_mode(fd);
-        term::write_all(fd, b"\x1b[?1049h");
-        caps = probe::probe(fd, fd, env.tmux);
-        term::write_all(fd, b"\x1b[?1049l");
+        term::write_all(out, b"\x1b[?1049h");
+        caps = probe::probe(fd, out, env.tmux);
+        term::write_all(out, b"\x1b[?1049l");
         std::thread::sleep(std::time::Duration::from_millis(30));
-        unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+        #[cfg(unix)]
+        unsafe {
+            libc::tcflush(fd, libc::TCIFLUSH)
+        };
+        #[cfg(windows)]
+        term::flush_input(fd);
         term::restore_mode();
     }
     let (mode, why) = probe::choose_mode(&caps, &env, req);
@@ -1297,6 +1323,12 @@ fn main() {
         libc::mallopt(libc::M_TOP_PAD, 0);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // (Windows: the sensor service, started by the service manager: no settings, no
+    // console)
+    #[cfg(windows)]
+    if args.first().is_some_and(|a| a == "--sensor-service") {
+        std::process::exit(win::svc::main());
+    }
     let mut cfg = Config::load();
     let (mut want_doctor, mut no_probe) = (false, false);
     let mut theme_arg = None;
@@ -1337,6 +1369,9 @@ fn main() {
             "--per-core" => per_core = true,
             "--bmc" => bmc = true,
             "--dry-run" => dry = true,
+            // (Windows: --setup-sensors run elevated by itself, see win/setup.rs)
+            #[cfg(windows)]
+            "--elevated" => setup = true,
             "--no-probe" => no_probe = true,
             "--theme" => theme_arg = Some(val()),
             "--image" => image_arg = Some(val()),
@@ -1446,6 +1481,7 @@ fn main() {
 
     // terminal setup
     let mask = term::setup_signals();
+    #[cfg(unix)]
     unsafe {
         libc::prctl(libc::PR_SET_TIMERSLACK, 2_000_000u64, 0, 0, 0); // let the kernel batch our wakeups
     }
@@ -1577,7 +1613,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .map(|ms: i64| ms.max(100) * 1_000_000);
-    let mut offset = term::now_ns(libc::CLOCK_REALTIME) - term::mono();
+    let mut offset = term::now_ns(term::CLOCK_REALTIME) - term::mono();
     let mut tokens = CAP;
     let mut refill_t = term::mono();
     let mut est: i64 = CAP / 2;
@@ -1657,8 +1693,17 @@ fn main() {
             next_frame = Some(anim::next_frame(term::mono() + offset, fps) - offset);
         }
         let eco = fixed.is_none() && ui::SPEEDS[speed].1 == 0;
+        #[cfg(windows)]
+        {
+            st.app.s.eco = eco;
+            st.app.m.set_eco(eco);
+        }
         // account the CPU time of the wakeup that just finished (eco only: reading
         // the process clock is a syscall, which faster speeds needn't pay per frame)
+        // (Windows: the other threads' CPU time joins the process's here, once a
+        // minute: charged to the budget, never to a sample's cost)
+        #[cfg(windows)]
+        term::reconcile();
         let c = if eco { term::cpu_ns() } else { cpu_mark };
         let now = term::mono();
         // sensors page: the sensor reads have their own share of the budget (`zp`,
@@ -1778,7 +1823,7 @@ fn main() {
         if sec / 60 != last_min {
             last_min = sec / 60;
             update_clock(&mut st.app);
-            offset = term::now_ns(libc::CLOCK_REALTIME) - term::mono();
+            offset = term::now_ns(term::CLOCK_REALTIME) - term::mono();
             dirty = true;
         }
         if !st.app.paused && now + slack >= t_sample && tick > last_tick {

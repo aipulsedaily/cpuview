@@ -1,0 +1,54 @@
+# Pull requests and pushes: build and test on Linux and Windows; the Windows builds
+# (x86_64, and aarch64 cross-built) are uploaded as artifacts (cpuview.exe with the
+# wallpapers, LICENSE and README).
+# (actions pinned to commit SHAs: the organisation requires it)
+name: ci
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: cargo test --release --locked
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-pc-windows-msvc
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+      - run: cargo build --release --locked --target aarch64-pc-windows-msvc
+      - name: Package
+        shell: pwsh
+        run: |
+          foreach ($a in @(@("x86_64", "target/release"), @("aarch64", "target/aarch64-pc-windows-msvc/release"))) {
+            $d = "dist/$($a[0])"
+            New-Item -ItemType Directory -Force "$d/wallpapers" | Out-Null
+            Copy-Item "$($a[1])/cpuview.exe", LICENSE, README.md $d
+            Copy-Item wallpapers/*.jpg, wallpapers/*.png, wallpapers/CREDITS.md, wallpapers/credits.toml "$d/wallpapers"
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cpuview-windows-x86_64
+          path: dist/x86_64
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cpuview-windows-aarch64
+          path: dist/aarch64
+          retention-days: 14

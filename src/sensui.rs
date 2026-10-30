@@ -841,6 +841,17 @@ impl App {
         let z = &self.z;
         let th = &self.t;
         let m = z.fan_hint.as_ref().map_or("", |h| h.0.as_str());
+        // (Windows: what needs cpuview's sensor service, in one dim line, two where it
+        // doesn't fit; 5: the service runs, the board's chip isn't one it reads)
+        if let Some(k) = z.fan_hint.as_ref().map(|h| h.1).filter(|&k| !z.vm && (k == 4 || k == 5)) {
+            l.row(2, th.dim, th.dim, -1.0, 0);
+            l.s(if k == 4 { "CPU temperature, fans, voltages: " } else { "fans, voltages: " });
+            if two {
+                l.row(2, th.dim, 0, -1.0, 0);
+            }
+            l.s(if k == 4 { "cpuview --setup-sensors" } else { "this board's chip isn't one cpuview reads yet" });
+            return;
+        }
         l.row(2, th.warn, th.dim, -1.0, 0);
         let b = match z.fan_hint.as_ref().map(|h| h.1) {
             _ if z.vm => {
@@ -983,7 +994,13 @@ impl App {
         }
         if z.cpu_power == P_NONE && others.is_empty() && z.bats.is_empty() {
             l.row(2, th.dim, 0, -1.0, 0);
-            l.s(if z.vm { "no power meters (a virtual machine)" } else { "no power meters on this machine" });
+            l.s(if z.vm {
+                "no power meters (a virtual machine)"
+            } else if cfg!(windows) {
+                "no power meters: Windows has none here"
+            } else {
+                "no power meters on this machine"
+            });
         }
         let end = ir.y + ih - if chart { gh + 1 } else { 0 };
         let all = zm(&mut self.zcache, Z_PBODY, mixk(&[iw as u64, ih as u64, l.rows.len() as u64])) || full;
@@ -1193,7 +1210,12 @@ impl App {
         l.row(2, th.mid, th.dim, -1.0, 0);
         match z.cpu_power {
             P_OK => {
-                l.s("CPU power: RAPL energy counters");
+                if cfg!(windows) {
+                    let src = z.role(R_PKG).map_or("", |i| z.srcs[z.rd[i].src as usize].what.as_str());
+                    l.s("CPU power: ").s(src);
+                } else {
+                    l.s("CPU power: RAPL energy counters");
+                }
                 if !z.rd.iter().any(|r| r.role == R_CORE) && z.has_core_pmu() {
                     l.f().s(" · per core: cpuview --setup-sensors --per-core");
                 }
@@ -1207,11 +1229,16 @@ impl App {
                 l.s("  to allow it: ").f().s("cpuview --setup-sensors");
             }
             _ => {
-                l.s("CPU power: no energy counters on this CPU");
+                l.s(if cfg!(windows) {
+                    "CPU power: Windows has no energy meter for this CPU"
+                } else {
+                    "CPU power: no energy counters on this CPU"
+                });
             }
         }
         if z.fan_hint.is_some() || (z.vm && !z.rd.iter().any(|r| r.kind == K_FAN)) {
-            self.fan_hint_text(&mut l, false);
+            // (Windows: its one line on two where it doesn't fit)
+            self.fan_hint_text(&mut l, cfg!(windows) && ir.w < 74);
         }
         self.zlist(scr, ir, &l, ir.y + ir.h, true, 500);
         self.zv.l = l;

@@ -1380,7 +1380,7 @@ impl App {
             let title: [(&str, u32); 3] = [
                 ("services", th.title | BOLD),
                 (c.s(), th.text),
-                (if n.has_systemd { " (systemd)" } else { "" }, th.dim),
+                (if n.has_systemd { " (systemd)" } else if cfg!(windows) { " (Windows)" } else { "" }, th.dim),
             ];
             let sub = if iw >= 30 { "cpu: 100% = one core" } else { "" };
             self.panel(scr, r, &title, sub);
@@ -1411,6 +1411,8 @@ impl App {
             Self::row(scr, ir.x, y, maxx, &[]);
             y += 1;
         }
+        // (Windows with Docker: where its containers are, in the last line)
+        let end = end - (n.docker_vm && ih >= 4) as usize;
         let mut y = self.usage_rows(
             scr,
             ir,
@@ -1423,6 +1425,9 @@ impl App {
             &get,
         );
         Self::blank(scr, ir.x, &mut y, end, maxx);
+        if n.docker_vm && ih >= 4 {
+            Self::row(scr, ir.x, end, maxx, &[("containers: Docker runs them in WSL's virtual machine, out of Windows' sight", th.dim, 0)]);
+        }
     }
 }
 

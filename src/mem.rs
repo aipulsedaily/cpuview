@@ -8,10 +8,17 @@
 //! temperatures cost 40–65 µs of CPU and 1–20 ms of wall time per read, so a helper
 //! thread reads them every few seconds and the main loop never waits for them.
 
+// (the Linux parsers stay compiled, and tested, on Windows too)
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 use crate::sys::{open_ro, parse_u64, pread, Ring};
 use std::ffi::CString;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering::Relaxed};
+
+/// The Windows sources (system calls and device queries instead of /proc and sysfs).
+#[cfg(windows)]
+#[path = "win/mem.rs"]
+mod win;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct MemInfo {
@@ -240,6 +247,7 @@ static SLOW_MS: AtomicU32 = AtomicU32::new(0);
 static SLOW_GEN: AtomicU32 = AtomicU32::new(0);
 static SLOW_UP: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(unix)]
 fn futex(w: &AtomicU32, op: c_int, val: u32, ts: *const libc::timespec) {
     unsafe {
         libc::syscall(
@@ -252,6 +260,7 @@ fn futex(w: &AtomicU32, op: c_int, val: u32, ts: *const libc::timespec) {
     }
 }
 
+#[cfg(unix)]
 extern "C" fn slow_main(_: *mut libc::c_void) -> *mut libc::c_void {
     let mut buf = [0u8; 16];
     loop {
@@ -288,6 +297,9 @@ pub fn slow_period(ms: u32) {
     SLOW_MS.store(ms, Relaxed);
     SLOW_GEN.fetch_add(1, Relaxed);
     if SLOW_UP.swap(1, Relaxed) == 0 {
+        #[cfg(windows)]
+        win::start_slow();
+        #[cfg(unix)]
         unsafe {
             let mut a: libc::pthread_attr_t = std::mem::zeroed();
             let mut t: libc::pthread_t = std::mem::zeroed();
@@ -297,10 +309,14 @@ pub fn slow_period(ms: u32) {
             libc::pthread_attr_destroy(&mut a);
         }
     } else {
+        #[cfg(windows)]
+        win::wake_slow();
+        #[cfg(unix)]
         futex(&SLOW_GEN, libc::FUTEX_WAKE, 1, std::ptr::null());
     }
 }
 
+#[cfg(unix)]
 fn add_slow(path: &str) -> Option<usize> {
     let i = SLOW_N.load(Relaxed);
     let fd = open_ro(path);
@@ -451,6 +467,7 @@ impl Disk {
 
 /// Whole physical disks: block devices with a `device` (not loop, dm, md, zram, ram)
 /// and a size, in /proc/diskstats order.
+#[cfg(unix)]
 fn find_disks() -> Vec<Disk> {
     let ds = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
     let mut v = Vec::new();
@@ -473,12 +490,14 @@ fn find_disks() -> Vec<Disk> {
     v
 }
 
+#[cfg(unix)]
 fn canon(p: &str) -> Option<std::path::PathBuf> {
     std::fs::canonicalize(p).ok()
 }
 
 /// DIMM sensors (spd5118 / jc42) and drive sensors (nvme / drivetemp, matched to
 /// the disks by their device): registered with the helper thread.
+#[cfg(unix)]
 fn find_slow(disks: &mut [Disk]) -> Vec<usize> {
     let mut dimms = Vec::new();
     for d in crate::sys::hwmon_dirs() {
@@ -524,6 +543,7 @@ impl Fs {
             (self.used * 100).div_ceil(d) as u32
         }
     }
+    #[cfg(unix)]
     fn stat(&mut self) {
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(self.path.as_ptr(), &mut s) } == 0 {
@@ -571,6 +591,7 @@ fn parse_statm(b: &[u8]) -> (u64, u64) {
 }
 
 /// Process `pid`'s statm, opened relative to /proc (`keep`: return the open fd).
+#[cfg(unix)]
 fn statm_open(dfd: c_int, pid: u32) -> c_int {
     let mut path = [0u8; 24];
     let mut f = crate::ui::F::new();
@@ -588,6 +609,7 @@ fn statm_open(dfd: c_int, pid: u32) -> c_int {
 }
 
 /// (resident, shared) pages, or None if the process is gone.
+#[cfg(unix)]
 fn statm_read(fd: c_int) -> Option<(u64, u64)> {
     let mut b = [0u8; 128];
     let n = unsafe { libc::pread(fd, b.as_mut_ptr() as *mut _, b.len(), 0) };
@@ -596,6 +618,7 @@ fn statm_read(fd: c_int) -> Option<(u64, u64)> {
 
 /// A process's program: argv[0]'s file name (comm is often a thread's name, such as
 /// node's "MainThread"), else comm.
+#[cfg(unix)]
 fn proc_name(pid: u32) -> String {
     let c = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     let a0 = c.split(|&b| b == 0 || b == b' ').next().unwrap_or(&[]);
@@ -674,7 +697,10 @@ pub struct Mem {
     scans: u32,
     hidden: u32,
     held: u32,
+    #[cfg(unix)]
     proc_dir: *mut libc::DIR,
+    #[cfg(windows)]
+    w: win::State,
     page: u64,
     pub hist_n: u64,
     pub last_fs: i64,
@@ -718,7 +744,10 @@ impl Mem {
             scans: 0,
             hidden: 0,
             held: 0,
+            #[cfg(unix)]
             proc_dir: std::ptr::null_mut(),
+            #[cfg(windows)]
+            w: win::State::new(),
             page: 4096,
             hist_n: 0,
             last_fs: i64::MIN / 2,
@@ -729,6 +758,7 @@ impl Mem {
         }
     }
 
+    #[cfg(unix)]
     pub fn new() -> Mem {
         let mut m = Mem::empty();
         m.meminfo_fd = open_ro("/proc/meminfo");
@@ -746,6 +776,7 @@ impl Mem {
         m
     }
 
+    #[cfg(unix)]
     fn read_mounts(&mut self) {
         let t = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         self.fs = parse_mountinfo(&t)
@@ -769,6 +800,7 @@ impl Mem {
 
     /// Filesystems: statvfs each, the mount table again only if it changed (poll on
     /// mountinfo flags a change since the last look).
+    #[cfg(unix)]
     pub fn refresh_fs(&mut self) {
         let mut p = libc::pollfd {
             fd: self.mounts_fd,
@@ -797,15 +829,26 @@ impl Mem {
             return;
         }
         let push = std::mem::take(&mut self.held);
-        let n = pread(self.meminfo_fd, &mut self.buf);
-        parse_meminfo(&self.buf[..n], &mut self.mi);
-        let mut b = [0u8; 256];
-        for d in &mut self.disks {
-            let n = pread(d.fd, &mut b);
-            if n > 0 {
-                d.update(now, parse_disk_fields(&b[..n]));
+        #[cfg(windows)]
+        {
+            let _ = vm;
+            self.read_now(now);
+        }
+        #[cfg(unix)]
+        {
+            let n = pread(self.meminfo_fd, &mut self.buf);
+            parse_meminfo(&self.buf[..n], &mut self.mi);
+            let mut b = [0u8; 256];
+            for d in &mut self.disks {
+                let n = pread(d.fd, &mut b);
+                if n > 0 {
+                    d.update(now, parse_disk_fields(&b[..n]));
+                }
             }
         }
+        // (Windows: no swap-in / swap-out counts nor pressure; the page file's use is
+        // read above)
+        #[cfg(unix)]
         if vis && vm {
             self.last_vm = now;
             if self.mi.swap_total > 0 {
@@ -838,6 +881,7 @@ impl Mem {
     /// Drop what only the next full scan needs (every process's sizes, the names by
     /// pid): the overview scans rarely and keeps its memory small; the next scan
     /// reads the names again.
+    #[cfg(unix)]
     pub fn shrink(&mut self) {
         if !self.proc_dir.is_null() {
             // (the listing's buffer is 32 KB: opened again for the next scan)
@@ -856,6 +900,7 @@ impl Mem {
     /// program name; the `NPROC` biggest are then followed live (`refresh_procs`).
     /// Kernel threads (no memory) are remembered and skipped; that list is rebuilt
     /// every tenth scan in case their pids were reused. Names are read once per pid.
+    #[cfg(unix)]
     pub fn scan_procs(&mut self) {
         if self.proc_dir.is_null() {
             self.proc_dir = unsafe { libc::opendir(c"/proc".as_ptr()) };
@@ -1026,6 +1071,7 @@ impl Mem {
     /// processes don't show? Checks /proc's pid list against the known one (statm
     /// only for new pids: one with 64 MB or more counts), and whether RAM in use
     /// changed by more than the followed processes explain (2 % of RAM, ≥ 256 MB).
+    #[cfg(unix)]
     pub fn need_scan(&mut self) -> bool {
         let live: u64 = self.procs.iter().map(|p| p.rss).sum();
         let d_used = self.mi.used() as i64 - self.scan_used as i64;
@@ -1077,6 +1123,7 @@ impl Mem {
 
     /// Re-read the processes followed live (one pread each, ~1 µs); the ones that
     /// ended are dropped.
+    #[cfg(unix)]
     pub fn refresh_procs(&mut self) {
         let page = self.page;
         self.procs.retain_mut(|p| match statm_read(p.fd) {

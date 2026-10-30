@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+# (a template: make-manifest.ps1 fills in the version and the zip's hash)
+PackageIdentifier: aipulsedaily.cpuview
+PackageVersion: {version}
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: cpuview-{version}-x86_64-windows\cpuview.exe
+    PortableCommandAlias: cpuview
+# Windows 10 1809: VT input, ConPTY, the memory counters it reads
+MinimumOSVersion: 10.0.17763.0
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/aipulsedaily/cpuview/releases/download/v{version}/cpuview-{version}-x86_64-windows.zip
+    InstallerSha256: {sha256}
+ManifestType: installer
+ManifestVersion: 1.6.0

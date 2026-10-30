@@ -13,9 +13,28 @@
 //! (the fields show "?"), zombies, pid reuse (a process is its pid *and* start time),
 //! thousands of processes (~150 bytes each), containers (the cgroup path names them).
 
+// (the Linux parsers stay compiled, and tested, on Windows too)
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 use crate::sys::{parse_u64, pread};
-use libc::c_int;
+use std::os::raw::c_int;
 use std::rc::Rc;
+
+/// The Windows source (the system's process list, process handles).
+#[cfg(windows)]
+#[path = "win/procs.rs"]
+mod win;
+#[cfg(windows)]
+pub use win::{sig, why, NSIG};
+
+/// Why an action failed (errno values; the Windows source maps its errors to them).
+#[cfg(unix)]
+pub use libc::EACCES;
+#[cfg(windows)]
+pub const EPERM: c_int = 1;
+#[cfg(windows)]
+pub const ESRCH: c_int = 3;
+#[cfg(windows)]
+pub const EACCES: c_int = 13;
 
 /// Command line bytes kept per process for the table (the selected one is read whole).
 const CMD_MAX: usize = 160;
@@ -387,6 +406,7 @@ fn bsearch(list: &[P], pid: u32) -> Result<usize, usize> {
     list.binary_search_by_key(&pid, |p| p.pid)
 }
 
+#[cfg(unix)]
 fn hash(b: &[u8]) -> u32 {
     b.iter().fold(0x811c_9dc5u32, |h, &c| {
         (h ^ c as u32).wrapping_mul(0x0100_0193)
@@ -422,6 +442,13 @@ impl Track {
     pub fn back(&self, h: &[f32; HN], k: usize) -> f32 {
         h[(self.hh + HN - 1 - k) % HN]
     }
+    #[cfg(windows)]
+    fn close(&mut self) {
+        crate::win::close_later(crate::win::fd2h(self.fd));
+        self.fd = -1;
+        self.iofd = -1;
+    }
+    #[cfg(unix)]
     fn close(&mut self) {
         for fd in [self.fd, self.iofd, self.mfd] {
             if fd >= 0 {
@@ -494,7 +521,10 @@ pub struct Procs {
     /// every process, by pid
     pub list: Vec<P>,
     pub tr: Vec<Track>,
+    #[cfg(unix)]
     dir: *mut libc::DIR,
+    #[cfg(windows)]
+    w: win::State,
     dfd: c_int,
     load_fd: c_int,
     pids: Vec<u32>,
@@ -534,6 +564,7 @@ pub fn errno() -> c_int {
 }
 
 /// "<pid>/<file>\0" for openat relative to /proc.
+#[cfg(unix)]
 fn path(pid: u32, file: &str, out: &mut [u8; 48]) {
     let mut f = crate::ui::F::new();
     f.int(pid, 0);
@@ -544,6 +575,7 @@ fn path(pid: u32, file: &str, out: &mut [u8; 48]) {
     out[n] = 0;
 }
 
+#[cfg(unix)]
 impl Procs {
     pub fn new(root: &str) -> Procs {
         let c = std::ffi::CString::new(root).unwrap_or_default();
@@ -618,6 +650,9 @@ impl Procs {
         self.buf.get(..n as usize)
     }
 
+}
+
+impl Procs {
     pub fn find(&self, pid: u32) -> Option<usize> {
         bsearch(&self.list, pid).ok()
     }
@@ -632,7 +667,10 @@ impl Procs {
     pub fn user(&self, uid: u32) -> &str {
         self.users.iter().find(|u| u.0 == uid).map_or("?", |u| &u.1)
     }
+}
 
+#[cfg(unix)]
+impl Procs {
     fn learn_user(&mut self, uid: u32) {
         if self.users.iter().any(|u| u.0 == uid) {
             return;
@@ -1043,6 +1081,9 @@ impl Procs {
         self.tr.retain(|t| t.fd >= 0);
     }
 
+}
+
+impl Procs {
     /// One history point a second (`n` of them after a longer gap) for every tracked
     /// process.
     pub fn hist_push(&mut self, n: u32) {
@@ -1066,7 +1107,10 @@ impl Procs {
     pub fn tracked(&self, pid: u32, start: u64) -> Option<&Track> {
         self.tr.iter().find(|t| t.pid == pid && t.start == start)
     }
+}
 
+#[cfg(unix)]
+impl Procs {
     /// The start time of the process now holding `pid` (None if there is none).
     pub fn start_of(&mut self, pid: u32) -> Option<u64> {
         parse_stat(self.read_file(pid, "stat")?).map(|s| s.start)
@@ -1113,6 +1157,9 @@ impl Procs {
         d
     }
 
+}
+
+impl Procs {
     /// Kernel threads: show them (`true`, read every scan) or skip them.
     pub fn set_show_k(&mut self, on: bool) {
         self.show_k = on;
@@ -1123,6 +1170,10 @@ impl Procs {
         self.scans = 0;
     }
 
+}
+
+#[cfg(unix)]
+impl Procs {
     /// Close the directory listing (its buffer is 32 KB) until the next scan.
     pub fn release(&mut self) {
         if !self.dir.is_null() {
@@ -1131,8 +1182,13 @@ impl Procs {
         }
     }
 
+}
+
+impl Procs {
     /// Forget everything (leaving the page): the next scan starts afresh.
     pub fn reset(&mut self) {
+        #[cfg(windows)]
+        self.w.clear();
         for t in self.tr.iter_mut() {
             t.close();
         }
@@ -1148,7 +1204,9 @@ impl Procs {
 // ── actions ────────────────────────────────────────────────────────────────
 
 /// Signals offered for `k` (0, TERM, is the default): name, number, what it does.
+#[cfg(unix)]
 pub const NSIG: usize = 6;
+#[cfg(unix)]
 pub fn sig(i: usize) -> (&'static str, c_int, &'static str) {
     match i {
         1 => ("KILL", libc::SIGKILL, "ends it at once (no clean-up)"),
@@ -1169,6 +1227,7 @@ pub fn sig(i: usize) -> (&'static str, c_int, &'static str) {
 }
 
 /// Why an action failed, in words.
+#[cfg(unix)]
 pub fn why(e: c_int) -> &'static str {
     match e {
         libc::EPERM | libc::EACCES => {
@@ -1179,6 +1238,7 @@ pub fn why(e: c_int) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 impl Procs {
     /// Send `sig` to the process `pid` that started at `start` (never to a later one
     /// reusing the pid: a pidfd pins it while the start time is checked).
@@ -1365,6 +1425,7 @@ mod tests {
     }
 
     /// A scan of this machine's /proc finds us, with sane numbers.
+    #[cfg(unix)]
     #[test]
     fn scan_finds_this_process() {
         let mut p = Procs::new("/proc");

@@ -9,6 +9,8 @@ pub static CONT: AtomicBool = AtomicBool::new(false);
 static TTY_FD: AtomicI32 = AtomicI32::new(-1);
 static mut ORIG: Option<libc::termios> = None;
 
+pub use libc::{CLOCK_BOOTTIME, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID};
+
 extern "C" fn on_signal(sig: c_int) {
     match sig {
         libc::SIGWINCH => WINCH.store(true, Ordering::Relaxed),

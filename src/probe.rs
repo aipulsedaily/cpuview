@@ -187,11 +187,22 @@ pub struct Env {
 impl Env {
     pub fn get() -> Env {
         let g = |k: &str| std::env::var(k).unwrap_or_default();
-        Env {
+        #[allow(unused_mut)]
+        let mut e = Env {
             term: g("TERM"),
             colorterm: g("COLORTERM").to_ascii_lowercase(),
             tmux: !g("TMUX").is_empty(),
+        };
+        // Windows consoles set no TERM, and all of them (conhost since Windows 10
+        // 1703, Windows Terminal, VS Code) take 256 and 24-bit colours
+        #[cfg(windows)]
+        if e.term.is_empty() {
+            e.term = "xterm-256color".into();
+            if e.colorterm.is_empty() {
+                e.colorterm = "truecolor".into();
+            }
         }
+        e
     }
 }
 
@@ -400,23 +411,42 @@ pub fn probe(fd_in: c_int, fd_out: c_int, tmux: bool) -> Caps {
     let mut end = t0 + base_ms * 1_000_000;
     let mut buf = Vec::with_capacity(512);
     let mut tmp = [0u8; 1024];
+    #[cfg(windows)]
+    let mut resized = false;
     loop {
         let now = crate::term::mono();
         if now >= end {
             break;
         }
-        let mut p = libc::pollfd {
-            fd: fd_in,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ms = ((end - now) / 1_000_000).max(1) as c_int;
-        let r = unsafe { libc::poll(&mut p, 1, ms) };
-        if r <= 0 {
-            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+        #[cfg(unix)]
+        {
+            let mut p = libc::pollfd {
+                fd: fd_in,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = ((end - now) / 1_000_000).max(1) as c_int;
+            let r = unsafe { libc::poll(&mut p, 1, ms) };
+            if r <= 0 {
+                if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
             }
-            break;
+        }
+        // (the console's input records, turned into bytes, until the deadline; a
+        // resize as the window opens doesn't end the wait, it is handled after)
+        #[cfg(windows)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let r = crate::term::wait(fd_in, end - now, &());
+            resized |= crate::term::WINCH.swap(false, Relaxed);
+            if !r {
+                if resized && !crate::term::QUIT.load(Relaxed) {
+                    continue;
+                }
+                break;
+            }
         }
         let n = crate::term::read(fd_in, &mut tmp);
         if n <= 0 {
@@ -428,6 +458,10 @@ pub fn probe(fd_in: c_int, fd_out: c_int, tmux: bool) -> Caps {
         }
         // replies have started (slow link): allow up to 1 s for the DA1 sentinel
         end = end.max(t0 + base_ms.max(1000) * 1_000_000);
+    }
+    #[cfg(windows)]
+    if resized {
+        crate::term::WINCH.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut c = parse_replies(&buf);
     c.ms = ((crate::term::mono() - t0) / 1_000_000) as u32;

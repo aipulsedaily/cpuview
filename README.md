@@ -64,6 +64,65 @@ cd cpuview-*-linux && ./bin/cpuview
 To install it for your user: `cp bin/cpuview ~/.local/bin/` and
 `mkdir -p ~/.local/share/cpuview && cp -r share/cpuview/wallpapers ~/.local/share/cpuview/`.
 
+### Windows 10 and 11
+
+In PowerShell (no administrator rights needed):
+
+```powershell
+irm https://raw.githubusercontent.com/aipulsedaily/cpuview/main/install.ps1 | iex
+```
+
+It downloads the latest release's Windows zip (x86_64 or ARM64, whichever the PC is), checks
+its SHA-256 against the one GitHub publishes, puts `cpuview.exe` and the wallpapers in
+`%LOCALAPPDATA%\Programs\cpuview` and that folder on your PATH: open a new terminal and run
+`cpuview`. Run it again to update (a running cpuview is fine). Then, optionally,
+`cpuview --setup-sensors` for CPU temperatures, fans and voltages (see below). To remove it
+(the sensor service too, if you installed it):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/aipulsedaily/cpuview/main/install.ps1))) -Uninstall
+```
+
+Or by hand: every release has `cpuview-<version>-x86_64-windows.zip` (and `…-aarch64-…`):
+unpack it anywhere and run `cpuview.exe` in Windows Terminal (the classic console window and
+VS Code's terminal work too). No installer, no administrator rights, no Visual C++ runtime;
+the `wallpapers` folder next to it holds the picture themes, settings go to
+`%APPDATA%\cpuview`. (winget: later.)
+
+From source: `cargo build --release` with the MSVC toolchain (rustup's default on Windows,
+with Visual Studio's C++ build tools).
+
+**What Windows can and can't show.** CPU load per thread, the clocks the cores really run at,
+cores and their threads (P- and E-cores apart, as AMD's CCDs are), the power plan, RAM and
+the page file, disks, volumes, the network, Windows' services (on the network page, where
+Linux shows systemd's), processes (end, suspend, resume, priority), the CPU's power
+(package, cores and, where the CPU counts them, its built-in GPU and RAM: Windows' energy
+meter), graphics cards' temperature and fan (any vendor, as Task Manager shows them) and an
+NVIDIA card's watts (NVML, which comes with its driver; ~14 MB of memory), the battery,
+drives' temperatures (NVMe, and SATA drives' SMART temperature while they're spun up) and
+the firmware's ACPI thermal zones all come from Windows itself. CPU temperatures and the
+board's fans (CPU fan, case fans, pump), voltages and temperatures don't: Windows has no
+interface for them without a kernel driver. `cpuview --setup-sensors` installs what it
+takes, in one step: it shows what it will add and why, asks, then asks Windows for
+administrator rights once and installs the signed [PawnIO](https://pawnio.eu) driver
+(through winget), its signed modules and cpuview's own sensor service, a small service that
+runs as SYSTEM, idles until cpuview asks and hands cpuview a read-only snapshot; `--undo`
+removes all of it. The service reads the CPU's temperatures (Intel: the package and every
+core; AMD: Tctl and each CCD) and the board's monitoring chip (Nuvoton NCT6779–NCT6799,
+ITE IT87xx/IT86xx up to the IT8628 and Gigabyte's IT8792E/IT87952E, Fintek F718xx/F81xxx)
+under the ISA-bus mutex other monitoring tools share. It only reads: the one thing it sets
+is what the board's own firmware sets around each access (on NCT6791 and later, the lock
+on the monitor's I/O window, opened for each read and closed again), and on ASUS boards the
+fans carry their header names (CPU_FAN, CHA_FAN1, AIO_PUMP …) as on Linux.
+`cpuview --sensor-service --print` (as an administrator) shows what it reads. Linux-only:
+containers (Docker Desktop's run in WSL's virtual machine, out of Windows' sight), a server
+board's BMC, per-core RAPL, RAM sticks' temperatures (their sensors share the SMBus with
+RGB lighting software, which takes no lock cpuview could share), the "waiting for RAM"
+pressure figure, Ctrl-Z. The load average is an estimate (the busy CPUs, decayed like
+Linux's); processes' read / write counts are all their I/O (disk, network and pipes
+together); services' CPU and memory come from Windows' full process list (18 ms with
+15 000 threads), so they're read every 30 s (10 min in eco).
+
 ### From source
 
 With a Rust toolchain (<https://rustup.rs>):
@@ -860,6 +919,45 @@ What makes that possible:
   mappings and go back to the kernel when freed. Smooth's
   animation frames redraw only what moved (memo keys per panel and per card row) and never
   send picture data.
+
+**On Windows** (i9-13900K, Windows 11 on the Balanced plan, a busy desktop: ~620
+processes and 15 000 threads; 128×45 in a pseudo console that is read continuously; 60 s
+windows, eco after a minute's warm-up). CPU time is the process's exact cycle count
+(QueryProcessCycleTime); GetProcessTimes is in brackets: it moves in 15.6 ms ticks, so
+eco's ~3–5 ms a minute reads 0 (one tick in a minute would be 260 µs/s), and a smooth
+minute reads anywhere from 0.7× to 2× the cycle count:
+
+| page | eco (2 windows) | smooth | smooth output |
+|---|---|---|---|
+| overview | 21–57 µs/s (0) | 4.2 ms/s (5.7) | 11 KB/s |
+| CPU | 57–68 µs/s (0) | 4.5 ms/s (6.8) | 70 KB/s |
+| memory & storage | 34–83 µs/s (0) | 4.3 ms/s (7.0) | 3.3 KB/s |
+| network | 4–59 µs/s (0) | 3.8 ms/s (4.9) | 5 KB/s |
+| processes | 9–48 µs/s (0) | 3.8–5.1 ms/s, 3 windows (2.3–4.7) | 19–32 KB/s |
+| sensors | 50–63 µs/s (0) | 4.0 ms/s (8.3) | 6 KB/s |
+
+(With cpuview's sensor service installed and every board sensor shown; a busier desktop than
+earlier runs: ~645 processes, 22 % of the CPU busy with other work.) The sensor service
+itself: ~8 MB of working set (1.4 MB private), no CPU while nothing asks (it waits on an
+event), and while a cpuview asks every second 0.34 ms/s (GetProcessTimes over 26 minutes),
+most of it Intel's per-core temperatures (the service's thread visits every core), which
+it now reads every 5 s.
+
+The same work costs more CPU time when Windows has the core clocked down: in one hour
+with the clocks low, smooth measured up to 7–8 ms/s on the overview and processes pages
+(the frame-rate governor had halved the frame rate twice).
+
+The budget is the same as on Linux, but a sample costs more there (the console, the
+clocks' performance counters, process and socket tables that walk the whole system), so
+eco updates every ~5 s on the CPU page and every ~15–60 s on the others; the processes
+page, whose sample is the dearest, now and then waits a minute or two. The eco budget
+counts the main thread's exact cycles (QueryThreadCycleTime: 0.1 µs to read) and adds the
+other threads' once a minute where the budget is charged (QueryProcessCycleTime costs
+50–150 µs). The full process list walks every thread of every process — 16 ms with
+15 000 threads — so it is read when a page that needs it is entered (and outside eco now
+and then); in between the basic list (pids and names, ~0.1–0.4 ms) and process handles
+kept open keep it current. The working set is 8–11 MB (the performance counter library
+is ~5 MB of it).
 
 ## Notes
 
