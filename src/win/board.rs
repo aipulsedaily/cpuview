@@ -515,6 +515,9 @@ impl Board {
                 seen.push(format!("{port:#x}: chip ID {id:#06x}"));
                 if key == 2 {
                     sout(0x02, 0x02);
+                    // (at 0x2e ITE's key ends in 0x55, SMSC's: an SMSC chip there took
+                    // it and leaves on 0xaa)
+                    outb(port, 0xaa);
                 }
                 continue;
             };
@@ -546,7 +549,8 @@ impl Board {
                 1 => {
                     outb(port, 0xaa);
                 }
-                2 => {
+                // (Gigabyte's second chips stay in configuration mode: never left)
+                2 if !matches!(fam, Fam::Ite(c) if c.f & NOCONF != 0) => {
                     sout(0x02, 0x02);
                 }
                 _ => {}

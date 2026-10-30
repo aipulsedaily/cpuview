@@ -281,9 +281,10 @@ fn install(say: &mut dyn FnMut(&str)) -> Result<(), String> {
     std::fs::copy(&me, &exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     say(&["copied cpuview.exe to ", &exe.to_string_lossy()].concat());
     // the modules: the release (checked), the two modules and the licence (checked)
+    // (-q first: no .curlrc from this user's profile, which the elevated run inherits)
     let zip = mods.join("release.zip");
     let ok = std::process::Command::new(system32("curl.exe"))
-        .args(["-fsSL", "--proto", "=https", "--max-time", "60", "-o"])
+        .args(["-q", "-fsSL", "--proto", "=https", "--max-time", "60", "-o"])
         .arg(&zip)
         .arg(MODULES_URL)
         .status()
@@ -382,7 +383,8 @@ fn remove() -> u32 {
         return U_SERVICE;
     }
     let dir = program_dir();
-    if dir.join(PAWNIO_MARK).exists() {
+    // (not if it was removed by hand meanwhile: winget would fail, and the folder stay)
+    if dir.join(PAWNIO_MARK).exists() && pawnio::installed() {
         let ok = winget().is_some_and(|w| {
             std::process::Command::new(w)
                 .args(["uninstall", "--id", PAWNIO_ID, "--exact", "--silent", "--source", "winget", "--accept-source-agreements", "--disable-interactivity"])
