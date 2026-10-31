@@ -581,10 +581,29 @@ impl App {
         self.tu = vec![0.0; n];
         self.nf = vec![0.0; n];
         self.nu = vec![0.0; n];
-        self.tt = self.s.temps.iter().map(|t| (t.val, 0.0)).collect();
-        self.hy = vec![0.0; HY_TEMP + self.s.temps.len() + 2 * self.s.t.ndom.max(1)];
         self.bars_snap();
         self
+    }
+
+    /// The temperatures' moving state sized to the sensors there are now (Windows'
+    /// come from the sensor service, which may answer only after the first sample).
+    fn fit_temps(&mut self) {
+        let n = self.s.temps.len();
+        if self.tt.len() == n && !self.hy.is_empty() {
+            return;
+        }
+        self.tt = self.s.temps.iter().map(|t| (t.val, 0.0)).collect();
+        // the numbers before and after the temperatures stay; theirs start as read
+        let nd = 2 * self.s.t.ndom.max(1);
+        let mut hy = vec![-1e9; HY_TEMP + n + nd];
+        if self.hy.len() >= HY_TEMP + nd {
+            hy[..HY_TEMP].copy_from_slice(&self.hy[..HY_TEMP]);
+            hy[HY_TEMP + n..].copy_from_slice(&self.hy[self.hy.len() - nd..]);
+            for (h, t) in hy[HY_TEMP..].iter_mut().zip(&self.s.temps) {
+                *h = t.val;
+            }
+        }
+        self.hy = hy;
     }
 
     pub fn smooth(&self) -> bool {
@@ -604,6 +623,7 @@ impl App {
 
     /// Bars jump to the latest sample (every speed but smooth; smooth at start).
     pub fn bars_snap(&mut self) {
+        self.fit_temps();
         let m = self.s.t.maxf;
         for i in 0..self.bf.len() {
             self.bf[i] = (self.s.fe[i] / m).clamp(0.0, 1.0);
@@ -644,6 +664,7 @@ impl App {
             );
             db(&mut self.tu[i], self.s.ur[i].clamp(0.0, 1.0), DEADBAND_U);
         }
+        self.fit_temps();
         self.mem_retarget(true);
         self.net_retarget(true);
         self.sens_retarget(true);
@@ -798,7 +819,7 @@ impl App {
 
     /// Sensor `k`: (bar position, shown value) in °C.
     pub fn temp(&self, k: usize) -> (f32, f32) {
-        if self.smooth() {
+        if self.smooth() && self.tt.len() == self.s.temps.len() {
             (self.tt[k].0, self.hy[HY_TEMP + k])
         } else {
             let v = self.s.temps[k].val;
@@ -4510,6 +4531,39 @@ mod tests {
             let z = a.zones.iter().find(|z| z.2 == k).unwrap();
             assert_eq!(a.key_at(z.0, 39), Some(k));
         }
+    }
+
+    #[test]
+    fn smooth_mode_takes_temperatures_that_arrive_later() {
+        // Windows: the sensor service may answer after the first sample
+        let mut a = app(16, 2, 2);
+        a.s.temps.clear();
+        let t = |label: &str, val| crate::sys::Sensor::new(label.into(), val);
+        let (temps, v) = (vec![t("Pkg0", 61.0), t("P-core", 64.0), t("E-core", 52.0)], 61.0);
+        a.speed = SMOOTH;
+        a.fit(172, 40);
+        a.bars_snap();
+        let mut scr = Screen::new(172, 40);
+        for page in [PG_OVERVIEW, PG_CPU, PG_SENS] {
+            a.page = page;
+            a.draw(&mut scr, true);
+        }
+        a.s.temps = temps;
+        for page in [PG_OVERVIEW, PG_CPU, PG_SENS] {
+            a.page = page;
+            a.draw(&mut scr, true); // before the next sample's retarget
+        }
+        assert_eq!(a.temp(0), (v, v));
+        a.retarget();
+        assert_eq!(a.temp(0), (v, v));
+        a.anim_step(0.1);
+        a.anim_numbers(0.1);
+        a.draw(&mut scr, true);
+        // and when the service goes away again
+        a.s.temps.clear();
+        a.draw(&mut scr, true);
+        a.retarget();
+        a.draw(&mut scr, true);
     }
 
     #[test]

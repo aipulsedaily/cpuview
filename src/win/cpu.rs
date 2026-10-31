@@ -515,7 +515,7 @@ impl Cpu {
             }
         }
         if !self.from_svc || temps.len() != v.len() || temps.iter().zip(&v).any(|(s, r)| s.label != r.0) {
-            *temps = v.into_iter().map(|(label, val)| Sensor { label, fd: -1, val, hist: Ring::new(), max: 0.0 }).collect();
+            *temps = v.into_iter().map(|(label, val)| Sensor::new(label, val)).collect();
             self.from_svc = true;
         } else {
             for (s, r) in temps.iter_mut().zip(&v) {

@@ -298,6 +298,14 @@ pub struct Sensor {
     pub max: f32,
 }
 
+impl Sensor {
+    /// A reading with no file behind it (Windows: the sensor service's).
+    #[cfg(any(windows, test))]
+    pub fn new(label: String, val: f32) -> Sensor {
+        Sensor { label, fd: -1, val, hist: Ring::new(), max: 0.0 }
+    }
+}
+
 pub struct Topo {
     pub cpus: Vec<usize>,
     /// cpu id → index in `cpus` (or usize::MAX)
